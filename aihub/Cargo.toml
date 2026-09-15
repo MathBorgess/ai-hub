@@ -1,0 +1,19 @@
+[package]
+name = "aihub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aihub-core = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+thiserror = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+vt100 = { workspace = true }

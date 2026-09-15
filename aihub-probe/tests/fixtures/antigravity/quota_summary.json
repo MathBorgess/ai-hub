@@ -1,0 +1,40 @@
+{
+  "response": {
+    "groups": [
+      {
+        "displayName": "Gemini",
+        "buckets": [
+          {
+            "bucketId": "gemini-5h",
+            "window": "5h",
+            "remainingFraction": 0.45,
+            "resetTime": "2026-09-15T18:00:00.000Z"
+          },
+          {
+            "bucketId": "gemini-weekly",
+            "window": "weekly",
+            "remainingFraction": 0.8,
+            "resetTime": "2026-09-22T00:00:00.000Z"
+          }
+        ]
+      },
+      {
+        "displayName": "Claude and GPT",
+        "buckets": [
+          {
+            "bucketId": "3p-5h",
+            "window": "5h",
+            "remainingFraction": 0,
+            "resetTime": "2026-09-15T18:00:00.000Z"
+          },
+          {
+            "bucketId": "3p-weekly",
+            "window": "weekly",
+            "remainingFraction": 0.25,
+            "resetTime": "2026-09-22T00:00:00.000Z"
+          }
+        ]
+      }
+    ]
+  }
+}

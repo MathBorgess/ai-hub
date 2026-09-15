@@ -1,0 +1,13 @@
+[package]
+name = "aihub-pty"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aihub-core = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+thiserror = { workspace = true }
+portable-pty = { workspace = true }

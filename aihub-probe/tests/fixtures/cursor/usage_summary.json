@@ -1,0 +1,11 @@
+{
+  "billingCycleStart": "2024-01-01T00:00:00.000Z",
+  "billingCycleEnd": "2024-02-01T00:00:00.000Z",
+  "individualUsage": {
+    "plan": {
+      "totalPercentUsed": 30,
+      "autoPercentUsed": 5,
+      "apiPercentUsed": 95
+    }
+  }
+}

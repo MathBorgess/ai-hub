@@ -1,0 +1,8 @@
+{
+  "tokens": {
+    "access_token": "fabricated-codex-token-12345",
+    "refresh_token": "fabricated-codex-refresh-12345",
+    "account_id": "fabricated-account-abc",
+    "expires_at": "2026-10-01T00:00:00.000Z"
+  }
+}
