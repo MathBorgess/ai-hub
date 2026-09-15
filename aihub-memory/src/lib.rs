@@ -10,26 +10,29 @@ use aihub_core::{HarnessId, SessionId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub use ai_memory::record_handoff_to;
 pub use brief::{next_session_index, write_brief_pair};
 pub use record::{
     handoffs_log_path, record_handoff, record_handoff_delivered, record_handoff_destination,
 };
 
-/// Reports whether the recorded handoff reached live ai-memory or was spooled locally (§3.5).
+/// Reports whether the recorded handoff reached the live backend or was spooled locally (§3.5).
+/// Backend-neutral by design: the concrete backend (currently ai-memory) is an
+/// implementation detail confined to `ai_memory.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HandoffDestination {
-    AiMemory,
-    SpooledLocally,
+    Delivered,
+    Spooled,
 }
 
 impl HandoffDestination {
-    pub fn reached_ai_memory(&self) -> bool {
-        matches!(self, HandoffDestination::AiMemory)
+    pub fn is_delivered(&self) -> bool {
+        matches!(self, HandoffDestination::Delivered)
     }
 
-    pub fn was_spooled_locally(&self) -> bool {
-        matches!(self, HandoffDestination::SpooledLocally)
+    pub fn is_spooled(&self) -> bool {
+        matches!(self, HandoffDestination::Spooled)
     }
 }
 

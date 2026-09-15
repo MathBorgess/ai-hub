@@ -1,6 +1,6 @@
 # Verification matrix (production run 20260915T182254Z)
 
-Evidence from session 10 integration: **158** workspace tests, gates `cargo fmt --check`, `cargo clippy --workspace --all-targets --offline -- -D warnings`, `cargo test --workspace --offline`, and `cargo build --release --locked --offline` (all passed on 2026-09-15).
+Evidence from session 10's correction pass: **159** workspace tests, gates `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --offline -- -D warnings`, `cargo test --workspace --offline --no-fail-fast` (0 failed across 3 consecutive runs), and `cargo build --release --locked --offline` (all passed on 2026-09-15). Three previously-flaky regression areas were root-caused and fixed rather than serialized away — see `docs/CONTRACT.md` §5 and the session 10 result for detail: an unscoped `QuotaPush` broadcast interleaving with RPC-style replies in `aihubd/tests/regression.rs`, a fake test server in `aihub-memory/src/ai_memory.rs` closing sockets with unread request bytes (TCP RST), and a kernel backlog false-positive in `aihubd`'s stale-socket liveness check.
 
 ## Findings F1–F14
 
@@ -31,7 +31,7 @@ Evidence from session 10 integration: **158** workspace tests, gates `cargo fmt 
 | Full workspace regression | automated | `cargo test --workspace --offline` |
 | Lint / format | automated | `cargo fmt --check`; `cargo clippy --workspace --all-targets --offline -- -D warnings` |
 | Release binaries | automated | `cargo build --release --locked --offline` |
-| ai-memory record → CLI handoffs → spool → drain (loopback, temp dirs) | automated (session 10) | `AI_MEMORY_E2E=1 AI_MEMORY_BIN=<path-to-v2.2.2-binary> AI_MEMORY_DATA_DIR=<tmp> AIHUB_DATA_DIR=<tmp>/aihub AI_MEMORY_PORT=<non-49374> cargo test -p aihub-memory --test session10_ai_memory_loop --offline -- --nocapture` (after `scripts/install.sh --dry-run` plan review and pinned asset checksum per `scripts/install.sh`) |
+| ai-memory record → CLI handoffs → spool → drain (loopback, temp dirs) | automated (session 10) | `scripts/e2e-ai-memory.sh` — one command: reuses `scripts/install.sh`'s pinned-asset download/checksum, inits a temp data dir, serves on a free loopback port, runs `session10_ai_memory_live_record_spool_and_drain`, and always tears down via `trap` |
 | Daemon socket permissions | automated | `cargo test -p aihubd --test headless_e2e test_headless_end_to_end --offline` |
 | E2E merge / switch / routing (headless) | automated | `cargo test -p aihubd --test headless_e2e --offline`; `cargo test -p aihubd --test regression --offline` |
 | TUI + live Keychain quotas | owner-manual | Run `aihub` in a real repo; authorize Keychain; confirm statusline and `/quota` table (`docs/INSTALL.md`) |

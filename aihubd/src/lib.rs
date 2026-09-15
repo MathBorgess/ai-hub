@@ -175,24 +175,42 @@ fn bind(path: &Path) -> Result<(UnixListener, SocketGuard)> {
         if !meta.file_type().is_socket() {
             bail!("socket path already exists and is not a socket");
         }
-        match std::os::unix::net::UnixStream::connect(path) {
-            Ok(_) => bail!("a live aihubd already holds this socket"),
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                let current = std::fs::symlink_metadata(path)?;
-                if current.ino() != meta.ino() || current.dev() != meta.dev() {
-                    bail!("socket changed while checking listener");
+        // A closed listener's socket file can still accept one queued
+        // connect() from its old kernel backlog for a brief moment after
+        // the listening fd is dropped, making a genuinely stale socket look
+        // momentarily live. Require repeated successful connects before
+        // concluding a live daemon is really there; a lone stale backlog
+        // entry won't survive a second attempt a few milliseconds later.
+        let mut confirmed_live = false;
+        let mut stale = false;
+        for attempt in 0..3 {
+            match std::os::unix::net::UnixStream::connect(path) {
+                Ok(_) if attempt == 2 => confirmed_live = true,
+                Ok(_) => std::thread::sleep(Duration::from_millis(20)),
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    stale = true;
+                    break;
                 }
-                std::fs::remove_file(path)?;
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(e) => {
+                    log_lifecycle(
+                        "ERROR",
+                        "bind_check",
+                        &format!("stale socket check failed: {e} (kind={:?})", e.kind()),
+                    );
+                    bail!("cannot establish whether existing socket is stale: {e}");
+                }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
-            Err(e) => {
-                log_lifecycle(
-                    "ERROR",
-                    "bind_check",
-                    &format!("stale socket check failed: {e} (kind={:?})", e.kind()),
-                );
-                bail!("cannot establish whether existing socket is stale: {e}");
+        }
+        if confirmed_live {
+            bail!("a live aihubd already holds this socket");
+        }
+        if stale {
+            let current = std::fs::symlink_metadata(path)?;
+            if current.ino() != meta.ino() || current.dev() != meta.dev() {
+                bail!("socket changed while checking listener");
             }
+            std::fs::remove_file(path)?;
         }
     }
     let listener = UnixListener::bind(path)?;
@@ -366,7 +384,7 @@ impl Daemon {
                         Ok(Err(e)) => Err(anyhow::anyhow!(e)),
                         Err(_) => {
                             aihub_memory::record_handoff(&id, from, to, &b).await?;
-                            Ok(aihub_memory::HandoffDestination::SpooledLocally)
+                            Ok(aihub_memory::HandoffDestination::Spooled)
                         }
                     }
                 })

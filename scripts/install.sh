@@ -172,16 +172,37 @@ ai_memory_expected_sha256() {
   esac
 }
 
-install_ai_memory_transitional() {
-  local asset url base sha_url expected tmpdir
+# Downloads the pinned ai-memory release into ${1}, verifies its SHA-256, and
+# extracts it there. Shared by install.sh and scripts/e2e-ai-memory.sh so both
+# paths check the exact same bytes against the exact same pin.
+ai_memory_fetch_verified() {
+  local dest_dir="$1"
+  local asset url base sha_url expected
   asset="$(ai_memory_asset_name)"
   base="https://github.com/akitaonrails/ai-memory/releases/download/${AI_MEMORY_VERSION}"
   url="${base}/${asset}"
   sha_url="${base}/${asset}.sha256"
   expected="$(ai_memory_expected_sha256)"
 
+  curl -fsSL -o "${dest_dir}/${asset}" "${url}"
+  curl -fsSL -o "${dest_dir}/${asset}.sha256" "${sha_url}"
+  (
+    cd "${dest_dir}"
+    echo "${expected}  ${asset}" | shasum -a 256 -c -
+  )
+  tar -xzf "${dest_dir}/${asset}" -C "${dest_dir}"
+}
+
+install_ai_memory_transitional() {
+  local asset tmpdir
+  asset="$(ai_memory_asset_name)"
+
   if [[ "${DRY_RUN}" -eq 1 ]]; then
-    log "[dry-run] curl -fsSL -o <tmpdir>/${asset} ${url}"
+    local base sha_url expected
+    base="https://github.com/akitaonrails/ai-memory/releases/download/${AI_MEMORY_VERSION}"
+    sha_url="${base}/${asset}.sha256"
+    expected="$(ai_memory_expected_sha256)"
+    log "[dry-run] curl -fsSL -o <tmpdir>/${asset} ${base}/${asset}"
     log "[dry-run] curl -fsSL -o <tmpdir>/${asset}.sha256 ${sha_url}"
     log "[dry-run] verify sha256 ${expected} ${asset}"
     log "[dry-run] tar -xzf <tmpdir>/${asset} -C <tmpdir>"
@@ -190,13 +211,7 @@ install_ai_memory_transitional() {
     tmpdir="$(mktemp -d)"
     # shellcheck disable=SC2064
     trap "rm -rf '${tmpdir}'" RETURN
-    curl -fsSL -o "${tmpdir}/${asset}" "${url}"
-    curl -fsSL -o "${tmpdir}/${asset}.sha256" "${sha_url}"
-    (
-      cd "${tmpdir}"
-      echo "${expected}  ${asset}" | shasum -a 256 -c -
-    )
-    tar -xzf "${tmpdir}/${asset}" -C "${tmpdir}"
+    ai_memory_fetch_verified "${tmpdir}"
     install -m 0755 "${tmpdir}/ai-memory" "${LOCAL_BIN}/ai-memory"
     if [[ -d "${tmpdir}/hooks" ]]; then
       mkdir -p "${LOCAL_BIN}/../share/ai-memory"
@@ -340,4 +355,8 @@ main() {
   log "done"
 }
 
-main "$@"
+# scripts/e2e-ai-memory.sh sources this file to reuse ai_memory_fetch_verified()
+# and friends without running the real installer against the real $HOME.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi

@@ -73,7 +73,7 @@ pub async fn record_handoff_delivered(
     brief: &BriefPair,
 ) -> Result<bool, MemoryError> {
     let dest = record_handoff_destination(session_id, from, to, brief).await?;
-    Ok(dest.reached_ai_memory())
+    Ok(dest.is_delivered())
 }
 
 /// Internal implementation taking explicit parameters for testing.
@@ -102,12 +102,12 @@ pub async fn record_handoff_to(
         Ok(()) => {
             // Success: drain any previously spooled records
             let _ = drain_spool(server_url, auth_token, &spool_path, MAX_DRAIN_PER_CALL).await;
-            Ok(HandoffDestination::AiMemory)
+            Ok(HandoffDestination::Delivered)
         }
         Err(_) => {
             // Unreachable or non-2xx: append to local spool
             append_spool(&spool_path, &record)?;
-            Ok(HandoffDestination::SpooledLocally)
+            Ok(HandoffDestination::Spooled)
         }
     }
 }
@@ -380,9 +380,43 @@ mod tests {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     break;
                 };
-                let mut buf = vec![0u8; 4096];
-                let n = socket.read(&mut buf).await.unwrap_or(0);
-                let req_str = String::from_utf8_lossy(&buf[..n]).to_string();
+                // Drain the whole request (headers + Content-Length body) before
+                // responding. Closing the socket while unread bytes remain in the
+                // kernel receive buffer sends a TCP RST instead of a clean FIN,
+                // which the client observes as "connection reset by peer" instead
+                // of its response — a real flake, not a test-ordering issue.
+                let mut buf = Vec::new();
+                let header_end = loop {
+                    let mut chunk = [0u8; 4096];
+                    let n = socket.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        break None;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break Some(pos + 4);
+                    }
+                };
+                if let Some(header_end) = header_end {
+                    let content_length = String::from_utf8_lossy(&buf[..header_end])
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().to_string())
+                        })
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    while buf.len() < header_end + content_length {
+                        let mut chunk = [0u8; 4096];
+                        let n = socket.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                }
+                let req_str = String::from_utf8_lossy(&buf).to_string();
                 req_clone.lock().await.push(req_str);
 
                 let resp = format!(
@@ -447,9 +481,9 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(dest, HandoffDestination::AiMemory);
-        assert!(dest.reached_ai_memory());
-        assert!(!dest.was_spooled_locally());
+        assert_eq!(dest, HandoffDestination::Delivered);
+        assert!(dest.is_delivered());
+        assert!(!dest.is_spooled());
 
         let recorded = reqs.lock().await;
         assert_eq!(recorded.len(), 1);
@@ -502,8 +536,8 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(dest, HandoffDestination::SpooledLocally);
-        assert!(dest.was_spooled_locally());
+        assert_eq!(dest, HandoffDestination::Spooled);
+        assert!(dest.is_spooled());
 
         let spool_file = dir.join("handoffs.jsonl");
         assert!(spool_file.exists());
@@ -554,7 +588,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(dest, HandoffDestination::SpooledLocally);
+        assert_eq!(dest, HandoffDestination::Spooled);
 
         let spool_file = dir.join("handoffs.jsonl");
         assert!(spool_file.exists());
@@ -608,7 +642,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(dest1, HandoffDestination::SpooledLocally);
+        assert_eq!(dest1, HandoffDestination::Spooled);
 
         let spool_file = dir.join("handoffs.jsonl");
         assert!(spool_file.exists());
@@ -640,7 +674,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(dest2, HandoffDestination::AiMemory);
+        assert_eq!(dest2, HandoffDestination::Delivered);
 
         // Server should have received 2 requests: the live one (sess-live-2) and the drained one (sess-spooled-1)
         let mut len = 0usize;

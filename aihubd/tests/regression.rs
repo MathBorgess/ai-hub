@@ -36,7 +36,7 @@ async fn send(s: &mut UnixStream, msg: ClientMessage) {
         .unwrap();
 }
 
-async fn recv(s: &mut UnixStream) -> DaemonMessage {
+async fn recv_raw(s: &mut UnixStream) -> DaemonMessage {
     tokio::time::timeout(Duration::from_secs(30), async {
         let n = s.read_u32().await.unwrap();
         let mut data = vec![0; n as usize];
@@ -48,6 +48,19 @@ async fn recv(s: &mut UnixStream) -> DaemonMessage {
     })
     .await
     .unwrap()
+}
+
+/// QuotaPush is an unscoped push the daemon may interleave with any reply
+/// (its background probe loop broadcasts on its first tick). Callers waiting
+/// on a specific reply must skip it rather than assume strict request/response
+/// ordering; bounded by recv_raw's own 30s timeout per read.
+async fn recv(s: &mut UnixStream) -> DaemonMessage {
+    loop {
+        let msg = recv_raw(s).await;
+        if !matches!(msg, DaemonMessage::QuotaPush { .. }) {
+            return msg;
+        }
+    }
 }
 
 async fn connect_and_handshake(path: &std::path::Path) -> UnixStream {
@@ -70,11 +83,11 @@ async fn connect_and_handshake(path: &std::path::Path) -> UnixStream {
     )
     .await;
     assert!(matches!(
-        recv(&mut s).await,
+        recv_raw(&mut s).await,
         DaemonMessage::Hello { version } if version == PROTOCOL_VERSION
     ));
     assert!(matches!(
-        recv(&mut s).await,
+        recv_raw(&mut s).await,
         DaemonMessage::QuotaPush { .. }
     ));
     s
@@ -365,9 +378,7 @@ async fn f5_switch_ordering_no_overlap() {
             })
         }
     })
-    .with_memory_recorder(|_, _, _, _| async {
-        Ok(aihub_memory::HandoffDestination::SpooledLocally)
-    });
+    .with_memory_recorder(|_, _, _, _| async { Ok(aihub_memory::HandoffDestination::Spooled) });
 
     let temp_wt = std::env::temp_dir().join(format!("ah08-wt-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&temp_wt);
@@ -788,7 +799,17 @@ async fn f10_no_capacity_never_dispatched() {
 
     // Verify session was NOT switched
     send(&mut client, ClientMessage::ListSessions).await;
-    match recv(&mut client).await {
+    // The background quota probe may re-broadcast a pending autonomous
+    // task's NoCapacity recommendation before the SessionList reply lands;
+    // that duplicate is benign here, only the final session state matters.
+    // recv() already bounds each read at 30s, so this loop terminates.
+    let session_list = loop {
+        match recv(&mut client).await {
+            DaemonMessage::RouteRecommendation { .. } => continue,
+            other => break other,
+        }
+    };
+    match session_list {
         DaemonMessage::SessionList { sessions } => {
             assert_eq!(sessions.len(), 1);
             assert_eq!(sessions[0].harness, HarnessId::Codex);
@@ -990,7 +1011,7 @@ async fn lifecycle_logging_and_handoff_destination() {
             })
         })
         .with_memory_recorder(|_, _, _, _| async {
-            Ok(aihub_memory::HandoffDestination::AiMemory)
+            Ok(aihub_memory::HandoffDestination::Delivered)
         });
 
     let id = SessionId::new("dest-session-1");
@@ -1014,7 +1035,7 @@ async fn lifecycle_logging_and_handoff_destination() {
         .switch_session(&id, HarnessId::ClaudeCode, true)
         .await
         .unwrap();
-    assert_eq!(dest, Some(aihub_memory::HandoffDestination::AiMemory));
+    assert_eq!(dest, Some(aihub_memory::HandoffDestination::Delivered));
 
     let daemon_spool = Daemon::new(|| async { vec![] }, |_, _| Ok(dummy_pty()))
         .with_memory_extractor(|_, _, _| async {
@@ -1024,9 +1045,7 @@ async fn lifecycle_logging_and_handoff_destination() {
                 decisions: vec![],
             })
         })
-        .with_memory_recorder(|_, _, _, _| async {
-            Ok(aihub_memory::HandoffDestination::SpooledLocally)
-        });
+        .with_memory_recorder(|_, _, _, _| async { Ok(aihub_memory::HandoffDestination::Spooled) });
 
     let id2 = SessionId::new("dest-session-2");
     daemon_spool
@@ -1049,10 +1068,7 @@ async fn lifecycle_logging_and_handoff_destination() {
         .switch_session(&id2, HarnessId::ClaudeCode, true)
         .await
         .unwrap();
-    assert_eq!(
-        dest2,
-        Some(aihub_memory::HandoffDestination::SpooledLocally)
-    );
+    assert_eq!(dest2, Some(aihub_memory::HandoffDestination::Spooled));
 
     let _ = std::fs::remove_dir_all(&temp_wt);
 }

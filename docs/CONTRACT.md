@@ -628,12 +628,16 @@ These new public signatures are added additively for production readiness, each 
 
 ### 3.4. `aihub-memory` (Owned by Session 06)
 
-- **ai-memory boundary (§3.5, Findings F1, F11):** One function records a handoff and returns whether it reached ai-memory or was spooled locally. The brief API stays as it is.
+- **Handoff backend boundary (§3.5, Findings F1, F11):** One function records a handoff and returns whether it reached the live backend or was spooled locally. Names outside `aihub-memory/src/ai_memory.rs` are backend-neutral — the concrete backend (currently ai-memory) is that one file's implementation detail (session 10 correction pass).
   ```rust
   #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
   pub enum HandoffDestination {
-      AiMemory,
-      SpooledLocally,
+      Delivered,
+      Spooled,
+  }
+  impl HandoffDestination {
+      pub fn is_delivered(&self) -> bool;
+      pub fn is_spooled(&self) -> bool;
   }
 
   pub async fn record_handoff_destination(
@@ -649,6 +653,19 @@ These new public signatures are added additively for production readiness, each 
       to: HarnessId,
       brief: &BriefPair,
   ) -> Result<bool, MemoryError>;
+
+  /// Explicit-parameter form (never reads env); record_handoff_destination's
+  /// implementation, exported so tests and scripts/e2e-ai-memory.sh never
+  /// need std::env::set_var.
+  pub async fn record_handoff_to(
+      session_id: &SessionId,
+      from: HarnessId,
+      to: HarnessId,
+      brief: &BriefPair,
+      server_url: &str,
+      auth_token: Option<&str>,
+      data_dir: &Path,
+  ) -> Result<HandoffDestination, MemoryError>;
   ```
 
 ---
@@ -662,4 +679,15 @@ These pre–production-round entry points were superseded in sessions 02–09 an
 | `aihub-pty` | Blocking `PtyHandle::write(&[u8])` on the PTY writer thread | `try_write` / `write_nonblocking` (bounded queue, `PtyError::QueueFull`) |
 | `aihub-router` | `route(...) -> Result<HarnessId, RouterError>` (untyped recommendation) | `route_outcome` / `route_typed` → `RouteOutcome` (`Recommendation` or `NoCapacity`) |
 | `aihub-git` | `finish(worktree, strategy, base_branch)` (branch discovered from checkout) | `finish_session` / `finish_validated` with `expected_session_branch` and `originating_checkout` |
+
+## 5. Renamed for backend neutrality (session 10 correction pass)
+
+| Crate | Old | New |
+|-------|-----|-----|
+| `aihub-memory` | `HandoffDestination::AiMemory` | `HandoffDestination::Delivered` |
+| `aihub-memory` | `HandoffDestination::SpooledLocally` | `HandoffDestination::Spooled` |
+| `aihub-memory` | `HandoffDestination::reached_ai_memory()` | `HandoffDestination::is_delivered()` |
+| `aihub-memory` | `HandoffDestination::was_spooled_locally()` | `HandoffDestination::is_spooled()` |
+
+All callers in `aihubd` and its tests were updated in the same pass; no behavior changed.
 
