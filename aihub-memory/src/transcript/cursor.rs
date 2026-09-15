@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::HandoffTurn;
 use crate::redact::redact_secrets;
+use crate::HandoffTurn;
 
 use super::paths::{collect_decisions, read_jsonl, walk_jsonl_files};
 
@@ -57,14 +57,24 @@ fn extract_file(path: &Path) -> Option<HandoffTurn> {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        let role = value.get("role").and_then(Value::as_str)?;
-        let content = value.get("message")?.get("content")?;
-        let text = cursor_text(content)?;
+        let Some(role) = value.get("role").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(message) = value.get("message") else {
+            continue;
+        };
+        let Some(content) = message.get("content") else {
+            continue;
+        };
+        let Some(text) = cursor_text(content) else {
+            continue;
+        };
         match role {
-            "user" => last_user = text,
+            "user" => last_user = redact_secrets(&text),
             "assistant" => {
-                decisions.extend(collect_decisions(&text));
-                last_assistant = text;
+                let redacted = redact_secrets(&text);
+                decisions.extend(collect_decisions(&redacted));
+                last_assistant = redacted;
             }
             _ => {}
         }
@@ -83,10 +93,7 @@ fn extract_file(path: &Path) -> Option<HandoffTurn> {
     Some(HandoffTurn {
         summary: redact_secrets(&summary),
         last_output: redact_secrets(&last_assistant),
-        decisions: decisions
-            .into_iter()
-            .map(|d| redact_secrets(&d))
-            .collect(),
+        decisions: decisions.into_iter().map(|d| redact_secrets(&d)).collect(),
     })
 }
 

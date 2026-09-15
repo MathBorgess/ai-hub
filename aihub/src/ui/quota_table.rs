@@ -1,11 +1,11 @@
 //! Full windows x lanes quota table modal overlay.
 
+use crate::colors::quota_color;
 use aihub_core::{QuotaSnapshot, WindowKind};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Row, Table, Widget};
-use crate::colors::quota_color;
 
 fn format_duration(seconds: Option<u64>) -> String {
     match seconds {
@@ -17,9 +17,18 @@ fn format_duration(seconds: Option<u64>) -> String {
 }
 
 /// Renders the full analytical quota table modal.
-pub fn render_quota_table(snapshots: &[QuotaSnapshot], scroll: usize, area: Rect, buf: &mut Buffer) {
-    let width = (area.width * 9 / 10).max(60).min(area.width.saturating_sub(2));
-    let height = (area.height * 8 / 10).max(12).min(area.height.saturating_sub(2));
+pub fn render_quota_table(
+    snapshots: &[QuotaSnapshot],
+    scroll: usize,
+    area: Rect,
+    buf: &mut Buffer,
+) {
+    let width = (area.width * 9 / 10)
+        .max(60)
+        .min(area.width.saturating_sub(2));
+    let height = (area.height * 8 / 10)
+        .max(12)
+        .min(area.height.saturating_sub(2));
 
     if width < 30 || height < 6 {
         return;
@@ -42,13 +51,41 @@ pub fn render_quota_table(snapshots: &[QuotaSnapshot], scroll: usize, area: Rect
     block.render(popup_area, buf);
 
     let header_row = Row::new(vec![
-        Cell::from("Harness").style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Cell::from("Conta").style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Cell::from("Tipo").style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Cell::from("Janela / Lane").style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Cell::from("Uso %").style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Cell::from("Status").style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Cell::from("Reset em").style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Cell::from("Harness").style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from("Conta").style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from("Tipo").style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from("Janela / Lane").style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from("Uso %").style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from("Status").style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from("Reset em").style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
     ])
     .bottom_margin(1);
 
@@ -74,7 +111,8 @@ pub fn render_quota_table(snapshots: &[QuotaSnapshot], scroll: usize, area: Rect
                 Cell::from(account.clone()),
                 Cell::from("Janela").style(Style::default().fg(Color::DarkGray)),
                 Cell::from(win_label),
-                Cell::from(format!("{:.1}%", win.used_pct)).style(Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                Cell::from(format!("{:.1}%", win.used_pct))
+                    .style(Style::default().fg(color).add_modifier(Modifier::BOLD)),
                 Cell::from(status.clone()),
                 Cell::from(format_duration(win.resets_in_s)),
             ]));
@@ -87,9 +125,11 @@ pub fn render_quota_table(snapshots: &[QuotaSnapshot], scroll: usize, area: Rect
                 all_rows.push(Row::new(vec![
                     Cell::from(harness.clone()),
                     Cell::from(account.clone()),
-                    Cell::from(format!("Lane ({})", lane.kind)).style(Style::default().fg(Color::LightBlue)),
+                    Cell::from(format!("Lane ({})", lane.kind))
+                        .style(Style::default().fg(Color::LightBlue)),
                     Cell::from(lane.name.clone()),
-                    Cell::from(format!("{:.1}%", win.used_pct)).style(Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                    Cell::from(format!("{:.1}%", win.used_pct))
+                        .style(Style::default().fg(color).add_modifier(Modifier::BOLD)),
                     Cell::from(status.clone()),
                     Cell::from(format_duration(win.resets_in_s)),
                 ]));

@@ -27,7 +27,10 @@ pub fn discover_roots(harness: HarnessId) -> Vec<PathBuf> {
                 Vec::new()
             }
         }
-        HarnessId::Antigravity => Vec::new(),
+        HarnessId::Antigravity => antigravity_brain_dirs(&home)
+            .into_iter()
+            .filter(|p| p.is_dir())
+            .collect(),
     }
 }
 
@@ -65,6 +68,21 @@ fn codex_homes(home: &Path) -> Vec<PathBuf> {
         }
     }
     vec![home.join(".codex")]
+}
+
+fn antigravity_brain_dirs(home: &Path) -> Vec<PathBuf> {
+    if let Ok(from_env) = std::env::var("ANTIGRAVITY_BRAIN_DIR") {
+        let dirs: Vec<PathBuf> = from_env
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .collect();
+        if !dirs.is_empty() {
+            return dirs;
+        }
+    }
+    vec![home.join(".gemini").join("antigravity-cli").join("brain")]
 }
 
 pub(crate) fn walk_jsonl_files(root: &Path, out: &mut Vec<PathBuf>, depth: usize) {

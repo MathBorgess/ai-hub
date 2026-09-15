@@ -14,10 +14,7 @@ use crate::HarnessLaunchRecipe;
 ///   prompt is the optional positional `[PROMPT]` argument.
 /// - **Cursor Agent** (`cursor-agent` / `agent`): interactive by default; initial text is passed
 ///   as positional `prompt...` arguments (not `-p` / `--print`).
-pub fn harness_recipe(
-    harness: HarnessId,
-    initial_prompt: Option<&str>,
-) -> HarnessLaunchRecipe {
+pub fn harness_recipe(harness: HarnessId, initial_prompt: Option<&str>) -> HarnessLaunchRecipe {
     match harness {
         HarnessId::ClaudeCode => {
             let mut args = Vec::new();
@@ -65,4 +62,20 @@ pub fn harness_recipe(
             }
         }
     }
+}
+
+/// Same as [`harness_recipe`], with an optional model id passed via each CLI's own `--model` flag
+/// (`claude --help`, `agy --help`, `codex --help` and `cursor-agent --help` all expose `--model`).
+pub fn harness_recipe_with_model(
+    harness: HarnessId,
+    initial_prompt: Option<&str>,
+    model: Option<&str>,
+) -> HarnessLaunchRecipe {
+    let mut recipe = harness_recipe(harness, initial_prompt);
+    if let Some(model) = model {
+        recipe
+            .args
+            .splice(0..0, ["--model".to_string(), model.to_string()]);
+    }
+    recipe
 }

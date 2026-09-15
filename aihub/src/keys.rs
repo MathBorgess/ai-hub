@@ -1,8 +1,8 @@
 //! Keystroke routing, prefix chord processing, and palette command handling.
 
-use aihub_core::{ClientMessage, HarnessId, MergeStrategy, Mode};
+use crate::state::{App, RecommendationState, UiMode};
+use aihub_core::{ClientMessage, HarnessId, MergeStrategy, Mode, QuotaSnapshot, QuotaStatus};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use crate::state::{App, UiMode};
 
 /// Action resulting from processing a key event.
 #[derive(Debug, Clone, PartialEq)]
@@ -19,6 +19,32 @@ pub fn cycle_harness(current: HarnessId) -> HarnessId {
     let all = HarnessId::all();
     let idx = all.iter().position(|&h| h == current).unwrap_or(0);
     all[(idx + 1) % all.len()]
+}
+
+/// Cycles only harnesses whose slot has supply, meaning status is not Empty or Unknown.
+/// Falls back to cycling all harnesses if no snapshots or supply information is available.
+pub fn cycle_available_harness(current: HarnessId, snapshots: &[QuotaSnapshot]) -> HarnessId {
+    let available: Vec<HarnessId> = HarnessId::all()
+        .iter()
+        .copied()
+        .filter(|&h| {
+            snapshots.iter().any(|s| {
+                s.slot.harness == h
+                    && s.status != QuotaStatus::Empty
+                    && s.status != QuotaStatus::Unknown
+            })
+        })
+        .collect();
+
+    if available.is_empty() {
+        return cycle_harness(current);
+    }
+
+    if let Some(idx) = available.iter().position(|&h| h == current) {
+        available[(idx + 1) % available.len()]
+    } else {
+        available[0]
+    }
 }
 
 /// Converts a crossterm KeyEvent into raw byte sequence suitable for a Unix PTY.
@@ -98,7 +124,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> AppAction {
 }
 
 fn handle_normal_key(app: &mut App, key: KeyEvent) -> AppAction {
-    let is_ctrl_bracket = (key.code == KeyCode::Char(']') && key.modifiers.contains(KeyModifiers::CONTROL))
+    let is_ctrl_bracket = (key.code == KeyCode::Char(']')
+        && key.modifiers.contains(KeyModifiers::CONTROL))
         || (key.code == KeyCode::Char('\x1d'));
 
     if is_ctrl_bracket {
@@ -126,26 +153,41 @@ fn handle_normal_key(app: &mut App, key: KeyEvent) -> AppAction {
             }
             KeyCode::Enter => {
                 // Accept assisted-mode recommendation
-                if let Some(rec) = &app.recommendation {
-                    if let Some(session_id) = &app.session_id {
-                        return AppAction::SendMessage(ClientMessage::SwitchHarness {
-                            session_id: session_id.clone(),
-                            target: rec.harness,
-                            with_handoff: true,
-                        });
+                match &app.recommendation {
+                    Some(RecommendationState::Recommended { harness, .. }) => {
+                        if let Some(session_id) = &app.session_id {
+                            return AppAction::SendMessage(ClientMessage::SwitchHarness {
+                                session_id: session_id.clone(),
+                                target: *harness,
+                                with_handoff: true,
+                            });
+                        }
                     }
+                    Some(RecommendationState::NoCapacity { reason }) => {
+                        app.set_status(format!("Não é possível aceitar: {}", reason));
+                        return AppAction::None;
+                    }
+                    None => {}
                 }
                 AppAction::None
             }
             KeyCode::Tab => {
-                // Cycle harness
-                let next = cycle_harness(app.harness);
+                // Cycle harness only over available harnesses with supply
+                let next = cycle_available_harness(app.harness, &app.snapshots);
                 if let Some(session_id) = &app.session_id {
-                    AppAction::SendMessage(ClientMessage::SwitchHarness {
-                        session_id: session_id.clone(),
-                        target: next,
-                        with_handoff: true,
-                    })
+                    if next != app.harness {
+                        AppAction::SendMessage(ClientMessage::SwitchHarness {
+                            session_id: session_id.clone(),
+                            target: next,
+                            with_handoff: true,
+                        })
+                    } else {
+                        app.set_status(format!(
+                            "Apenas {} possui capacidade disponível",
+                            app.harness.binary_name()
+                        ));
+                        AppAction::None
+                    }
                 } else {
                     AppAction::None
                 }
@@ -206,9 +248,7 @@ fn handle_palette_key(app: &mut App, key: KeyEvent) -> AppAction {
             app.ui_mode = UiMode::Normal;
             AppAction::None
         }
-        KeyCode::Enter => {
-            execute_palette_command(app, &input)
-        }
+        KeyCode::Enter => execute_palette_command(app, &input),
         KeyCode::Backspace => {
             if let UiMode::Palette { input, .. } = &mut app.ui_mode {
                 input.pop();
@@ -235,6 +275,7 @@ fn handle_palette_key(app: &mut App, key: KeyEvent) -> AppAction {
 }
 
 const PALETTE_COMMANDS: &[&str] = &[
+    "/task <descrição>",
     "/switch agy",
     "/switch claude",
     "/switch codex",
@@ -277,6 +318,27 @@ pub fn execute_palette_command(app: &mut App, raw_cmd: &str) -> AppAction {
     let verb = parts.next().unwrap_or("");
 
     match verb {
+        "task" => {
+            let task_text = normalized
+                .strip_prefix("task")
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            app.ui_mode = UiMode::Normal;
+            if task_text.is_empty() {
+                app.set_status("Uso: /task <texto da tarefa>");
+                AppAction::None
+            } else if let Some(session_id) = app.session_id.clone() {
+                app.set_status(format!("Tarefa enviada: {}", task_text));
+                AppAction::SendMessage(ClientMessage::SubmitTask {
+                    session_id,
+                    task: task_text,
+                })
+            } else {
+                app.set_status("Nenhuma sessão ativa para submeter tarefa");
+                AppAction::None
+            }
+        }
         "switch" => {
             let target_str = parts.next().unwrap_or("");
             let harness = match target_str {

@@ -1,11 +1,11 @@
 //! Footer component rendering assisted-mode recommendation banner and prefix shortcuts hint.
 
+use crate::state::{App, RecommendationState};
 use aihub_core::Mode;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use crate::state::App;
 
 /// Renders the footer banner, prefix hint, and status message.
 pub fn render_footer(app: &App, area: Rect, buf: &mut Buffer) {
@@ -27,32 +27,48 @@ pub fn render_footer(app: &App, area: Rect, buf: &mut Buffer) {
     if app.mode == Mode::Assisted {
         if let Some(rec) = &app.recommendation {
             if current_y < area.bottom() {
-                let banner_line = Line::from(vec![
-                    Span::styled(
-                        "💡 [RECOMENDAÇÃO] ",
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw("Trocar para "),
-                    Span::styled(
-                        rec.harness.binary_name(),
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(format!(
-                        " ({}) [confiança: {:.0}%] — ",
-                        rec.reason,
-                        rec.confidence * 100.0
-                    )),
-                    Span::styled(
-                        "Pressione ^] seguido de Enter para aceitar",
-                        Style::default()
-                            .fg(Color::Green)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]);
+                let banner_line = match rec {
+                    RecommendationState::Recommended {
+                        harness,
+                        reason,
+                        confidence,
+                        ..
+                    } => Line::from(vec![
+                        Span::styled(
+                            "💡 [RECOMENDAÇÃO] ",
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw("Trocar para "),
+                        Span::styled(
+                            harness.binary_name(),
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(format!(
+                            " ({}) [confiança: {:.0}%] — ",
+                            reason,
+                            confidence * 100.0
+                        )),
+                        Span::styled(
+                            "Pressione ^] seguido de Enter para aceitar",
+                            Style::default()
+                                .fg(Color::Green)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]),
+                    RecommendationState::NoCapacity { reason } => Line::from(vec![
+                        Span::styled(
+                            "ℹ️ [SEM CAPACIDADE] ",
+                            Style::default()
+                                .fg(Color::LightYellow)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(format!("{} — Aceitar indisponível", reason)),
+                    ]),
+                };
 
                 buf.set_line(area.left(), current_y, &banner_line, area.width);
                 current_y += 1;
@@ -63,14 +79,12 @@ pub fn render_footer(app: &App, area: Rect, buf: &mut Buffer) {
     // 2. Status message (if active)
     if let Some((msg, _)) = &app.status_message {
         if current_y < area.bottom() {
-            let status_line = Line::from(vec![
-                Span::styled(
-                    format!("💬 {}", msg),
-                    Style::default()
-                        .fg(Color::LightYellow)
-                        .add_modifier(Modifier::ITALIC),
-                ),
-            ]);
+            let status_line = Line::from(vec![Span::styled(
+                format!("💬 {}", msg),
+                Style::default()
+                    .fg(Color::LightYellow)
+                    .add_modifier(Modifier::ITALIC),
+            )]);
             buf.set_line(area.left(), current_y, &status_line, area.width);
             current_y += 1;
         }
@@ -88,19 +102,52 @@ pub fn render_footer(app: &App, area: Rect, buf: &mut Buffer) {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" Escolha: "),
-                Span::styled("[p|:]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "[p|:]",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(" paleta  "),
-                Span::styled("[Enter]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "[Enter]",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(" aceitar  "),
-                Span::styled("[Tab]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "[Tab]",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(" alternar  "),
-                Span::styled("[m]", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "[m]",
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(" modo  "),
-                Span::styled("[q]", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "[q]",
+                    Style::default()
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(" quotas  "),
-                Span::styled("[d]", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "[d]",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(" desconectar  "),
-                Span::styled("[^]]", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "[^]]",
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(" enviar ^]"),
             ])
         } else {

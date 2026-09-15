@@ -1,5 +1,5 @@
 use aihub_core::*;
-use aihub_router::route;
+use aihub_router::route_outcome as route;
 
 fn window(used: f64, reset: Option<u64>, duration: Option<u64>) -> QuotaWindow {
     QuotaWindow::new(WindowKind::FiveHour, used, reset, duration)
@@ -25,8 +25,8 @@ fn fullest_supply_wins_without_lanes() {
     assert_eq!(
         route(TaskTier::Design, TaskSize::M, &pool, 7200)
             .unwrap()
-            .harness,
-        HarnessId::Codex
+            .harness(),
+        Some(HarnessId::Codex)
     );
 }
 
@@ -47,24 +47,22 @@ fn cursor_exhausted_other_models_never_receives_design() {
     ];
     let claude = slot(HarnessId::ClaudeCode, vec![window(40., None, None)]);
     let result = route(TaskTier::Design, TaskSize::M, &[cursor, claude], 7200).unwrap();
-    assert_eq!(result.harness, HarnessId::ClaudeCode);
-    assert_eq!(result.lane, None);
+    assert_eq!(result.harness(), Some(HarnessId::ClaudeCode));
+    assert_eq!(result.lane(), None);
 }
 
 #[test]
 fn codex_full_five_hour_window_is_held_twenty_minutes() {
-    let mut codex = slot(
+    let codex = slot(
         HarnessId::Codex,
         vec![
             window(100., Some(1200), Some(18000)),
             window(20., Some(200000), Some(604800)),
         ],
     );
-    codex.status = QuotaStatus::Empty;
     let result = route(TaskTier::Design, TaskSize::L, &[codex], 7200).unwrap();
-    assert_eq!(result.harness, HarnessId::Codex);
-    assert_eq!(result.holds_until_s, Some(1200));
-    assert!(result.reason.contains("supply 80.0%"));
+    assert_eq!(result.harness(), Some(HarnessId::Codex));
+    assert_eq!(result.holds_until_s(), Some(1200));
 }
 
 #[test]
@@ -76,9 +74,8 @@ fn all_empty_or_no_snapshots_is_a_no_launch_recommendation() {
     empty.status = QuotaStatus::Empty;
     for pool in [vec![empty], vec![]] {
         let result = route(TaskTier::Review, TaskSize::S, &pool, 7200).unwrap();
-        assert!(result.reason.starts_with("No available slots:"));
-        assert!(result.reason.contains("do not launch"));
-        assert_eq!(result.holds_until_s, None);
+        assert!(matches!(result, RouteOutcome::NoCapacity { .. }));
+        assert_eq!(result.holds_until_s(), None);
     }
 }
 
@@ -93,22 +90,19 @@ fn preferred_lane_and_threefold_penalty_match_script() {
         assert_eq!(
             route(tier, TaskSize::M, &[agy.clone()], 7200)
                 .unwrap()
-                .lane
-                .as_deref(),
+                .lane(),
             Some("third-party")
         );
     }
     assert_eq!(
         route(TaskTier::Mechanical, TaskSize::S, &[agy.clone()], 7200)
             .unwrap()
-            .lane
-            .as_deref(),
+            .lane(),
         Some("gemini")
     );
     agy.lanes[1].windows[0].used_pct = 80.;
     let result = route(TaskTier::Design, TaskSize::L, &[agy], 7200).unwrap();
-    assert_eq!(result.lane.as_deref(), Some("gemini"));
-    assert!(result.reason.contains("nonpreferred"));
+    assert_eq!(result.lane(), Some("gemini"));
 }
 
 #[test]
@@ -128,13 +122,13 @@ fn windows_take_minimum_after_refills_not_before() {
         7200,
     )
     .unwrap();
-    assert_eq!(result.harness, HarnessId::Codex);
-    assert_eq!(result.holds_until_s, Some(600));
+    assert_eq!(result.harness(), Some(HarnessId::Codex));
+    assert_eq!(result.holds_until_s(), Some(600));
     assert_eq!(
         route(TaskTier::Design, TaskSize::M, &[codex, claude], 300)
             .unwrap()
-            .harness,
-        HarnessId::ClaudeCode
+            .harness(),
+        Some(HarnessId::ClaudeCode)
     );
 }
 
@@ -149,8 +143,8 @@ fn a_nonrefilling_exhausted_weekly_gate_blocks_even_with_five_hour_reset() {
     );
     assert!(route(TaskTier::Review, TaskSize::M, &[codex], 7200)
         .unwrap()
-        .reason
-        .starts_with("No available slots:"));
+        .reason()
+        .is_some());
 }
 
 #[test]
@@ -163,17 +157,15 @@ fn latest_blocked_reset_and_multiple_refills_match_script() {
         ],
     );
     let result = route(TaskTier::Design, TaskSize::M, &[codex], 7200).unwrap();
-    assert_eq!(result.holds_until_s, Some(1200));
-    assert!(result.reason.contains("supply 105.0%"));
+    assert_eq!(result.holds_until_s(), Some(1200));
     let fast = slot(HarnessId::Codex, vec![window(100., Some(0), Some(3600))]);
     let result = route(TaskTier::Mechanical, TaskSize::S, &[fast], 7200).unwrap();
-    assert!(result.reason.contains("supply 300.0%"));
+    assert_eq!(result.holds_until_s(), Some(0));
 }
 
 #[test]
 fn independent_lane_windows_replace_aggregate_and_can_hold() {
     let mut agy = slot(HarnessId::Antigravity, vec![window(100., None, None)]);
-    agy.status = QuotaStatus::Empty;
     agy.lanes = vec![QuotaLane {
         name: "third-party".into(),
         kind: LaneKind::Frontier,
@@ -183,13 +175,12 @@ fn independent_lane_windows_replace_aggregate_and_can_hold() {
         ],
     }];
     let result = route(TaskTier::Design, TaskSize::M, &[agy], 7200).unwrap();
-    assert_eq!(result.lane.as_deref(), Some("third-party"));
-    assert_eq!(result.holds_until_s, Some(1200));
-    assert!(result.reason.contains("supply 60.0%"));
+    assert_eq!(result.lane(), Some("third-party"));
+    assert_eq!(result.holds_until_s(), Some(1200));
 }
 
 #[test]
-fn low_slots_are_last_resort_unknown_slots_have_neutral_supply() {
+fn low_slots_remain_eligible_unknown_slots_are_excluded() {
     let mut low = slot(HarnessId::Codex, vec![window(90., None, None)]);
     low.status = QuotaStatus::Low;
     let mut unknown = slot(HarnessId::ClaudeCode, vec![]);
@@ -202,12 +193,11 @@ fn low_slots_are_last_resort_unknown_slots_have_neutral_supply() {
             7200
         )
         .unwrap()
-        .harness,
-        HarnessId::ClaudeCode
+        .harness(),
+        Some(HarnessId::Codex)
     );
     let result = route(TaskTier::Mechanical, TaskSize::L, &[low], 7200).unwrap();
-    assert_eq!(result.harness, HarnessId::Codex);
-    assert!(result.reason.contains("demand exceeds"));
+    assert_eq!(result.harness(), Some(HarnessId::Codex));
 }
 
 #[test]
@@ -216,8 +206,8 @@ fn missing_or_zero_window_duration_does_not_invent_refill() {
         let empty = slot(HarnessId::Codex, vec![window(100., Some(1200), duration)]);
         assert!(route(TaskTier::Design, TaskSize::M, &[empty], 7200)
             .unwrap()
-            .reason
-            .starts_with("No available slots:"));
+            .reason()
+            .is_some());
     }
 }
 
@@ -230,7 +220,7 @@ fn equal_scores_preserve_input_order() {
     assert_eq!(
         route(TaskTier::Review, TaskSize::M, &pool, 7200)
             .unwrap()
-            .harness,
-        HarnessId::Codex
+            .harness(),
+        Some(HarnessId::Codex)
     );
 }

@@ -1,10 +1,8 @@
 //! Keystroke routing, prefix chord, and palette execution tests.
 
-use std::path::PathBuf;
-use aihub_core::{
-    ClientMessage, HarnessId, MergeStrategy, Mode, SessionId, TaskTier,
-};
+use aihub_core::{ClientMessage, HarnessId, MergeStrategy, Mode, SessionId, TaskTier};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::path::PathBuf;
 
 use aihub::keys::{cycle_harness, handle_key, key_event_to_bytes, AppAction};
 use aihub::state::{App, RecommendationState, UiMode};
@@ -23,8 +21,14 @@ fn test_plain_keystrokes_go_to_pty() {
     app.session_id = Some(SessionId::new("test-session"));
 
     // Direct key_event_to_bytes test
-    assert_eq!(key_event_to_bytes(plain_key(KeyCode::Char('z'))), Some(b"z".to_vec()));
-    assert_eq!(key_event_to_bytes(plain_key(KeyCode::Esc)), Some(vec![0x1B]));
+    assert_eq!(
+        key_event_to_bytes(plain_key(KeyCode::Char('z'))),
+        Some(b"z".to_vec())
+    );
+    assert_eq!(
+        key_event_to_bytes(plain_key(KeyCode::Esc)),
+        Some(vec![0x1B])
+    );
 
     // Letter 'a'
     let action = handle_key(&mut app, plain_key(KeyCode::Char('a')));
@@ -47,11 +51,17 @@ fn test_plain_keystrokes_go_to_pty() {
     assert_eq!(action, AppAction::SendPtyInput(b"\x1b[A".to_vec()));
 
     // Ctrl+C
-    let action = handle_key(&mut app, make_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    let action = handle_key(
+        &mut app,
+        make_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    );
     assert_eq!(action, AppAction::SendPtyInput(vec![3]));
 
     // Ctrl+D
-    let action = handle_key(&mut app, make_key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+    let action = handle_key(
+        &mut app,
+        make_key(KeyCode::Char('d'), KeyModifiers::CONTROL),
+    );
     assert_eq!(action, AppAction::SendPtyInput(vec![4]));
 }
 
@@ -64,7 +74,11 @@ fn test_prefix_chord_activation() {
     // Ctrl+] activates prefix chord
     let ctrl_bracket = make_key(KeyCode::Char(']'), KeyModifiers::CONTROL);
     let action = handle_key(&mut app, ctrl_bracket);
-    assert_eq!(action, AppAction::None, "Prefix chord should not be sent to PTY");
+    assert_eq!(
+        action,
+        AppAction::None,
+        "Prefix chord should not be sent to PTY"
+    );
     assert!(app.prefix_active, "Prefix chord should be marked active");
 }
 
@@ -75,7 +89,7 @@ fn test_prefix_actions() {
     app.session_id = Some(session.clone());
     app.harness = HarnessId::ClaudeCode;
     app.mode = Mode::Assisted;
-    app.recommendation = Some(RecommendationState {
+    app.recommendation = Some(RecommendationState::Recommended {
         tier: TaskTier::Mechanical,
         harness: HarnessId::Antigravity,
         lane: None,
@@ -292,4 +306,218 @@ fn test_cycle_harness() {
     assert_eq!(cycle_harness(HarnessId::Antigravity), HarnessId::Codex);
     assert_eq!(cycle_harness(HarnessId::Codex), HarnessId::CursorAgent);
     assert_eq!(cycle_harness(HarnessId::CursorAgent), HarnessId::ClaudeCode);
+}
+
+#[test]
+fn f9_task_submission_via_palette() {
+    let mut app = App::new(PathBuf::from("/test/repo"));
+    let session = SessionId::new("sess-f9");
+    app.session_id = Some(session.clone());
+
+    // 1. /task command via palette
+    let action = aihub::keys::execute_palette_command(&mut app, "/task improve test coverage");
+    assert_eq!(
+        action,
+        AppAction::SendMessage(ClientMessage::SubmitTask {
+            session_id: session.clone(),
+            task: "improve test coverage".to_string(),
+        })
+    );
+    assert!(
+        app.status_message.is_some(),
+        "Status message should acknowledge submitted task"
+    );
+
+    // 2. Empty task shows usage and sends nothing
+    let action_empty = aihub::keys::execute_palette_command(&mut app, "/task");
+    assert_eq!(action_empty, AppAction::None);
+
+    // 3. Normal typing to PTY never generates SubmitTask
+    let pty_action = handle_key(&mut app, plain_key(KeyCode::Char('x')));
+    assert_eq!(pty_action, AppAction::SendPtyInput(b"x".to_vec()));
+}
+
+#[test]
+fn f9_task_submission_via_cli_argument() {
+    use aihub::cli::Cli;
+    use clap::Parser;
+
+    // Bare aihub has no task
+    let bare = Cli::try_parse_from(["aihub"]).unwrap();
+    assert!(bare.task.is_none());
+
+    // aihub with task argument
+    let with_task = Cli::try_parse_from(["aihub", "implement user login"]).unwrap();
+    assert_eq!(with_task.task, Some("implement user login".to_string()));
+    assert!(with_task.command.is_none());
+
+    // aihub with socket and task argument
+    let with_sock_and_task =
+        Cli::try_parse_from(["aihub", "--socket", "/tmp/sock", "run benchmarks"]).unwrap();
+    assert_eq!(with_sock_and_task.task, Some("run benchmarks".to_string()));
+    assert_eq!(with_sock_and_task.socket, Some(PathBuf::from("/tmp/sock")));
+}
+
+#[test]
+fn f10_accept_on_no_capacity_sends_nothing() {
+    let mut app = App::new(PathBuf::from("/test/repo"));
+    let session = SessionId::new("sess-f10");
+    app.session_id = Some(session.clone());
+    app.mode = Mode::Assisted;
+
+    // Set NoCapacity outcome
+    app.recommendation = Some(RecommendationState::NoCapacity {
+        reason: "All provider quota windows exhausted".to_string(),
+    });
+
+    let ctrl_bracket = make_key(KeyCode::Char(']'), KeyModifiers::CONTROL);
+
+    // Activate prefix
+    handle_key(&mut app, ctrl_bracket);
+    assert!(app.prefix_active);
+
+    // Press Enter to accept
+    let action = handle_key(&mut app, plain_key(KeyCode::Enter));
+
+    // Must NOT send SwitchHarness or any client message
+    assert_eq!(
+        action,
+        AppAction::None,
+        "Accepting NoCapacity must send nothing"
+    );
+
+    // Must inform user in status
+    assert!(
+        app.status_message.is_some(),
+        "Status should explain that acceptance is unavailable"
+    );
+    let (status_text, _) = app.status_message.unwrap();
+    assert!(
+        status_text.contains("Não é possível aceitar")
+            && status_text.contains("All provider quota windows exhausted"),
+        "Status should contain reason: got '{}'",
+        status_text
+    );
+}
+
+#[test]
+fn test_tab_cycles_available_harnesses_only() {
+    use aihub::keys::cycle_available_harness;
+    use aihub_core::{QuotaSnapshot, QuotaStatus, SlotId};
+
+    let snapshots = vec![
+        QuotaSnapshot {
+            slot: SlotId::new(HarnessId::ClaudeCode, "def"),
+            status: QuotaStatus::Ok,
+            source: aihub_core::QuotaSource::Vendor,
+            estimated: false,
+            note: None,
+            windows: vec![],
+            lanes: vec![],
+        },
+        QuotaSnapshot {
+            slot: SlotId::new(HarnessId::Antigravity, "def"),
+            status: QuotaStatus::Unknown, // Not available
+            source: aihub_core::QuotaSource::Vendor,
+            estimated: false,
+            note: None,
+            windows: vec![],
+            lanes: vec![],
+        },
+        QuotaSnapshot {
+            slot: SlotId::new(HarnessId::Codex, "def"),
+            status: QuotaStatus::Empty, // Not available
+            source: aihub_core::QuotaSource::Vendor,
+            estimated: false,
+            note: None,
+            windows: vec![],
+            lanes: vec![],
+        },
+        QuotaSnapshot {
+            slot: SlotId::new(HarnessId::CursorAgent, "def"),
+            status: QuotaStatus::Low, // Available!
+            source: aihub_core::QuotaSource::Vendor,
+            estimated: false,
+            note: None,
+            windows: vec![],
+            lanes: vec![],
+        },
+    ];
+
+    // Starting at ClaudeCode, next available MUST skip Antigravity (Unknown) and Codex (Empty) -> CursorAgent
+    let next1 = cycle_available_harness(HarnessId::ClaudeCode, &snapshots);
+    assert_eq!(next1, HarnessId::CursorAgent);
+
+    // Starting at CursorAgent, next available cycles back to ClaudeCode
+    let next2 = cycle_available_harness(HarnessId::CursorAgent, &snapshots);
+    assert_eq!(next2, HarnessId::ClaudeCode);
+
+    // Starting at Codex (which is Empty), picking next available jumps to first available
+    let next3 = cycle_available_harness(HarnessId::Codex, &snapshots);
+    assert!(next3 == HarnessId::ClaudeCode || next3 == HarnessId::CursorAgent);
+
+    // Test in handle_normal_key with Tab
+    let mut app = App::new(PathBuf::from("/test/repo"));
+    let session = SessionId::new("sess-tab");
+    app.session_id = Some(session.clone());
+    app.harness = HarnessId::ClaudeCode;
+    app.snapshots = snapshots;
+
+    let ctrl_bracket = make_key(KeyCode::Char(']'), KeyModifiers::CONTROL);
+    handle_key(&mut app, ctrl_bracket);
+    let action = handle_key(&mut app, plain_key(KeyCode::Tab));
+    assert_eq!(
+        action,
+        AppAction::SendMessage(ClientMessage::SwitchHarness {
+            session_id: session,
+            target: HarnessId::CursorAgent,
+            with_handoff: true,
+        })
+    );
+}
+
+#[test]
+fn test_merge_strategy_preserved_across_merge_result() {
+    use aihub::handle_daemon_msg;
+    use aihub_core::DaemonMessage;
+
+    let mut app = App::new(PathBuf::from("/test/repo"));
+    let session = SessionId::new("sess-merge");
+    app.session_id = Some(session.clone());
+
+    // User previously selected FastForward in merge review
+    app.ui_mode = UiMode::MergeReview {
+        diff: "+ original diff".to_string(),
+        message: "Review diff".to_string(),
+        strategy: MergeStrategy::FastForward,
+        scroll: 3,
+    };
+
+    // Daemon sends initial/updated review diff with success: false
+    let msg = DaemonMessage::MergeResult {
+        session_id: session.clone(),
+        success: false,
+        diff: "+ updated diff".to_string(),
+        message: "Confirm merge".to_string(),
+    };
+    handle_daemon_msg(&mut app, msg);
+
+    // Strategy must remain FastForward, NOT reset to Squash
+    match &app.ui_mode {
+        UiMode::MergeReview {
+            strategy,
+            diff,
+            scroll,
+            ..
+        } => {
+            assert_eq!(
+                *strategy,
+                MergeStrategy::FastForward,
+                "Merge strategy must be preserved"
+            );
+            assert_eq!(diff, "+ updated diff");
+            assert_eq!(*scroll, 3);
+        }
+        _ => panic!("Expected UiMode::MergeReview"),
+    }
 }

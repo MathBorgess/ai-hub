@@ -1,7 +1,7 @@
+use crate::ipc::IpcMessage;
 use bytes::{Buf, BufMut, BytesMut};
 use thiserror::Error;
 use tokio_util::codec::{Decoder, Encoder};
-use crate::ipc::IpcMessage;
 
 /// Default maximum allowed frame length (32 MiB), comfortably accommodating 1+ MiB PTY chunks.
 pub const DEFAULT_MAX_FRAME_LENGTH: usize = 32 * 1024 * 1024;

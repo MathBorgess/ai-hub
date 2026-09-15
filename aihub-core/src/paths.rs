@@ -1,5 +1,5 @@
-use std::path::{Path, PathBuf};
 use crate::types::SessionId;
+use std::path::{Path, PathBuf};
 
 /// Returns the default data directory for aihub (`~/.local/share/aihub`).
 pub fn default_data_dir() -> PathBuf {
@@ -49,7 +49,10 @@ mod tests {
     fn test_custom_paths() {
         let temp = Path::new("/custom/tmp");
         let data = Path::new("/custom/data");
-        assert_eq!(socket_path_in(data), PathBuf::from("/custom/data/aihub.sock"));
+        assert_eq!(
+            socket_path_in(data),
+            PathBuf::from("/custom/data/aihub.sock")
+        );
         let root = worktree_root_in(temp);
         assert_eq!(root, PathBuf::from("/custom/tmp/aihub/worktrees"));
 

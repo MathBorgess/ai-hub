@@ -1,6 +1,16 @@
-use aihub_core::{HarnessId, QuotaSnapshot, TaskSize, TaskTier};
+use std::future::Future;
+use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
+
+use aihub_core::{HarnessId, LaneKind, QuotaSnapshot, RouteOutcome, TaskSize, TaskTier};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+/// Same bound as `classify`: prompts longer than this may invoke the fallback.
+pub const CLASSIFY_FALLBACK_LEN_THRESHOLD: usize = 2000;
+
+const FALLBACK_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Error)]
 pub enum RouterError {
@@ -20,16 +30,6 @@ pub struct Classification {
     pub tier: TaskTier,
     pub confidence: f32,
     pub ambiguous: bool,
-}
-
-/// Detailed routing recommendation for a given task and supply state.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Recommendation {
-    pub tier: TaskTier,
-    pub harness: HarnessId,
-    pub lane: Option<String>,
-    pub holds_until_s: Option<u64>,
-    pub reason: String,
 }
 
 /// Classifies EN/PT-BR action words without regex compilation or I/O.
@@ -179,28 +179,226 @@ pub async fn try_classify_with_cli(prompt: &str) -> Option<Classification> {
     }).await.ok().flatten()
 }
 
-/// Resolves one task using handoff.mjs's initial costs (S=3, M=8, L=18),
-/// horizon supply per window at the minimum, and a 3x nonpreferred-lane penalty.
-/// Equal scores preserve snapshot/lane order. Unknown supply has neutral weight
-/// 50; low slots are used only if no healthy/refilling slot exists.
-/// Lane windows replace the slot's aggregate windows, matching the script.
-/// Unlike the script's unconditional Empty exclusion, a measured exhausted
-/// window that refills inside the horizon remains eligible as required here.
-/// `holds_until_s` is a duration from this snapshot, in seconds (not Unix time).
-/// A lane is a preference only: this API cannot pin a CLI model.
+fn can_refill(w: &aihub_core::QuotaWindow, horizon_s: u64) -> bool {
+    w.resets_in_s.is_some_and(|r| r <= horizon_s) && w.window_s.is_some_and(|s| s > 0)
+}
+
+fn window_supply(w: &aihub_core::QuotaWindow, horizon_s: u64) -> f64 {
+    if !w.used_pct.is_finite() || !(0.0..=100.0).contains(&w.used_pct) {
+        return 50.0;
+    }
+    let mut supply = 100.0 - w.used_pct;
+    if can_refill(w, horizon_s) {
+        let after = horizon_s - w.resets_in_s.unwrap_or(0);
+        supply += 100.0 * (1.0 + (after / w.window_s.unwrap_or(1)) as f64);
+    }
+    supply
+}
+
+/// Assigns optimal harness, lane, and hold duration, returning the typed RouteOutcome from core (F10).
 ///
-/// With no supply, returns a recommendation whose reason starts with
-/// `No available slots:`. Its mandatory harness field is a placeholder, NEVER
-/// an instruction to launch. Callers must handle that outcome before dispatch.
-/// // ponytail: This one-task API has no accumulated load, cost history, account
-/// selection output, or model pin. Batch balancing needs a richer contract.
-pub fn route(
+/// `Unknown` and `Empty` quota slots are never candidates. When nothing can take the task,
+/// returns `RouteOutcome::NoCapacity` instead of a dispatchable recommendation.
+pub fn route_outcome(
     tier: TaskTier,
     size: TaskSize,
     snapshots: &[QuotaSnapshot],
     horizon_s: u64,
-) -> Result<Recommendation, RouterError> {
-    use aihub_core::{LaneKind, QuotaStatus};
+) -> Result<RouteOutcome, RouterError> {
+    let Some((snapshot, lane, hold)) =
+        select_route_candidate(tier, size, snapshots, horizon_s, true)?
+    else {
+        let reason = if snapshots.is_empty() {
+            "No available slots: no quota snapshots supplied; do not launch.".into()
+        } else {
+            "No available slots: every slot is empty, unknown, or has no supply inside the horizon; do not launch.".into()
+        };
+        return Ok(RouteOutcome::NoCapacity { reason });
+    };
+    Ok(RouteOutcome::Recommendation {
+        harness: snapshot.slot.harness,
+        lane: lane.map(|l| l.name.clone()),
+        model: model_for_lane(snapshot.slot.harness, lane.map(|l| l.name.as_str())),
+        holds_until_s: hold,
+    })
+}
+
+/// Alias for `route_outcome`.
+pub fn route_typed(
+    tier: TaskTier,
+    size: TaskSize,
+    snapshots: &[QuotaSnapshot],
+    horizon_s: u64,
+) -> Result<RouteOutcome, RouterError> {
+    route_outcome(tier, size, snapshots, horizon_s)
+}
+
+/// Async classification entry that invokes LLM fallback for ambiguous or long tasks (F9).
+pub async fn classify_with_fallback(prompt: &str) -> Classification {
+    let local = classify(prompt);
+    let needs_fallback = local.ambiguous || prompt.len() > CLASSIFY_FALLBACK_LEN_THRESHOLD;
+    if !needs_fallback {
+        return local;
+    }
+    match tokio::time::timeout(FALLBACK_TIMEOUT, try_classify_with_cli(prompt)).await {
+        Ok(Some(answer)) => answer,
+        _ => local,
+    }
+}
+
+/// Like [`classify_with_fallback`], but accepts an injected fallback (tests only).
+pub async fn classify_with_fallback_using<F, Fut>(prompt: &str, fallback: F) -> Classification
+where
+    F: for<'a> FnOnce(&'a str) -> Fut,
+    Fut: Future<Output = Option<Classification>>,
+{
+    let local = classify(prompt);
+    let needs_fallback = local.ambiguous || prompt.len() > CLASSIFY_FALLBACK_LEN_THRESHOLD;
+    if !needs_fallback {
+        return local;
+    }
+    let fb = tokio::time::timeout(FALLBACK_TIMEOUT, fallback(prompt)).await;
+    match fb {
+        Ok(Some(answer)) => answer,
+        _ => local,
+    }
+}
+
+/// Parses model ids from `cursor-agent --list-models` or `agy models` stdout (fixture-safe).
+pub fn parse_cli_model_list(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .map(trim_model_line)
+        .filter(|line| {
+            !line.is_empty()
+                && line
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphanumeric())
+                && line.len() <= 49
+                && line
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+fn trim_model_line(line: &str) -> &str {
+    line.trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '*' | '-' | '•'))
+        .trim()
+}
+
+/// Maps harness and lane to a model id using fixture CLI list output (no subprocess).
+pub fn lane_to_model_id_from_list(
+    harness: HarnessId,
+    lane: &str,
+    list_stdout: &str,
+) -> Option<String> {
+    let models = parse_cli_model_list(list_stdout);
+    pick_model_for_lane(harness, lane, &models)
+}
+
+/// Resolves the recommended CLI model identifier for a given harness and lane (plan §3.3).
+pub fn lane_to_model_id(harness: HarnessId, lane: &str) -> Option<String> {
+    let models = cached_cli_models(harness)?;
+    pick_model_for_lane(harness, lane, &models)
+}
+
+/// Helper mapping an optional lane name to a model identifier for a harness.
+pub fn model_for_lane(harness: HarnessId, lane: Option<&str>) -> Option<String> {
+    lane.and_then(|name| lane_to_model_id(harness, name))
+}
+
+fn cached_cli_models(harness: HarnessId) -> Option<Vec<String>> {
+    static CURSOR: OnceLock<Mutex<Option<Vec<String>>>> = OnceLock::new();
+    static AGY: OnceLock<Mutex<Option<Vec<String>>>> = OnceLock::new();
+    let slot = match harness {
+        HarnessId::CursorAgent => CURSOR.get_or_init(|| Mutex::new(None)),
+        HarnessId::Antigravity => AGY.get_or_init(|| Mutex::new(None)),
+        _ => return None,
+    };
+    let mut guard = slot.lock().ok()?;
+    if guard.is_none() {
+        *guard = Some(fetch_cli_models(harness).unwrap_or_default());
+    }
+    guard.as_ref().filter(|v| !v.is_empty()).cloned()
+}
+
+fn fetch_cli_models(harness: HarnessId) -> Option<Vec<String>> {
+    let (bin, args): (&str, &[&str]) = match harness {
+        HarnessId::CursorAgent => ("cursor-agent", &["--list-models"]),
+        HarnessId::Antigravity => ("agy", &["models"]),
+        _ => return None,
+    };
+    let output = Command::new(bin)
+        .args(args)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let list = parse_cli_model_list(&String::from_utf8_lossy(&output.stdout));
+    if list.is_empty() {
+        None
+    } else {
+        Some(list)
+    }
+}
+
+fn lane_kind_for_name(lane: &str) -> Option<LaneKind> {
+    match lane {
+        "cursor-models" | "gemini" => Some(LaneKind::Own),
+        "other-models" | "third-party" => Some(LaneKind::Frontier),
+        _ => None,
+    }
+}
+
+fn model_lane_kind(harness: HarnessId, model: &str) -> Option<LaneKind> {
+    let lower = model.to_ascii_lowercase();
+    match harness {
+        HarnessId::CursorAgent => Some(
+            if lower == "auto" || lower.contains("composer") || lower.contains("grok") {
+                LaneKind::Own
+            } else {
+                LaneKind::Frontier
+            },
+        ),
+        HarnessId::Antigravity => Some(if lower.starts_with("gemini") {
+            LaneKind::Own
+        } else {
+            LaneKind::Frontier
+        }),
+        _ => None,
+    }
+}
+
+fn pick_model_for_lane(harness: HarnessId, lane: &str, models: &[String]) -> Option<String> {
+    let wanted = lane_kind_for_name(lane)?;
+    let in_lane: Vec<_> = models
+        .iter()
+        .filter(|m| model_lane_kind(harness, m.as_str()) == Some(wanted))
+        .cloned()
+        .collect();
+    in_lane
+        .iter()
+        .find(|m| !m.eq_ignore_ascii_case("auto"))
+        .or(in_lane.first())
+        .cloned()
+}
+
+type RoutePick<'a> = (
+    &'a QuotaSnapshot,
+    Option<&'a aihub_core::QuotaLane>,
+    Option<u64>,
+);
+
+fn select_route_candidate(
+    tier: TaskTier,
+    size: TaskSize,
+    snapshots: &[QuotaSnapshot],
+    horizon_s: u64,
+    exclude_unknown_empty: bool,
+) -> Result<Option<RoutePick<'_>>, RouterError> {
+    use aihub_core::QuotaStatus;
     let wanted = if tier == TaskTier::Mechanical {
         LaneKind::Own
     } else {
@@ -213,6 +411,11 @@ pub fn route(
     };
     let mut candidates = Vec::new();
     for snapshot in snapshots {
+        if exclude_unknown_empty
+            && matches!(snapshot.status, QuotaStatus::Unknown | QuotaStatus::Empty)
+        {
+            continue;
+        }
         let options: Vec<_> = if snapshot.lanes.is_empty() {
             vec![None]
         } else {
@@ -231,9 +434,8 @@ pub fn route(
                 .unwrap_or(50.0);
             let reopens = windows.iter().any(|w| can_refill(w, horizon_s));
             refills |= reopens;
-            // Empty without a measured depleted window that reopens may be an
-            // externally rate-limited slot, so do not infer availability.
-            if snapshot.status == QuotaStatus::Empty
+            if !exclude_unknown_empty
+                && snapshot.status == QuotaStatus::Empty
                 && !windows
                     .iter()
                     .any(|w| w.used_pct >= 100.0 && can_refill(w, horizon_s))
@@ -255,7 +457,11 @@ pub fn route(
             };
             slot_candidates.push((snapshot, lane, supply, cost / supply * penalty, hold));
         }
-        let healthy = matches!(snapshot.status, QuotaStatus::Ok | QuotaStatus::Unknown) || refills;
+        let healthy = if exclude_unknown_empty {
+            matches!(snapshot.status, QuotaStatus::Ok | QuotaStatus::Low) || refills
+        } else {
+            matches!(snapshot.status, QuotaStatus::Ok | QuotaStatus::Unknown) || refills
+        };
         candidates.extend(slot_candidates.into_iter().map(|c| (healthy, c)));
     }
     let healthy_exists = candidates.iter().any(|(healthy, _)| *healthy);
@@ -263,50 +469,5 @@ pub fn route(
         .into_iter()
         .filter(|(healthy, _)| !healthy_exists || *healthy)
         .min_by(|a, b| a.1 .3.total_cmp(&b.1 .3));
-    let Some((_, (snapshot, lane, supply, _, hold))) = selected else {
-        return Ok(Recommendation { tier, harness: snapshots.first().map_or(HarnessId::ClaudeCode, |s| s.slot.harness), lane: None, holds_until_s: None,
-            reason: "No available slots: every slot is empty or has no supply inside the horizon; do not launch.".into() });
-    };
-    let mut reason = format!("Projected cost {cost:.0}% / horizon supply {supply:.1}%");
-    if snapshot.status == QuotaStatus::Unknown {
-        reason.push_str("; quota unknown (neutral weight)");
-    }
-    if snapshot.estimated {
-        reason.push_str("; estimated quota");
-    }
-    if lane.is_some_and(|l| l.kind != wanted) {
-        reason.push_str("; nonpreferred lane (3x penalty)");
-    }
-    if lane.is_some() {
-        reason.push_str("; lane preference requires a matching CLI model");
-    }
-    if let Some(seconds) = hold {
-        reason.push_str(&format!("; holds {seconds}s for window reset"));
-    }
-    if cost > supply {
-        reason.push_str("; demand exceeds available supply");
-    }
-    Ok(Recommendation {
-        tier,
-        harness: snapshot.slot.harness,
-        lane: lane.map(|l| l.name.clone()),
-        holds_until_s: hold,
-        reason,
-    })
-}
-
-fn can_refill(w: &aihub_core::QuotaWindow, horizon_s: u64) -> bool {
-    w.resets_in_s.is_some_and(|r| r <= horizon_s) && w.window_s.is_some_and(|s| s > 0)
-}
-
-fn window_supply(w: &aihub_core::QuotaWindow, horizon_s: u64) -> f64 {
-    if !w.used_pct.is_finite() || !(0.0..=100.0).contains(&w.used_pct) {
-        return 50.0;
-    }
-    let mut supply = 100.0 - w.used_pct;
-    if can_refill(w, horizon_s) {
-        let after = horizon_s - w.resets_in_s.unwrap_or(0);
-        supply += 100.0 * (1.0 + (after / w.window_s.unwrap_or(1)) as f64);
-    }
-    supply
+    Ok(selected.map(|(_, (snapshot, lane, _, _, hold))| (snapshot, lane, hold)))
 }

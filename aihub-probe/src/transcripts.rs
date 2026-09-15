@@ -1,9 +1,9 @@
-use std::path::{Path, PathBuf};
+use crate::ProbeError;
 use aihub_core::{
     HarnessId, QuotaSnapshot, QuotaSource, QuotaStatus, QuotaWindow, SlotId, WindowKind,
 };
 use serde::{Deserialize, Serialize};
-use crate::ProbeError;
+use std::path::{Path, PathBuf};
 
 const HOUR_MS: u64 = 3600 * 1000;
 const BLOCK_MS: u64 = 5 * HOUR_MS;
@@ -112,13 +112,16 @@ pub fn calculate_rolling_windows(turns: &[TranscriptTurn]) -> Vec<QuotaWindow> {
     let now_ms = now_s * 1000;
 
     let blocks = build_blocks_ms(turns, BLOCK_MS);
-    let active = blocks.iter().find(|b| now_ms < b.end_ms && now_ms.saturating_sub(b.last_ts_ms) <= BLOCK_MS);
-    let completed: Vec<&Block> = blocks.iter().filter(|b| {
-        match active {
+    let active = blocks
+        .iter()
+        .find(|b| now_ms < b.end_ms && now_ms.saturating_sub(b.last_ts_ms) <= BLOCK_MS);
+    let completed: Vec<&Block> = blocks
+        .iter()
+        .filter(|b| match active {
             Some(a) => b.start_ms != a.start_ms,
             None => true,
-        }
-    }).collect();
+        })
+        .collect();
 
     let denominator: u64 = completed.iter().map(|b| b.tokens).max().unwrap_or(0);
 
@@ -184,22 +187,37 @@ pub fn parse_transcript_line(line: &str) -> Result<Option<TranscriptTurn>, Probe
         if let Some(msg) = val.get("message") {
             if let Some(usage) = msg.get("usage") {
                 if let Some(inp) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
-                    let out = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let cache_read = usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let out = usage
+                        .get("output_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let cache_read = usage
+                        .get("cache_read_input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
                     let cache_create = if let Some(cc) = usage.get("cache_creation") {
-                        cc.get("ephemeral_5m_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0)
-                            + cc.get("ephemeral_1h_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0)
+                        cc.get("ephemeral_5m_input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0)
+                            + cc.get("ephemeral_1h_input_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0)
                     } else {
-                        usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0)
+                        usage
+                            .get("cache_creation_input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0)
                     };
                     let total_tokens = inp + out + cache_read + cache_create;
 
-                    let timestamp_s = val.get("timestamp")
+                    let timestamp_s = val
+                        .get("timestamp")
                         .and_then(|v| v.as_str())
                         .and_then(parse_iso_to_epoch_s)
                         .unwrap_or(0);
 
-                    let session_id = val.get("sessionId")
+                    let session_id = val
+                        .get("sessionId")
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
@@ -220,30 +238,55 @@ pub fn parse_transcript_line(line: &str) -> Result<Option<TranscriptTurn>, Probe
             if payload.get("type").and_then(|v| v.as_str()) == Some("token_count") {
                 let info = payload.get("info");
                 let tokens = if let Some(last) = info.and_then(|i| i.get("last_token_usage")) {
-                    last.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or_else(|| {
-                        let inp = last.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let cached = last.get("cached_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let out = last.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                        inp + cached + out
-                    })
+                    last.get("total_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or_else(|| {
+                            let inp = last
+                                .get("input_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            let cached = last
+                                .get("cached_input_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            let out = last
+                                .get("output_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            inp + cached + out
+                        })
                 } else if let Some(total) = info.and_then(|i| i.get("total_token_usage")) {
-                    total.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or_else(|| {
-                        let inp = total.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let cached = total.get("cached_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let out = total.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                        inp + cached + out
-                    })
+                    total
+                        .get("total_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or_else(|| {
+                            let inp = total
+                                .get("input_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            let cached = total
+                                .get("cached_input_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            let out = total
+                                .get("output_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            inp + cached + out
+                        })
                 } else {
                     0
                 };
 
-                let timestamp_s = val.get("timestamp")
+                let timestamp_s = val
+                    .get("timestamp")
                     .or_else(|| payload.get("timestamp"))
                     .and_then(|v| v.as_str())
                     .and_then(parse_iso_to_epoch_s)
                     .unwrap_or(0);
 
-                let session_id = val.get("session_id")
+                let session_id = val
+                    .get("session_id")
                     .or_else(|| payload.get("session_id"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
@@ -394,18 +437,18 @@ pub fn estimate_provider_usage(harness: HarnessId, roots: &[PathBuf]) -> Option<
         status,
         source: QuotaSource::Transcript,
         estimated: true,
-        note: Some(format!("estimated from {} turns in transcripts", turns.len())),
+        note: Some(format!(
+            "estimated from {} turns in transcripts",
+            turns.len()
+        )),
         windows,
         lanes: vec![],
     })
 }
 
-/// Probes local transcript JSONL logs to compute rolling usage estimates.
-/// Owned by session 02.
-pub async fn probe() -> Result<Vec<QuotaSnapshot>, ProbeError> {
+fn probe_transcripts_blocking() -> Vec<QuotaSnapshot> {
     let mut out = Vec::new();
 
-    // Claude roots
     let claude_roots: Vec<PathBuf> = crate::claude::claude_config_dirs()
         .into_iter()
         .map(|d| d.join("projects"))
@@ -414,7 +457,6 @@ pub async fn probe() -> Result<Vec<QuotaSnapshot>, ProbeError> {
         out.push(snap);
     }
 
-    // Codex roots
     let codex_roots: Vec<PathBuf> = crate::codex::codex_homes()
         .into_iter()
         .flat_map(|d| vec![d.join("sessions"), d.join("archived_sessions")])
@@ -423,5 +465,13 @@ pub async fn probe() -> Result<Vec<QuotaSnapshot>, ProbeError> {
         out.push(snap);
     }
 
-    Ok(out)
+    out
+}
+
+/// Probes local transcript JSONL logs to compute rolling usage estimates.
+/// Owned by session 02.
+pub async fn probe() -> Result<Vec<QuotaSnapshot>, ProbeError> {
+    tokio::task::spawn_blocking(probe_transcripts_blocking)
+        .await
+        .map_err(|e| ProbeError::Failure(format!("transcript probe failed: {e}")))
 }

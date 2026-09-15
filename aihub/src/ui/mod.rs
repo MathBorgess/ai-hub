@@ -7,9 +7,9 @@ pub mod palette;
 pub mod quota_table;
 pub mod terminal;
 
+use crate::state::{App, UiMode};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use crate::state::{App, UiMode};
 
 /// Renders the complete aihub UI onto the buffer and returns cursor position if any.
 pub fn render_app(app: &App, area: Rect, buf: &mut Buffer) -> Option<(u16, u16)> {
@@ -20,20 +20,28 @@ pub fn render_app(app: &App, area: Rect, buf: &mut Buffer) -> Option<(u16, u16)>
     // Determine footer height:
     // If recommendation is present in assisted mode, reserve 2 lines (or 3 lines if status message),
     // otherwise 1-2 lines.
-    let footer_height: u16 = if app.recommendation.is_some() && app.mode == aihub_core::Mode::Assisted {
-        if app.status_message.is_some() { 3 } else { 2 }
-    } else if app.status_message.is_some() {
-        2
-    } else {
-        1
-    };
+    let footer_height: u16 =
+        if app.recommendation.is_some() && app.mode == aihub_core::Mode::Assisted {
+            if app.status_message.is_some() {
+                3
+            } else {
+                2
+            }
+        } else if app.status_message.is_some() {
+            2
+        } else {
+            1
+        };
+
+    let header_height: u16 = header::header_height(app, area.width)
+        .min(area.height.saturating_sub(footer_height + 1).max(1));
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),                         // Header
-            Constraint::Min(1),                            // Terminal body
-            Constraint::Length(footer_height.min(area.height.saturating_sub(2))), // Footer
+            Constraint::Length(header_height), // Header (1 or 2 lines)
+            Constraint::Min(1),                // Terminal body
+            Constraint::Length(footer_height.min(area.height.saturating_sub(header_height + 1))), // Footer
         ])
         .split(area);
 

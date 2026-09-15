@@ -1,3 +1,4 @@
+mod antigravity;
 mod claude;
 mod codex;
 mod cursor;
@@ -19,7 +20,7 @@ pub(crate) fn extract_from_roots(
         HarnessId::ClaudeCode => claude::extract_from_roots(session_id, worktree_path, roots),
         HarnessId::Codex => codex::extract_from_roots(session_id, worktree_path, roots),
         HarnessId::CursorAgent => cursor::extract_from_roots(session_id, worktree_path, roots),
-        HarnessId::Antigravity => None,
+        HarnessId::Antigravity => antigravity::extract_from_roots(session_id, worktree_path, roots),
     }
 }
 

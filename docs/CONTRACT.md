@@ -14,7 +14,7 @@ Sessions 02 through 09 implement these interfaces in parallel without inter-sess
 - **Transport:** Unix Domain Socket at `~/.local/share/aihub/aihub.sock` (or custom path passed to path helpers).
 - **Framing:** 4-byte big-endian unsigned length prefix (`u32`) preceding a UTF-8 JSON payload.
 - **Maximum Frame Length:** 32 MiB (`DEFAULT_MAX_FRAME_LENGTH = 33_554_432`).
-- **Initial Handshake:** The first frame in both directions MUST be `Hello { version: 1 }`.
+- **Initial Handshake:** The first frame in both directions MUST be `Hello { version: 2 }`.
 - **PTY Streams:** Binary data transmitted in `PtyInput`, `PtyOutput`, and `Attached.scrollback` is wrapped in `Base64Bytes`, serializing directly to a base64 string rather than a JSON array of integers.
 
 ---
@@ -84,6 +84,19 @@ pub struct SessionSummary {
     pub branch: String,
     pub active: bool,
 }
+
+pub enum RouteOutcome {
+    Recommendation {
+        harness: HarnessId,
+        lane: Option<String>,
+        model: Option<String>,
+        holds_until_s: Option<u64>,
+    },
+    NoCapacity {
+        reason: String,
+    },
+}
+pub type RoutingOutcome = RouteOutcome;
 ```
 
 #### Module `aihub_core::quota`
@@ -161,7 +174,7 @@ impl QuotaSnapshot {
 
 #### Module `aihub_core::ipc`
 ```rust
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 pub struct Base64Bytes(pub Vec<u8>);
 impl Base64Bytes {
@@ -197,6 +210,7 @@ pub enum ClientMessage {
     },
     SetMode { session_id: SessionId, mode: Mode },
     MergeRequest { session_id: SessionId, strategy: MergeStrategy },
+    SubmitTask { session_id: SessionId, task: String },
 }
 
 pub enum DaemonMessage {
@@ -208,18 +222,18 @@ pub enum DaemonMessage {
         worktree_path: PathBuf,
         branch: String,
     },
-    Attached { session_id: SessionId, scrollback: Base64Bytes },
+    Attached {
+        session_id: SessionId,
+        scrollback: Base64Bytes,
+        summary: SessionSummary,
+    },
     Detached { session_id: SessionId },
     PtyOutput { session_id: SessionId, data: Base64Bytes },
     SessionExited { session_id: SessionId, exit_code: Option<i32> },
     QuotaPush { snapshots: Vec<QuotaSnapshot> },
     RouteRecommendation {
-        tier: TaskTier,
-        harness: HarnessId,
-        lane: Option<String>,
-        holds_until_s: Option<u64>,
-        confidence: f32,
-        reason: String,
+        session_id: SessionId,
+        outcome: RouteOutcome,
     },
     HarnessSwitched {
         session_id: SessionId,
@@ -359,27 +373,12 @@ pub struct Classification {
     pub ambiguous: bool,
 }
 
-pub struct Recommendation {
-    pub tier: TaskTier,
-    pub harness: HarnessId,
-    pub lane: Option<String>,
-    pub holds_until_s: Option<u64>,
-    pub reason: String,
-}
-
 /// Pure regex / verb heuristics (<2ms) to classify prompt into a task tier.
 pub fn classify(prompt: &str) -> Classification;
 
 /// Fallback LLM prompt classification for ambiguous or lengthy tasks.
 pub async fn classify_with_llm(prompt: &str, api_key: Option<&str>) -> Result<Classification, RouterError>;
 
-/// Assigns optimal harness, lane, and hold duration based on task tier, size, quota snapshots, and horizon.
-pub fn route(
-    tier: TaskTier,
-    size: TaskSize,
-    snapshots: &[QuotaSnapshot],
-    horizon_s: u64,
-) -> Result<Recommendation, RouterError>;
 ```
 
 ---
@@ -407,7 +406,6 @@ pub struct PtySpawnOptions {
 
 pub struct PtyHandle { /* fields managed by session 05 */ }
 impl PtyHandle {
-    pub async fn write(&self, data: &[u8]) -> Result<(), PtyError>;
     pub fn resize(&self, size: PtySize) -> Result<(), PtyError>;
     pub fn subscribe_output(&self) -> tokio::sync::broadcast::Receiver<Vec<u8>>;
     pub fn scrollback_snapshot(&self) -> Vec<u8>;
@@ -462,12 +460,6 @@ pub async fn create_session_worktree(
 /// Generates diff against the base branch.
 pub async fn diff(worktree_path: &Path, base_branch: &str, colored: bool) -> Result<String, GitError>;
 
-/// Finalizes session worktree applying Squash, FastForward, Keep, or Discard.
-pub async fn finish(
-    worktree_path: &Path,
-    strategy: MergeStrategy,
-    base_branch: &str,
-) -> Result<MergeOutcome, GitError>;
 ```
 
 ---
@@ -539,3 +531,135 @@ pub async fn record_handoff(
   - Ratatui / Crossterm interface with statusline, virtual terminal PTY viewport, and command palette.
   - Interactive commands: `/switch`, `/merge`, `/quota`, `Ctrl+P`, `Ctrl+M`.
   - ANSI streaming from `aihubd` over Unix domain socket.
+
+---
+
+## 3. Production Round Contract Extensions
+
+These new public signatures are added additively for production readiness, each owned and implemented by its respective parallel session:
+
+### 3.1. `aihub-pty` (Owned by Session 03)
+
+- **Stop barrier (Finding F4):** Terminate the child's process group, wait up to a timeout, escalate to kill, reap, and return the exit status.
+  ```rust
+  impl PtyHandle {
+      pub async fn stop(&self, timeout: std::time::Duration) -> Result<Option<i32>, PtyError>;
+      pub async fn stop_barrier(&self, timeout: std::time::Duration) -> Result<Option<i32>, PtyError>;
+  }
+  ```
+- **Non-blocking input path (Finding F7):** A bounded queue drained by a writer thread, where a full queue returns an error.
+  ```rust
+  pub enum PtyError {
+      /* existing variants: Io, Pty, NotRunning */
+      QueueFull,
+  }
+
+  impl PtyHandle {
+      pub fn try_write(&self, data: &[u8]) -> Result<(), PtyError>;
+      pub fn write_nonblocking(&self, data: &[u8]) -> Result<(), PtyError>;
+  }
+  ```
+- **Launch recipe with model identifier (Plan §3.3):**
+  ```rust
+  pub fn harness_recipe_with_model(
+      harness: HarnessId,
+      initial_prompt: Option<&str>,
+      model: Option<&str>,
+  ) -> HarnessLaunchRecipe;
+  ```
+
+### 3.2. `aihub-router` (Owned by Session 05)
+
+- **Typed outcome routing (Finding F10):** `route` returning the typed outcome (`RouteOutcome`) from core.
+  ```rust
+  pub fn route_outcome(
+      tier: TaskTier,
+      size: TaskSize,
+      snapshots: &[QuotaSnapshot],
+      horizon_s: u64,
+  ) -> Result<RouteOutcome, RouterError>;
+
+  pub fn route_typed(
+      tier: TaskTier,
+      size: TaskSize,
+      snapshots: &[QuotaSnapshot],
+      horizon_s: u64,
+  ) -> Result<RouteOutcome, RouterError>;
+  ```
+- **Async classify-with-fallback (Finding F9):** Entry the daemon calls for long or ambiguous prompts.
+  ```rust
+  pub async fn classify_with_fallback(prompt: &str) -> Classification;
+  ```
+- **Lane to model-id helper (Plan §3.3):** Maps harness and lane to recommended CLI model identifier for the launch recipe.
+  ```rust
+  pub fn lane_to_model_id(harness: HarnessId, lane: &str) -> Option<String>;
+  pub fn model_for_lane(harness: HarnessId, lane: Option<&str>) -> Option<String>;
+  ```
+
+### 3.3. `aihub-git` (Owned by Session 02)
+
+- **Originating checkout and session branch validation (Findings F3, F14):**
+  The creation result records both values, and the finish API validates both.
+  ```rust
+  pub struct SessionWorktree {
+      pub session_id: SessionId,
+      pub path: PathBuf,
+      pub branch: String,
+      pub base_branch: String,
+      pub originating_checkout: PathBuf,
+  }
+
+  pub async fn finish_session(
+      worktree_path: &Path,
+      strategy: MergeStrategy,
+      base_branch: &str,
+      expected_session_branch: &str,
+      originating_checkout: &Path,
+  ) -> Result<MergeOutcome, GitError>;
+
+  pub async fn finish_validated(
+      worktree_path: &Path,
+      strategy: MergeStrategy,
+      base_branch: &str,
+      expected_session_branch: &str,
+      originating_checkout: &Path,
+  ) -> Result<MergeOutcome, GitError>;
+  ```
+
+### 3.4. `aihub-memory` (Owned by Session 06)
+
+- **ai-memory boundary (§3.5, Findings F1, F11):** One function records a handoff and returns whether it reached ai-memory or was spooled locally. The brief API stays as it is.
+  ```rust
+  #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+  pub enum HandoffDestination {
+      AiMemory,
+      SpooledLocally,
+  }
+
+  pub async fn record_handoff_destination(
+      session_id: &SessionId,
+      from: HarnessId,
+      to: HarnessId,
+      brief: &BriefPair,
+  ) -> Result<HandoffDestination, MemoryError>;
+
+  pub async fn record_handoff_delivered(
+      session_id: &SessionId,
+      from: HarnessId,
+      to: HarnessId,
+      brief: &BriefPair,
+  ) -> Result<bool, MemoryError>;
+  ```
+
+---
+
+## 4. Removed after production integration (session 10)
+
+These pre–production-round entry points were superseded in sessions 02–09 and removed once no caller remained:
+
+| Crate | Removed | Replacement |
+|-------|---------|-------------|
+| `aihub-pty` | Blocking `PtyHandle::write(&[u8])` on the PTY writer thread | `try_write` / `write_nonblocking` (bounded queue, `PtyError::QueueFull`) |
+| `aihub-router` | `route(...) -> Result<HarnessId, RouterError>` (untyped recommendation) | `route_outcome` / `route_typed` → `RouteOutcome` (`Recommendation` or `NoCapacity`) |
+| `aihub-git` | `finish(worktree, strategy, base_branch)` (branch discovered from checkout) | `finish_session` / `finish_validated` with `expected_session_branch` and `originating_checkout` |
+

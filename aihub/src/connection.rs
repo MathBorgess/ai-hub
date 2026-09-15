@@ -1,11 +1,9 @@
 //! Unix domain socket client, framing, and daemon autostart lifecycle.
 
+use aihub_core::{encode_frame, ClientMessage, DaemonMessage, IpcMessage, PROTOCOL_VERSION};
+use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use aihub_core::{
-    encode_frame, ClientMessage, DaemonMessage, IpcMessage, PROTOCOL_VERSION,
-};
-use anyhow::{anyhow, bail, Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
@@ -14,8 +12,9 @@ use tokio::net::UnixStream;
 pub async fn connect_or_start_daemon(socket_path: &Path) -> Result<UnixStream> {
     match UnixStream::connect(socket_path).await {
         Ok(stream) => Ok(stream),
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused
-            || e.kind() == std::io::ErrorKind::NotFound =>
+        Err(e)
+            if e.kind() == std::io::ErrorKind::ConnectionRefused
+                || e.kind() == std::io::ErrorKind::NotFound =>
         {
             start_daemon_detached(socket_path)?;
             // Retry connecting for up to 5 seconds
@@ -116,6 +115,55 @@ pub async fn recv_msg(reader: &mut OwnedReadHalf) -> Result<DaemonMessage> {
     }
 }
 
+/// Dedicated reader task that reads frames from the socket reader and feeds an mpsc channel.
+/// A persistent frame buffer guarantees that interleaving keystrokes or cancelled channel receives
+/// will never drop partial frame bytes or corrupt IPC framing (Finding F8).
+pub fn spawn_daemon_reader(
+    mut reader: OwnedReadHalf,
+) -> tokio::sync::mpsc::UnboundedReceiver<Result<DaemonMessage>> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let mut temp = [0u8; 8192];
+        loop {
+            // Drain any complete frames from the accumulated buffer
+            loop {
+                match aihub_core::decode_frame(&buf) {
+                    Ok(Some((IpcMessage::Daemon(msg), consumed))) => {
+                        buf.drain(..consumed);
+                        if tx.send(Ok(msg)).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(Some((IpcMessage::Client(_), consumed))) => {
+                        buf.drain(..consumed);
+                        let _ = tx.send(Err(anyhow!(
+                            "Unexpected client message received from daemon"
+                        )));
+                        return;
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        let _ = tx.send(Err(anyhow!("IPC framing error: {}", e)));
+                        return;
+                    }
+                }
+            }
+
+            // Await more bytes from the socket
+            match reader.read(&mut temp).await {
+                Ok(0) => break, // EOF
+                Ok(n) => buf.extend_from_slice(&temp[..n]),
+                Err(e) => {
+                    let _ = tx.send(Err(e.into()));
+                    break;
+                }
+            }
+        }
+    });
+    rx
+}
+
 /// Performs the initial protocol handshake: sends `Hello`, verifies response `Hello`.
 pub async fn perform_handshake(
     writer: &mut OwnedWriteHalf,
@@ -145,7 +193,11 @@ pub async fn perform_handshake(
             Ok(())
         }
         DaemonMessage::Error { code, message } => {
-            bail!("Daemon returned error during handshake: [{}] {}", code, message)
+            bail!(
+                "Daemon returned error during handshake: [{}] {}",
+                code,
+                message
+            )
         }
         other => bail!("Expected Hello from daemon, received: {:?}", other),
     }

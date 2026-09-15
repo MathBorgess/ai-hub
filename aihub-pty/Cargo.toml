@@ -11,3 +11,5 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 thiserror = { workspace = true }
 portable-pty = { workspace = true }
+libc = { workspace = true }
+

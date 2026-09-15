@@ -1,7 +1,7 @@
-use std::path::{Path, PathBuf};
-use std::process::Output;
 use aihub_core::paths::default_worktree_root;
 use aihub_core::{MergeStrategy, SessionId};
+use std::path::{Path, PathBuf};
+use std::process::Output;
 use thiserror::Error;
 use tokio::process::Command;
 
@@ -24,6 +24,7 @@ pub struct SessionWorktree {
     pub path: PathBuf,
     pub branch: String,
     pub base_branch: String,
+    pub originating_checkout: PathBuf,
 }
 
 /// Outcome of finishing/merging a session worktree.
@@ -74,23 +75,6 @@ async fn current_branch(repo_path: &Path) -> Result<String, GitError> {
         ));
     }
     Ok(branch)
-}
-
-/// Discovers the main repository working directory for a worktree.
-/// In `git worktree list --porcelain`, the first entry is always the main worktree.
-async fn find_main_repo_path(worktree_path: &Path) -> Result<PathBuf, GitError> {
-    let output = run_git_success(worktree_path, &["worktree", "list", "--porcelain"]).await?;
-    for line in output.lines() {
-        if let Some(rest) = line.strip_prefix("worktree ") {
-            let path = PathBuf::from(rest.trim());
-            if path.exists() {
-                return Ok(path);
-            }
-        }
-    }
-    Err(GitError::InvalidRepo(
-        "Could not determine main repository from worktree".to_string(),
-    ))
 }
 
 /// Checks whether a repository checkout has uncommitted changes (dirty index or working tree).
@@ -198,288 +182,397 @@ pub async fn create_session_worktree(
         )));
     }
 
+    let originating_checkout =
+        PathBuf::from(run_git_success(repo_path, &["rev-parse", "--show-toplevel"]).await?);
+    let metadata_dir =
+        PathBuf::from(run_git_success(&worktree_path, &["rev-parse", "--absolute-git-dir"]).await?);
+    tokio::fs::write(metadata_dir.join("aihub-branch"), &branch).await?;
+    tokio::fs::write(
+        metadata_dir.join("aihub-origin"),
+        originating_checkout.as_os_str().as_encoded_bytes(),
+    )
+    .await?;
+
     Ok(SessionWorktree {
         session_id: session_id.clone(),
         path: worktree_path,
         branch,
         base_branch,
+        originating_checkout,
     })
 }
 
-/// Computes the git diff of the worktree against its base branch.
-/// Owned by session 06.
+/// Snapshot using a private index: preflight and preview must not stage or commit user work.
+async fn snapshot_tree(worktree_path: &Path) -> Result<String, GitError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let directory = std::env::temp_dir().join(format!(
+        "aihub-index-{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| GitError::CommandFailed(format!("snapshot clock: {e}")))?
+            .as_nanos(),
+        NEXT.fetch_add(1, Ordering::Relaxed),
+    ));
+    tokio::fs::create_dir(&directory).await?;
+    // Also cleans up when the future is cancelled.
+    struct TempIndex(PathBuf);
+    impl Drop for TempIndex {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let guard = TempIndex(directory);
+    let index = guard.0.join("index");
+    let real = run_git_success(worktree_path, &["rev-parse", "--git-path", "index"]).await?;
+    let real = worktree_path.join(real);
+    match tokio::fs::copy(&real, &index).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    let mut tree = String::new();
+    for args in [vec!["add", "-A"], vec!["write-tree"]] {
+        let out = Command::new("git")
+            .args(&args)
+            .current_dir(worktree_path)
+            .env("GIT_INDEX_FILE", &index)
+            .output()
+            .await?;
+        if !out.status.success() {
+            return Err(GitError::CommandFailed(format!(
+                "snapshot git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        tree = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    }
+    Ok(tree)
+}
+
+/// Paths outside the tracked snapshot, including ignored files. NUL delimiters
+/// preserve whitespace/newlines; debug quoting makes the preview unambiguous.
+async fn extra_paths(path: &Path) -> Result<Vec<String>, GitError> {
+    let mut paths = Vec::new();
+    for args in [
+        vec!["ls-files", "--others", "--exclude-standard", "-z"],
+        vec![
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+        ],
+    ] {
+        let out = run_git(path, &args).await?;
+        if !out.status.success() {
+            return Err(GitError::CommandFailed(
+                "Cannot inventory untracked/ignored paths".into(),
+            ));
+        }
+        paths.extend(
+            out.stdout
+                .split(|b| *b == 0)
+                .filter(|p| !p.is_empty())
+                .map(|p| format!("{:?}", String::from_utf8_lossy(p))),
+        );
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+/// Computes the diff without touching the real index and lists paths Discard will delete.
 pub async fn diff(
     worktree_path: &Path,
     base_branch: &str,
     colored: bool,
 ) -> Result<String, GitError> {
-    if !worktree_path.exists() {
-        return Err(GitError::InvalidRepo(format!(
-            "Worktree path does not exist: {}",
-            worktree_path.display()
-        )));
-    }
-
-    // Use a temporary index file so uncommitted work (including untracked files)
-    // is captured in diff without modifying the actual worktree index or files.
-    let rand_suffix: u64 = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let temp_index_path = std::env::temp_dir().join(format!("aihub-diff-index-{}-{}", std::process::id(), rand_suffix));
-
-    // Copy existing worktree index if it exists
-    let real_git_path = run_git_success(worktree_path, &["rev-parse", "--git-path", "index"]).await?;
-    let real_index = if Path::new(&real_git_path).is_absolute() {
-        PathBuf::from(&real_git_path)
-    } else {
-        worktree_path.join(&real_git_path)
-    };
-
-    if real_index.exists() {
-        let _ = tokio::fs::copy(&real_index, &temp_index_path).await;
-    }
-
-    let mut add_cmd = Command::new("git");
-    add_cmd
-        .args(["add", "-A"])
-        .current_dir(worktree_path)
-        .env("GIT_INDEX_FILE", &temp_index_path);
-    let add_res = add_cmd.output().await?;
-    if !add_res.status.success() {
-        let stderr = String::from_utf8_lossy(&add_res.stderr);
-        return Err(GitError::CommandFailed(format!(
-            "git add in temp index failed: {}",
-            stderr.trim()
-        )));
-    }
-
-    let mut write_tree_cmd = Command::new("git");
-    write_tree_cmd
-        .arg("write-tree")
-        .current_dir(worktree_path)
-        .env("GIT_INDEX_FILE", &temp_index_path);
-    let write_tree_res = write_tree_cmd.output().await?;
-    if !write_tree_res.status.success() {
-        let stderr = String::from_utf8_lossy(&write_tree_res.stderr);
-        return Err(GitError::CommandFailed(format!(
-            "git write-tree failed: {}",
-            stderr.trim()
-        )));
-    }
-    let tree_hash = String::from_utf8_lossy(&write_tree_res.stdout)
-        .trim()
-        .to_string();
-
-    let color_arg = if colored {
-        "--color=always"
-    } else {
-        "--no-color"
-    };
-
-    let diff_output = run_git_success(
+    let tree = snapshot_tree(worktree_path).await?;
+    let mut preview = run_git_success(
         worktree_path,
-        &["diff", color_arg, base_branch, &tree_hash],
+        &[
+            "diff",
+            if colored {
+                "--color=always"
+            } else {
+                "--no-color"
+            },
+            base_branch,
+            &tree,
+        ],
     )
-    .await;
-
-    let _ = tokio::fs::remove_file(&temp_index_path).await;
-
-    diff_output
+    .await?;
+    let extras = extra_paths(worktree_path).await?;
+    if !extras.is_empty() {
+        preview.push_str("\n\nUntracked/ignored paths (Discard permanently deletes these):\n");
+        preview.push_str(&extras.join("\n"));
+    }
+    Ok(preview)
 }
 
-/// Finishes the session worktree applying the selected strategy (squash, fast-forward, keep, discard).
-/// Owned by session 06.
-pub async fn finish(
+async fn validate_registration(origin: &Path, path: &Path, expected: &str) -> Result<(), GitError> {
+    let canonical = tokio::fs::canonicalize(path).await.map_err(|e| {
+        GitError::InvalidRepo(format!(
+            "Recorded worktree {} is unavailable: {e}",
+            path.display()
+        ))
+    })?;
+    let out = run_git(origin, &["worktree", "list", "--porcelain", "-z"]).await?;
+    if !out.status.success() {
+        return Err(GitError::InvalidRepo(format!(
+            "Cannot read worktree registration at {}",
+            origin.display()
+        )));
+    }
+    let mut matches = false;
+    let mut registered_branch = None;
+    for field in out.stdout.split(|b| *b == 0) {
+        let field = String::from_utf8_lossy(field);
+        if let Some(value) = field.strip_prefix("worktree ") {
+            matches = tokio::fs::canonicalize(value)
+                .await
+                .is_ok_and(|p| p == canonical);
+        } else if matches {
+            if let Some(branch) = field.strip_prefix("branch refs/heads/") {
+                registered_branch = Some(branch.to_owned());
+            } else if field == "detached" {
+                registered_branch = Some("(detached HEAD)".into());
+            }
+        }
+    }
+    let actual = registered_branch.ok_or_else(|| {
+        GitError::InvalidRepo(format!(
+            "Recorded worktree {} is not registered in repository at {}",
+            path.display(),
+            origin.display()
+        ))
+    })?;
+    if actual != expected {
+        return Err(GitError::CommandFailed(format!(
+            "Worktree {} is on branch '{actual}', expected recorded branch '{expected}'",
+            path.display()
+        )));
+    }
+    // A replaced directory can still have a stale registration. Verify its actual root and branch too.
+    let root = run_git_success(path, &["rev-parse", "--show-toplevel"]).await?;
+    let actual = current_branch(path).await?;
+    let origin_common = run_git_success(origin, &["rev-parse", "--git-common-dir"]).await?;
+    let path_common = run_git_success(path, &["rev-parse", "--git-common-dir"]).await?;
+    if tokio::fs::canonicalize(root).await? != canonical
+        || tokio::fs::canonicalize(origin.join(origin_common)).await?
+            != tokio::fs::canonicalize(path.join(path_common)).await?
+    {
+        return Err(GitError::InvalidRepo(format!(
+            "Worktree {} no longer matches its recorded registration",
+            path.display()
+        )));
+    }
+    if actual != expected {
+        return Err(GitError::CommandFailed(format!(
+            "Worktree branch '{actual}' differs from recorded '{expected}'"
+        )));
+    }
+    Ok(())
+}
+
+/// Finish only the registered session branch, merging into its recorded checkout.
+pub async fn finish_session(
     worktree_path: &Path,
     strategy: MergeStrategy,
     base_branch: &str,
+    expected_session_branch: &str,
+    originating_checkout: &Path,
 ) -> Result<MergeOutcome, GitError> {
-    if !worktree_path.exists() {
+    if !expected_session_branch.starts_with("session/") || expected_session_branch == "session/" {
         return Err(GitError::InvalidRepo(format!(
-            "Worktree path does not exist: {}",
-            worktree_path.display()
+            "Expected a recorded session/<id> branch, got '{expected_session_branch}'"
         )));
     }
-
-    let session_branch = current_branch(worktree_path).await?;
-    let main_repo = find_main_repo_path(worktree_path).await?;
-
-    match strategy {
-        MergeStrategy::Keep => {
-            // Commit uncommitted changes in worktree if any, and compute diff
-            commit_worktree_changes_if_any(worktree_path).await?;
-            let diff_text = diff(worktree_path, base_branch, false).await?;
-
-            // Remove worktree without deleting the branch
-            run_git_success(
-                &main_repo,
-                &["worktree", "remove", "--force", &worktree_path.to_string_lossy()],
-            )
-            .await?;
-
-            Ok(MergeOutcome {
-                strategy,
-                success: true,
-                diff: diff_text,
-                message: format!("Kept branch '{session_branch}' and removed worktree"),
-            })
-        }
+    validate_registration(originating_checkout, worktree_path, expected_session_branch).await?;
+    let diff_text = diff(worktree_path, base_branch, false).await?;
+    let mut extras = extra_paths(worktree_path).await?;
+    let message = match strategy {
+        MergeStrategy::Keep => format!(
+            "Kept branch '{expected_session_branch}' and worktree {} untouched",
+            worktree_path.display()
+        ),
         MergeStrategy::Discard => {
-            // Discard touches only session's own worktree and branch
-            let diff_text = diff(worktree_path, base_branch, false).await.unwrap_or_default();
-
-            // Remove worktree force
             run_git_success(
-                &main_repo,
-                &["worktree", "remove", "--force", &worktree_path.to_string_lossy()],
+                originating_checkout,
+                &[
+                    "worktree",
+                    "remove",
+                    "--force",
+                    &worktree_path.to_string_lossy(),
+                ],
             )
             .await?;
-
-            // Delete session branch
-            run_git_success(&main_repo, &["branch", "-D", &session_branch]).await?;
-
-            Ok(MergeOutcome {
-                strategy,
-                success: true,
-                diff: diff_text,
-                message: format!("Discarded session branch '{session_branch}' and removed worktree"),
-            })
+            run_git_success(
+                originating_checkout,
+                &["branch", "-D", expected_session_branch],
+            )
+            .await?;
+            format!("Discarded recorded branch '{expected_session_branch}' and worktree; deleted untracked/ignored paths: {}", extras.join(", "))
         }
-        MergeStrategy::FastForward | MergeStrategy::Squash => {
-            // Refuse to merge if the main repo has uncommitted changes
-            if is_dirty(&main_repo).await? {
-                return Err(GitError::CommandFailed(
-                    "Cannot merge: main repository has uncommitted changes".to_string(),
-                ));
-            }
-
-            // Refuse to merge if the main repo has moved to another branch
-            let main_branch = current_branch(&main_repo).await?;
-            if main_branch != base_branch {
+        MergeStrategy::Squash | MergeStrategy::FastForward => {
+            validate_registration(originating_checkout, originating_checkout, base_branch).await?;
+            if is_dirty(originating_checkout).await? {
                 return Err(GitError::CommandFailed(format!(
-                    "Cannot merge: main repository is on branch '{main_branch}', expected base branch '{base_branch}'"
+                    "Cannot merge: originating checkout {} has uncommitted changes",
+                    originating_checkout.display()
                 )));
             }
-
-            // Commit uncommitted harness work into the worktree session branch
-            commit_worktree_changes_if_any(worktree_path).await?;
-
-            // Calculate diff before removing worktree
-            let diff_text = diff(worktree_path, base_branch, false).await?;
-
+            // Preflight with an unreachable snapshot commit. Neither checkout, branch nor real
+            // index is changed on conflict, including when the harness has uncommitted work.
+            let tree = snapshot_tree(worktree_path).await?;
+            let candidate = run_git_success(
+                worktree_path,
+                &[
+                    "commit-tree",
+                    &tree,
+                    "-p",
+                    "HEAD",
+                    "-m",
+                    "aihub merge preflight",
+                ],
+            )
+            .await?;
             if strategy == MergeStrategy::FastForward {
-                // Check if fast-forward is possible (main is ancestor of session_branch)
-                let ff_check = run_git(&main_repo, &["merge-base", "--is-ancestor", base_branch, &session_branch]).await?;
-                if !ff_check.status.success() {
+                let out = run_git(
+                    originating_checkout,
+                    &["merge-base", "--is-ancestor", "HEAD", &candidate],
+                )
+                .await?;
+                if !out.status.success() {
+                    return Err(GitError::CommandFailed(format!("Cannot fast-forward: base branch '{base_branch}' has diverged from '{expected_session_branch}'")));
+                }
+            } else {
+                let out = run_git(
+                    originating_checkout,
+                    &[
+                        "merge-tree",
+                        "--write-tree",
+                        "--name-only",
+                        "HEAD",
+                        &candidate,
+                    ],
+                )
+                .await?;
+                if !out.status.success() {
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    let conflicts: Vec<_> =
+                        text.lines().skip(1).take_while(|l| !l.is_empty()).collect();
                     return Err(GitError::CommandFailed(format!(
-                        "Cannot fast-forward: base branch '{base_branch}' has diverged from session branch '{session_branch}'"
+                        "Merge conflict or preflight failure in paths: {}",
+                        conflicts.join(", ")
                     )));
                 }
-
-                // Remove worktree before fast-forwarding the branch
-                run_git_success(
-                    &main_repo,
-                    &["worktree", "remove", "--force", &worktree_path.to_string_lossy()],
-                )
-                .await?;
-
-                // Merge ff-only
-                run_git_success(&main_repo, &["merge", "--ff-only", &session_branch]).await?;
-
-                // Delete session branch
-                let _ = run_git(&main_repo, &["branch", "-d", &session_branch]).await;
-
-                Ok(MergeOutcome {
-                    strategy,
-                    success: true,
-                    diff: diff_text,
-                    message: format!("Fast-forward merged '{session_branch}' into '{base_branch}'"),
-                })
-            } else {
-                // MergeStrategy::Squash
-                // Test for merge conflict first using git merge-tree --write-tree
-                let merge_tree_output = run_git(&main_repo, &["merge-tree", "--write-tree", "--name-only", base_branch, &session_branch]).await?;
-                if !merge_tree_output.status.success() {
-                    let stdout = String::from_utf8_lossy(&merge_tree_output.stdout);
-                    // Extract conflicting file paths
-                    let mut conflicting_paths = Vec::new();
-                    let lines: Vec<&str> = stdout.lines().collect();
-                    for line in lines.iter().skip(1) {
-                        let trimmed = line.trim();
-                        if trimmed.is_empty() {
-                            break;
-                        }
-                        conflicting_paths.push(trimmed.to_string());
-                    }
-                    let err_msg = if conflicting_paths.is_empty() {
-                        format!("Merge conflict between '{base_branch}' and '{session_branch}'")
-                    } else {
-                        format!(
-                            "Merge conflict between '{}' and '{}' in paths: {}",
-                            base_branch,
-                            session_branch,
-                            conflicting_paths.join(", ")
-                        )
-                    };
-                    return Err(GitError::CommandFailed(err_msg));
-                }
-
-                // Remove worktree
-                run_git_success(
-                    &main_repo,
-                    &["worktree", "remove", "--force", &worktree_path.to_string_lossy()],
-                )
-                .await?;
-
-                // Execute squash merge in main_repo
-                let squash_res = run_git(&main_repo, &["merge", "--squash", &session_branch]).await?;
-                if !squash_res.status.success() {
-                    // Collect conflict paths if any
-                    let conflict_paths_res = run_git(&main_repo, &["diff", "--name-only", "--diff-filter=U"]).await?;
-                    let conflicting = String::from_utf8_lossy(&conflict_paths_res.stdout)
-                        .lines()
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect::<Vec<_>>();
-
-                    // Abort merge cleanly using git reset --merge
-                    let _ = run_git(&main_repo, &["reset", "--merge"]).await;
-
-                    let msg = if conflicting.is_empty() {
-                        "Squash merge failed".to_string()
-                    } else {
-                        format!("Merge conflict in paths: {}", conflicting.join(", "))
-                    };
-                    return Err(GitError::CommandFailed(msg));
-                }
-
-                // Commit squashed changes
-                let commit_res = run_git(
-                    &main_repo,
-                    &["commit", "-m", &format!("Squash merge session '{session_branch}'")],
-                )
-                .await?;
-
-                if !commit_res.status.success() {
-                    let stdout = String::from_utf8_lossy(&commit_res.stdout);
-                    if !stdout.contains("nothing to commit") {
-                        let stderr = String::from_utf8_lossy(&commit_res.stderr);
-                        let _ = run_git(&main_repo, &["reset", "--merge"]).await;
-                        return Err(GitError::CommandFailed(format!("git commit squash failed: {stderr}")));
-                    }
-                }
-
-                // Delete session branch
-                let _ = run_git(&main_repo, &["branch", "-D", &session_branch]).await;
-
-                Ok(MergeOutcome {
-                    strategy,
-                    success: true,
-                    diff: diff_text,
-                    message: format!("Squash merged '{session_branch}' into '{base_branch}'"),
-                })
             }
+            commit_worktree_changes_if_any(worktree_path).await?;
+            let mode = if strategy == MergeStrategy::Squash {
+                "--squash"
+            } else {
+                "--ff-only"
+            };
+            let out = run_git(
+                originating_checkout,
+                &[
+                    "merge",
+                    mode,
+                    "--no-overwrite-ignore",
+                    expected_session_branch,
+                ],
+            )
+            .await?;
+            if !out.status.success() {
+                // Squash has no MERGE_HEAD; reset --merge restores its clean starting index.
+                if strategy == MergeStrategy::Squash {
+                    run_git_success(originating_checkout, &["reset", "--merge"]).await?;
+                }
+                return Err(GitError::CommandFailed(format!(
+                    "Merge failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+            if strategy == MergeStrategy::Squash && is_dirty(originating_checkout).await? {
+                let out = run_git(
+                    originating_checkout,
+                    &[
+                        "commit",
+                        "-m",
+                        &format!("Squash merge session '{expected_session_branch}'"),
+                    ],
+                )
+                .await?;
+                if !out.status.success() {
+                    run_git_success(originating_checkout, &["reset", "--merge"]).await?;
+                    return Err(GitError::CommandFailed(format!(
+                        "Squash commit failed: {}",
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    )));
+                }
+            }
+            // Preserve paths seen before auto-commit, and re-inventory before cleanup.
+            extras.extend(extra_paths(worktree_path).await?);
+            extras.sort();
+            extras.dedup();
+            let mut message = format!(
+                "Merged '{expected_session_branch}' into '{base_branch}' at {}",
+                originating_checkout.display()
+            );
+            if extras.is_empty() {
+                let removal = run_git(
+                    originating_checkout,
+                    &["worktree", "remove", &worktree_path.to_string_lossy()],
+                )
+                .await?;
+                if removal.status.success() {
+                    let delete = run_git(
+                        originating_checkout,
+                        &["branch", "-D", expected_session_branch],
+                    )
+                    .await?;
+                    if !delete.status.success() {
+                        message.push_str("; retained session branch (cleanup refused)");
+                    }
+                } else {
+                    message.push_str("; retained worktree (safe cleanup refused)");
+                }
+            } else {
+                message.push_str(&format!(
+                    "; retained worktree {} and paths: {}",
+                    worktree_path.display(),
+                    extras.join(", ")
+                ));
+            }
+            message
         }
-    }
+    };
+    Ok(MergeOutcome {
+        strategy,
+        success: true,
+        diff: diff_text,
+        message,
+    })
+}
+
+/// Alias for `finish_session`.
+pub async fn finish_validated(
+    worktree_path: &Path,
+    strategy: MergeStrategy,
+    base_branch: &str,
+    expected_session_branch: &str,
+    originating_checkout: &Path,
+) -> Result<MergeOutcome, GitError> {
+    finish_session(
+        worktree_path,
+        strategy,
+        base_branch,
+        expected_session_branch,
+        originating_checkout,
+    )
+    .await
 }

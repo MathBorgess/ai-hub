@@ -16,8 +16,12 @@ pub fn render_merge_review(
     area: Rect,
     buf: &mut Buffer,
 ) {
-    let width = (area.width * 95 / 100).max(60).min(area.width.saturating_sub(2));
-    let height = (area.height * 90 / 100).max(12).min(area.height.saturating_sub(2));
+    let width = (area.width * 95 / 100)
+        .max(60)
+        .min(area.width.saturating_sub(2));
+    let height = (area.height * 90 / 100)
+        .max(12)
+        .min(area.height.saturating_sub(2));
 
     if width < 30 || height < 6 {
         return;
@@ -69,15 +73,30 @@ pub fn render_merge_review(
     } else {
         for line in diff.lines().skip(scroll) {
             let styled_line = if line.starts_with("+++") || line.starts_with("---") {
-                Span::styled(line, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                Span::styled(
+                    line,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
             } else if line.starts_with('+') {
                 Span::styled(line, Style::default().fg(Color::Green))
             } else if line.starts_with('-') {
                 Span::styled(line, Style::default().fg(Color::Red))
             } else if line.starts_with("@@") {
-                Span::styled(line, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+                Span::styled(
+                    line,
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
             } else if line.starts_with("diff --git") {
-                Span::styled(line, Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
+                Span::styled(
+                    line,
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                )
             } else {
                 Span::styled(line, Style::default().fg(Color::White))
             };
@@ -98,7 +117,12 @@ pub fn render_merge_review(
     ]);
 
     let line2 = Line::from(vec![
-        Span::styled("[Enter]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "[Enter]",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(" Confirmar  "),
         Span::styled("[Esc]", Style::default().fg(Color::Red)),
         Span::raw(" Cancelar"),

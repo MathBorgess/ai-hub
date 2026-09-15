@@ -8,8 +8,6 @@ pub mod state;
 pub mod terminal;
 pub mod ui;
 
-use std::io::stdout;
-use std::time::Duration;
 use aihub_core::{
     ClientMessage, DaemonMessage, HarnessId, MergeStrategy, SessionId, SessionTarget,
 };
@@ -18,10 +16,14 @@ use crossterm::event::Event;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Position;
 use ratatui::Terminal;
+use std::io::stdout;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::cli::{detect_repo_path, Cli, Commands};
-use crate::connection::{connect_or_start_daemon, perform_handshake, recv_msg, send_msg};
+use crate::connection::{
+    connect_or_start_daemon, perform_handshake, recv_msg, send_msg, spawn_daemon_reader,
+};
 use crate::keys::{handle_key, AppAction};
 use crate::state::{App, RecommendationState, UiMode};
 use crate::terminal::{setup_panic_hook, shutdown_signal, TerminalGuard};
@@ -30,9 +32,7 @@ use crate::terminal::{setup_panic_hook, shutdown_signal, TerminalGuard};
 pub async fn run(cli: Cli) -> Result<()> {
     setup_panic_hook();
 
-    let socket_path = cli
-        .socket
-        .unwrap_or_else(aihub_core::default_socket_path);
+    let socket_path = cli.socket.unwrap_or_else(aihub_core::default_socket_path);
     let repo_path = detect_repo_path();
 
     // 1. Connect or start daemon
@@ -54,6 +54,13 @@ pub async fn run(cli: Cli) -> Result<()> {
                 None => SessionTarget::LatestForRepo(repo_path),
             };
             send_msg(&mut writer, &ClientMessage::Attach { target }).await?;
+
+            // Read daemon response for attach
+            if let Ok(Ok(msg)) =
+                tokio::time::timeout(Duration::from_secs(3), recv_msg(&mut reader)).await
+            {
+                handle_daemon_msg(&mut app, msg);
+            }
         }
         None => {
             // Bare `aihub`: attach to latest for repo, or create new session
@@ -68,22 +75,51 @@ pub async fn run(cli: Cli) -> Result<()> {
             // Read next daemon response
             let resp = tokio::time::timeout(Duration::from_secs(3), recv_msg(&mut reader)).await;
             match resp {
-                Ok(Ok(DaemonMessage::Attached { session_id, scrollback })) => {
-                    app.session_id = Some(session_id.clone());
+                Ok(Ok(DaemonMessage::Attached {
+                    session_id,
+                    scrollback,
+                    summary,
+                })) => {
+                    app.session_id = Some(session_id);
+                    app.harness = summary.harness;
+                    app.branch = summary.branch;
+                    app.mode = summary.mode;
+                    app.active = summary.active;
+                    app.worktree_path = summary.worktree_path;
+                    app.repo_path = summary.repo_path;
                     app.vt_parser.process(scrollback.as_slice());
                 }
                 Ok(Ok(DaemonMessage::QuotaPush { snapshots })) => {
                     app.snapshots = snapshots;
                     // Try waiting for next message (Attached or Error)
-                    if let Ok(Ok(next)) = tokio::time::timeout(Duration::from_secs(2), recv_msg(&mut reader)).await {
+                    if let Ok(Ok(next)) =
+                        tokio::time::timeout(Duration::from_secs(2), recv_msg(&mut reader)).await
+                    {
                         match next {
-                            DaemonMessage::Attached { session_id, scrollback } => {
+                            DaemonMessage::Attached {
+                                session_id,
+                                scrollback,
+                                summary,
+                            } => {
                                 app.session_id = Some(session_id);
+                                app.harness = summary.harness;
+                                app.branch = summary.branch;
+                                app.mode = summary.mode;
+                                app.active = summary.active;
+                                app.worktree_path = summary.worktree_path;
+                                app.repo_path = summary.repo_path;
                                 app.vt_parser.process(scrollback.as_slice());
                             }
                             DaemonMessage::Error { .. } => {
                                 // No existing session; create new session
-                                create_new_session(&mut writer, &mut reader, &mut app, &repo_path).await?;
+                                create_new_session(
+                                    &mut writer,
+                                    &mut reader,
+                                    &mut app,
+                                    &repo_path,
+                                    cli.task.clone(),
+                                )
+                                .await?;
                             }
                             other => handle_daemon_msg(&mut app, other),
                         }
@@ -91,7 +127,14 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
                 Ok(Ok(DaemonMessage::Error { .. })) | Err(_) => {
                     // Create new session
-                    create_new_session(&mut writer, &mut reader, &mut app, &repo_path).await?;
+                    create_new_session(
+                        &mut writer,
+                        &mut reader,
+                        &mut app,
+                        &repo_path,
+                        cli.task.clone(),
+                    )
+                    .await?;
                 }
                 Ok(Ok(other)) => {
                     handle_daemon_msg(&mut app, other);
@@ -133,8 +176,25 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
     });
 
+    // Spawn dedicated daemon reader task (F8)
+    let mut daemon_rx = spawn_daemon_reader(reader);
+
     // Request fresh quotas from daemon
     let _ = send_msg(&mut writer, &ClientMessage::RequestQuota).await;
+
+    // Submit initial task if provided via CLI argument (F9)
+    if let Some(task_text) = &cli.task {
+        if let Some(session_id) = &app.session_id {
+            let _ = send_msg(
+                &mut writer,
+                &ClientMessage::SubmitTask {
+                    session_id: session_id.clone(),
+                    task: task_text.clone(),
+                },
+            )
+            .await;
+        }
+    }
 
     // 6. Main event loop
     loop {
@@ -229,13 +289,13 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
             }
 
-            // Message from daemon
-            msg_res = recv_msg(&mut reader) => {
-                match msg_res {
-                    Ok(msg) => {
+            // Message from daemon via dedicated reader task (F8)
+            msg_opt = daemon_rx.recv() => {
+                match msg_opt {
+                    Some(Ok(msg)) => {
                         handle_daemon_msg(&mut app, msg);
                     }
-                    Err(_) => {
+                    Some(Err(_)) | None => {
                         // Connection lost: attempt reconnection
                         app.set_status("Conexão perdida. Tentando reconectar...");
                         let mut reconnected = false;
@@ -253,7 +313,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                                         )
                                         .await;
                                     }
-                                    reader = new_reader;
+                                    daemon_rx = spawn_daemon_reader(new_reader);
                                     writer = new_writer;
                                     reconnected = true;
                                     app.set_status("Reconectado ao daemon com sucesso.");
@@ -281,13 +341,14 @@ async fn create_new_session(
     reader: &mut tokio::net::unix::OwnedReadHalf,
     app: &mut App,
     repo_path: &std::path::Path,
+    initial_prompt: Option<String>,
 ) -> Result<()> {
     send_msg(
         writer,
         &ClientMessage::NewSession {
             harness: HarnessId::ClaudeCode,
             repo_path: repo_path.to_path_buf(),
-            initial_prompt: None,
+            initial_prompt,
         },
     )
     .await?;
@@ -316,8 +377,18 @@ async fn create_new_session(
                 .await?;
                 break;
             }
-            Ok(Ok(DaemonMessage::Attached { session_id, scrollback })) => {
+            Ok(Ok(DaemonMessage::Attached {
+                session_id,
+                scrollback,
+                summary,
+            })) => {
                 app.session_id = Some(session_id);
+                app.harness = summary.harness;
+                app.branch = summary.branch;
+                app.mode = summary.mode;
+                app.active = summary.active;
+                app.worktree_path = summary.worktree_path;
+                app.repo_path = summary.repo_path;
                 app.vt_parser.process(scrollback.as_slice());
                 break;
             }
@@ -331,67 +402,147 @@ async fn create_new_session(
     Ok(())
 }
 
-fn handle_daemon_msg(app: &mut App, msg: DaemonMessage) {
+/// Dispatches an incoming DaemonMessage to the App state.
+/// Scoped messages for other sessions are filtered out (Finding F13).
+pub fn handle_daemon_msg(app: &mut App, msg: DaemonMessage) {
     match msg {
-        DaemonMessage::Attached { session_id, scrollback } => {
+        DaemonMessage::Attached {
+            session_id,
+            scrollback,
+            summary,
+        } => {
             app.session_id = Some(session_id);
+            app.harness = summary.harness;
+            app.branch = summary.branch;
+            app.mode = summary.mode;
+            app.active = summary.active;
+            app.worktree_path = summary.worktree_path;
+            app.repo_path = summary.repo_path;
             app.vt_parser.process(scrollback.as_slice());
         }
-        DaemonMessage::Detached { .. } => {
+        DaemonMessage::Detached { session_id } => {
+            if let Some(curr) = &app.session_id {
+                if curr != &session_id {
+                    return;
+                }
+            }
             app.should_exit = true;
         }
-        DaemonMessage::PtyOutput { data, .. } => {
+        DaemonMessage::PtyOutput { session_id, data } => {
+            if let Some(curr) = &app.session_id {
+                if curr != &session_id {
+                    return;
+                }
+            }
             app.vt_parser.process(data.as_slice());
         }
         DaemonMessage::QuotaPush { snapshots } => {
             app.snapshots = snapshots;
         }
         DaemonMessage::RouteRecommendation {
-            tier,
-            harness,
-            lane,
-            holds_until_s,
-            confidence,
-            reason,
+            session_id,
+            outcome,
         } => {
-            app.recommendation = Some(RecommendationState {
-                tier,
-                harness,
-                lane,
-                holds_until_s,
-                confidence,
-                reason,
-            });
+            if let Some(curr) = &app.session_id {
+                if curr != &session_id {
+                    return;
+                }
+            }
+            match outcome {
+                aihub_core::RouteOutcome::Recommendation {
+                    harness,
+                    lane,
+                    holds_until_s,
+                    ..
+                } => {
+                    app.recommendation = Some(RecommendationState::Recommended {
+                        tier: aihub_core::TaskTier::Design,
+                        harness,
+                        lane,
+                        holds_until_s,
+                        confidence: 1.0,
+                        reason: String::new(),
+                    });
+                }
+                aihub_core::RouteOutcome::NoCapacity { reason } => {
+                    app.recommendation = Some(RecommendationState::NoCapacity { reason });
+                }
+            }
         }
-        DaemonMessage::HarnessSwitched { new_harness, .. } => {
+        DaemonMessage::HarnessSwitched {
+            session_id,
+            new_harness,
+            ..
+        } => {
+            if let Some(curr) = &app.session_id {
+                if curr != &session_id {
+                    return;
+                }
+            }
             app.harness = new_harness;
-            app.set_status(format!("Harness alterado para {}", new_harness.binary_name()));
+            app.set_status(format!(
+                "Harness alterado para {}",
+                new_harness.binary_name()
+            ));
         }
-        DaemonMessage::ModeSet { mode, .. } => {
+        DaemonMessage::ModeSet { session_id, mode } => {
+            if let Some(curr) = &app.session_id {
+                if curr != &session_id {
+                    return;
+                }
+            }
             app.mode = mode;
             app.set_status(format!("Modo alterado para {:?}", mode));
         }
-        DaemonMessage::MergeResult { success, diff, message, .. } => {
+        DaemonMessage::MergeResult {
+            session_id,
+            success,
+            diff,
+            message,
+        } => {
+            if let Some(curr) = &app.session_id {
+                if curr != &session_id {
+                    return;
+                }
+            }
             if !success {
-                // First step of merge confirmation: display diff for review
+                // First step of merge confirmation: display diff for review while preserving chosen strategy
+                let strategy = match &app.ui_mode {
+                    UiMode::MergeReview { strategy, .. } => *strategy,
+                    _ => MergeStrategy::Squash,
+                };
+                let scroll = match &app.ui_mode {
+                    UiMode::MergeReview { scroll, .. } => *scroll,
+                    _ => 0,
+                };
                 app.ui_mode = UiMode::MergeReview {
                     diff,
                     message,
-                    strategy: MergeStrategy::Squash,
-                    scroll: 0,
+                    strategy,
+                    scroll,
                 };
             } else {
                 app.ui_mode = UiMode::Normal;
                 app.set_status(format!("Merge realizado: {}", message));
             }
         }
-        DaemonMessage::SessionExited { exit_code, .. } => {
+        DaemonMessage::SessionExited {
+            session_id,
+            exit_code,
+        } => {
+            if let Some(curr) = &app.session_id {
+                if curr != &session_id {
+                    return;
+                }
+            }
             app.active = false;
             app.set_status(format!("Sessão encerrada (código: {:?})", exit_code));
         }
         DaemonMessage::Error { code, message } => {
             app.set_status(format!("Erro [{}]: {}", code, message));
         }
-        DaemonMessage::SessionList { .. } | DaemonMessage::SessionCreated { .. } | DaemonMessage::Hello { .. } => {}
+        DaemonMessage::SessionList { .. }
+        | DaemonMessage::SessionCreated { .. }
+        | DaemonMessage::Hello { .. } => {}
     }
 }

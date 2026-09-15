@@ -16,9 +16,8 @@ const DASHBOARD_URL: &str =
     "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage";
 const LOW_REMAINING_PCT: f64 = 20.0;
 
-/// Probes Cursor usage from Cursor IDE `state.vscdb` token and dashboard endpoints.
-pub async fn probe() -> Result<QuotaSnapshot, ProbeError> {
-    let token = read_cursor_ide_token().or_else(|| {
+fn read_cursor_token_blocking() -> Option<String> {
+    read_cursor_ide_token().or_else(|| {
         for path in cursor_auth_config_paths() {
             if let Ok(data) = std::fs::read_to_string(&path) {
                 if let Some(jwt) = extract_cursor_jwt(&data) {
@@ -27,7 +26,14 @@ pub async fn probe() -> Result<QuotaSnapshot, ProbeError> {
             }
         }
         None
-    });
+    })
+}
+
+/// Probes Cursor usage from Cursor IDE `state.vscdb` token and dashboard endpoints.
+pub async fn probe() -> Result<QuotaSnapshot, ProbeError> {
+    let token = tokio::task::spawn_blocking(read_cursor_token_blocking)
+        .await
+        .map_err(|e| ProbeError::Failure(format!("cursor token read failed: {e}")))?;
 
     let Some(token) = token else {
         return Ok(empty_snapshot(
@@ -36,10 +42,7 @@ pub async fn probe() -> Result<QuotaSnapshot, ProbeError> {
         ));
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(ProbeError::Http)?;
+    let client = crate::build_probe_http_client()?;
 
     let dash = client
         .post(DASHBOARD_URL)
@@ -104,27 +107,21 @@ pub fn parse_dashboard_usage(json: &str) -> Result<(Vec<QuotaWindow>, Vec<QuotaL
     if used_pct.is_none() {
         let limit = plan.get("limit").and_then(|v| v.as_f64());
         if let Some(limit) = limit.filter(|l| *l > 0.0) {
-            let used = plan
-                .get("used")
-                .and_then(|v| v.as_f64())
-                .or_else(|| {
-                    plan.get("remaining")
-                        .and_then(|v| v.as_f64())
-                        .map(|rem| limit - rem)
-                });
+            let used = plan.get("used").and_then(|v| v.as_f64()).or_else(|| {
+                plan.get("remaining")
+                    .and_then(|v| v.as_f64())
+                    .map(|rem| limit - rem)
+            });
             if let Some(used) = used {
                 used_pct = Some((used / limit) * 100.0);
             }
         }
     }
 
-    let used_pct = used_pct.ok_or_else(|| {
-        ProbeError::Failure("no plan usage in dashboard response".into())
-    })?;
+    let used_pct = used_pct
+        .ok_or_else(|| ProbeError::Failure("no plan usage in dashboard response".into()))?;
 
-    let start_ms = root
-        .get("billingCycleStart")
-        .and_then(parse_epoch_ms_field);
+    let start_ms = root.get("billingCycleStart").and_then(parse_epoch_ms_field);
     let end_ms = root.get("billingCycleEnd").and_then(parse_epoch_ms_field);
 
     let window_s = match (start_ms, end_ms) {
@@ -140,9 +137,8 @@ pub fn parse_dashboard_usage(json: &str) -> Result<(Vec<QuotaWindow>, Vec<QuotaL
         window_s,
     )];
 
-    let lanes = cursor_lanes(&plan, &root).ok_or_else(|| {
-        ProbeError::Failure("incomplete lane split in dashboard response".into())
-    })?;
+    let lanes = cursor_lanes(&plan, &root)
+        .ok_or_else(|| ProbeError::Failure("incomplete lane split in dashboard response".into()))?;
 
     Ok((windows, lanes))
 }
@@ -152,7 +148,12 @@ pub fn parse_summary_usage(json: &str) -> Result<(Vec<QuotaWindow>, Vec<QuotaLan
     let root: Value = serde_json::from_str(json)?;
     if root.get("isUnlimited").and_then(|v| v.as_bool()) == Some(true) {
         return Ok((
-            vec![QuotaWindow::new(WindowKind::Custom("unlimited".into()), 0.0, None, None)],
+            vec![QuotaWindow::new(
+                WindowKind::Custom("unlimited".into()),
+                0.0,
+                None,
+                None,
+            )],
             vec![],
         ));
     }
@@ -239,9 +240,7 @@ fn snapshot_status(windows: &[QuotaWindow], lanes: &[QuotaLane]) -> QuotaStatus 
     }
     let best_lane = lanes
         .iter()
-        .filter_map(|lane| {
-            tightest_window(&lane.windows).map(|w| (lane, w.remaining_pct()))
-        })
+        .filter_map(|lane| tightest_window(&lane.windows).map(|w| (lane, w.remaining_pct())))
         .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     if let Some((_, remaining)) = best_lane {
         return status_from_remaining(remaining);
@@ -272,8 +271,18 @@ fn status_from_remaining(remaining_pct: f64) -> QuotaStatus {
 }
 
 fn cursor_lanes(plan: &Value, payload: &Value) -> Option<Vec<QuotaLane>> {
-    let auto = read_lane_used(plan, payload, "autoPercentUsed", "autoModelSelectedDisplayMessage");
-    let api = read_lane_used(plan, payload, "apiPercentUsed", "namedModelSelectedDisplayMessage");
+    let auto = read_lane_used(
+        plan,
+        payload,
+        "autoPercentUsed",
+        "autoModelSelectedDisplayMessage",
+    );
+    let api = read_lane_used(
+        plan,
+        payload,
+        "apiPercentUsed",
+        "namedModelSelectedDisplayMessage",
+    );
     let (auto, api) = (auto?, api?);
     Some(vec![
         lane_from_used("cursor-models", LaneKind::Own, auto),

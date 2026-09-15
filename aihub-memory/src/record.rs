@@ -2,7 +2,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use aihub_core::{HarnessId, SessionId, paths::default_data_dir};
+use aihub_core::{paths::default_data_dir, HarnessId, SessionId};
 use serde::Serialize;
 
 use crate::{BriefPair, MemoryError};
@@ -38,6 +38,28 @@ pub async fn record_handoff(
     };
     append_jsonl(&path, &record)?;
     Ok(())
+}
+
+/// Records handoff metadata and returns whether it reached ai-memory or was spooled locally (§3.5).
+///
+/// Owned by Session 06.
+pub async fn record_handoff_destination(
+    session_id: &SessionId,
+    from: HarnessId,
+    to: HarnessId,
+    brief: &BriefPair,
+) -> Result<crate::HandoffDestination, MemoryError> {
+    crate::ai_memory::record_handoff_destination(session_id, from, to, brief).await
+}
+
+/// Convenience alias returning true if delivered to ai-memory, false if spooled locally.
+pub async fn record_handoff_delivered(
+    session_id: &SessionId,
+    from: HarnessId,
+    to: HarnessId,
+    brief: &BriefPair,
+) -> Result<bool, MemoryError> {
+    crate::ai_memory::record_handoff_delivered(session_id, from, to, brief).await
 }
 
 pub fn handoffs_log_path(data_dir: &Path) -> PathBuf {

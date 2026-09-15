@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::HandoffTurn;
 use crate::redact::redact_secrets;
+use crate::HandoffTurn;
 
 use super::paths::{collect_decisions, paths_match_worktree, read_jsonl, walk_jsonl_files};
 
@@ -67,15 +67,24 @@ fn extract_file(session_id: &str, worktree_path: &Path, path: &Path) -> Option<H
         if value.get("type").and_then(Value::as_str) != Some("response_item") {
             continue;
         }
-        let payload = value.get("payload")?;
-        let role = payload.get("role").and_then(Value::as_str)?;
-        let content = payload.get("content")?;
-        let text = codex_text(content)?;
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+        let Some(role) = payload.get("role").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(content) = payload.get("content") else {
+            continue;
+        };
+        let Some(text) = codex_text(content) else {
+            continue;
+        };
         match role {
-            "user" => last_user = text,
+            "user" => last_user = redact_secrets(&text),
             "assistant" => {
-                decisions.extend(collect_decisions(&text));
-                last_assistant = text;
+                let redacted = redact_secrets(&text);
+                decisions.extend(collect_decisions(&redacted));
+                last_assistant = redacted;
             }
             _ => {}
         }
@@ -94,10 +103,7 @@ fn extract_file(session_id: &str, worktree_path: &Path, path: &Path) -> Option<H
     Some(HandoffTurn {
         summary: redact_secrets(&summary),
         last_output: redact_secrets(&last_assistant),
-        decisions: decisions
-            .into_iter()
-            .map(|d| redact_secrets(&d))
-            .collect(),
+        decisions: decisions.into_iter().map(|d| redact_secrets(&d)).collect(),
     })
 }
 
@@ -160,6 +166,46 @@ mod tests {
         let turn = extract_file("codex-9", Path::new("/tmp/wt"), &path).unwrap();
         assert!(turn.last_output.contains("Bridge is ready"));
         assert!(turn.summary.contains("ship memory"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f11_tool_call_skipped_for_final_assistant_message() {
+        let dir = std::env::temp_dir().join("aihub-memory-codex-f11");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rollout_with_tool_call.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"session_meta","payload":{{"session_id":"codex-f11","cwd":"/tmp/wt"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"response_item","payload":{{"role":"user","content":[{{"type":"input_text","text":"check file"}}]}}}}"#
+        )
+        .unwrap();
+        // Tool-call / function_call response_item with no role/content
+        writeln!(
+            f,
+            r#"{{"type":"response_item","payload":{{"type":"function_call","name":"view_file","arguments":{{"path":"lib.rs"}}}}}}"#
+        )
+        .unwrap();
+        // Followed by final assistant message
+        writeln!(
+            f,
+            r#"{{"type":"response_item","payload":{{"role":"assistant","content":[{{"type":"output_text","text":"Decision: tool call handled.\nHere is the final answer."}}]}}}}"#
+        )
+        .unwrap();
+
+        let turn = extract_file("codex-f11", Path::new("/tmp/wt"), &path)
+            .expect("must not abort on tool call");
+        assert!(turn.last_output.contains("Here is the final answer"));
+        assert!(turn
+            .decisions
+            .iter()
+            .any(|d| d.contains("tool call handled")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,10 +1,10 @@
 use std::fs;
 use std::path::Path;
 
-use crate::{BriefPair, HandoffTurn, MemoryError};
 use crate::redact::redact_secrets;
+use crate::{BriefPair, HandoffTurn, MemoryError};
 
-// ponytail: last assistant excerpt in the brief is capped at 2_000 UTF-8 scalars
+// Last assistant excerpt in the brief is capped at 2_000 UTF-8 scalars to keep the brief compact.
 const LAST_OUTPUT_BRIEF_CAP: usize = 2_000;
 
 pub fn write_brief_pair(
@@ -41,7 +41,7 @@ pub fn write_brief_pair(
 
 ## Out of scope
 - Re-litigating decisions already captured under Constraints
-- Launching or configuring harness binaries (sessions 05 and 08)
+- Modifying files outside the requested scope
 
 ## Constraints
 {constraints}
@@ -100,16 +100,13 @@ fn build_constraints(turn: &HandoffTurn) -> String {
 }
 
 fn build_pointers(turn: &HandoffTurn) -> String {
-    let mut lines = vec![
-        "- docs/CONTRACT.md — public API other sessions implement against".to_string(),
-        "- docs/PLAN.md §3.5 — memory bridge responsibilities".to_string(),
-    ];
+    let mut lines = Vec::new();
     for decision in &turn.decisions {
         if let Some(rest) = decision.strip_prefix("diff-stat:") {
             lines.push(format!("- worktree diff stat — `{rest}` (not pasted here)"));
         }
     }
-    if lines.len() == 2 {
+    if lines.is_empty() {
         lines.push("- worktree diff stat — supplied by aihub-git at handoff time (path passed via `diff-stat:` decision)".to_string());
     }
     lines.join("\n")
@@ -152,7 +149,9 @@ mod tests {
 
         let turn = HandoffTurn {
             summary: "continue bridge".into(),
-            last_output: "Decision: ship it.\neyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIn0.sig".to_string(),
+            last_output:
+                "Decision: ship it.\neyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIn0.sig"
+                    .to_string(),
             decisions: vec![
                 "Decision: use JSONL".into(),
                 "diff-stat: /tmp/stat.txt".into(),
@@ -171,6 +170,52 @@ mod tests {
 
         let second = write_brief_pair(&dir, next_session_index(&dir), "Next", &turn).unwrap();
         assert!(second.brief_path.ends_with("02.md"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn brief_template_is_generic_without_repo_specific_instructions() {
+        let dir = std::env::temp_dir().join("aihub-memory-generic-brief-test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let turn = HandoffTurn {
+            summary: "refactor user auth".into(),
+            last_output: "Done implementing user login.".to_string(),
+            decisions: vec!["Decision: use Argon2".into()],
+        };
+
+        let pair = write_brief_pair(&dir, 1, "Implement user authentication", &turn).unwrap();
+        let brief = fs::read_to_string(pair.brief_path).unwrap();
+
+        // Must not contain repo-specific instructions or document references
+        assert!(
+            !brief.contains("CONTRACT.md"),
+            "brief must not refer to CONTRACT.md"
+        );
+        assert!(
+            !brief.contains("PLAN.md"),
+            "brief must not refer to PLAN.md"
+        );
+        assert!(
+            !brief.contains("sessions 05 and 08"),
+            "brief must not mention sessions 05 and 08"
+        );
+        assert!(
+            !brief.contains("memory bridge responsibilities"),
+            "brief must not mention memory bridge"
+        );
+
+        // Must contain generic brief sections
+        assert!(brief.contains("# Handoff 01: harness switch brief"));
+        assert!(brief.contains("## Goal\nImplement user authentication"));
+        assert!(brief.contains("## In scope"));
+        assert!(brief.contains("## Out of scope"));
+        assert!(brief.contains("## Constraints"));
+        assert!(brief.contains("## Done when"));
+        assert!(brief.contains("## Pointers"));
+        assert!(brief.contains("## Last turn"));
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

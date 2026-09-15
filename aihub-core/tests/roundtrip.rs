@@ -1,5 +1,5 @@
-use std::path::PathBuf;
 use bytes::BytesMut;
+use std::path::PathBuf;
 use tokio_util::codec::{Decoder, Encoder};
 
 use aihub_core::*;
@@ -16,7 +16,9 @@ fn test_roundtrip(msg: IpcMessage) {
     // 2. Tokio IpcCodec roundtrip
     let mut codec = IpcCodec::default();
     let mut bytes = BytesMut::new();
-    codec.encode(msg.clone(), &mut bytes).expect("codec.encode failed");
+    codec
+        .encode(msg.clone(), &mut bytes)
+        .expect("codec.encode failed");
     let decoded_tokio = codec
         .decode(&mut bytes)
         .expect("codec.decode failed")
@@ -95,8 +97,13 @@ fn test_all_client_messages_roundtrip() {
             strategy: MergeStrategy::Squash,
         },
         ClientMessage::MergeRequest {
-            session_id: sess_id,
+            session_id: sess_id.clone(),
             strategy: MergeStrategy::Discard,
+        },
+        // 13. SubmitTask (F9)
+        ClientMessage::SubmitTask {
+            session_id: sess_id,
+            task: "Implement RFC 42 with robust error handling".to_string(),
         },
     ];
 
@@ -125,12 +132,22 @@ fn test_all_daemon_messages_roundtrip() {
             QuotaLane {
                 name: "gemini".to_string(),
                 kind: LaneKind::Own,
-                windows: vec![QuotaWindow::new(WindowKind::FiveHour, 20.0, None, Some(18000))],
+                windows: vec![QuotaWindow::new(
+                    WindowKind::FiveHour,
+                    20.0,
+                    None,
+                    Some(18000),
+                )],
             },
             QuotaLane {
                 name: "third-party".to_string(),
                 kind: LaneKind::Frontier,
-                windows: vec![QuotaWindow::new(WindowKind::FiveHour, 95.0, Some(1800), Some(18000))],
+                windows: vec![QuotaWindow::new(
+                    WindowKind::FiveHour,
+                    95.0,
+                    Some(1800),
+                    Some(18000),
+                )],
             },
         ],
     };
@@ -156,13 +173,22 @@ fn test_all_daemon_messages_roundtrip() {
         DaemonMessage::SessionCreated {
             session_id: sess_id.clone(),
             harness: HarnessId::CursorAgent,
-            worktree_path: wt_path,
+            worktree_path: wt_path.clone(),
             branch: "session/session-test-01".to_string(),
         },
         // 4. Attached
         DaemonMessage::Attached {
             session_id: sess_id.clone(),
             scrollback: Base64Bytes::new(b"welcome to shell\n$ ".to_vec()),
+            summary: SessionSummary {
+                session_id: sess_id.clone(),
+                harness: HarnessId::ClaudeCode,
+                mode: Mode::Assisted,
+                repo_path: repo_path.clone(),
+                worktree_path: wt_path,
+                branch: "session/session-test-01".to_string(),
+                active: true,
+            },
         },
         // 5. Detached
         DaemonMessage::Detached {
@@ -182,14 +208,22 @@ fn test_all_daemon_messages_roundtrip() {
         DaemonMessage::QuotaPush {
             snapshots: vec![sample_snapshot],
         },
-        // 9. RouteRecommendation
+        // 9. RouteRecommendation - dispatchable recommendation (F10, F13)
         DaemonMessage::RouteRecommendation {
-            tier: TaskTier::Design,
-            harness: HarnessId::ClaudeCode,
-            lane: Some("frontier".to_string()),
-            holds_until_s: Some(900),
-            confidence: 0.92,
-            reason: "Architecture prompt requires frontier reasoning tier".to_string(),
+            session_id: sess_id.clone(),
+            outcome: RouteOutcome::Recommendation {
+                harness: HarnessId::ClaudeCode,
+                lane: Some("frontier".to_string()),
+                model: Some("claude-3-7-sonnet".to_string()),
+                holds_until_s: Some(900),
+            },
+        },
+        // 9b. RouteRecommendation - no capacity (F10, F13)
+        DaemonMessage::RouteRecommendation {
+            session_id: sess_id.clone(),
+            outcome: RouteOutcome::NoCapacity {
+                reason: "No available slots: every slot is empty or has no supply inside the horizon; do not launch.".to_string(),
+            },
         },
         // 10. HarnessSwitched
         DaemonMessage::HarnessSwitched {
@@ -252,6 +286,7 @@ fn test_large_pty_chunks_roundtrip() {
     let attached_msg = IpcMessage::Daemon(DaemonMessage::Attached {
         session_id: sess_id,
         scrollback: Base64Bytes::new(large_data),
+        summary: SessionSummary::default(),
     });
     test_roundtrip(attached_msg);
 }
@@ -274,4 +309,86 @@ fn test_base64_json_encoding_is_not_array_of_numbers() {
         !json_str.contains("[72,101,108"),
         "PTY payload must not be a JSON array of numbers"
     );
+}
+
+#[test]
+fn test_f9_submit_task_roundtrip_and_aliases() {
+    let sess = SessionId::new("sess-f9");
+    let msg = ClientMessage::SubmitTask {
+        session_id: sess.clone(),
+        task: "Fix findings in parallel crates".to_string(),
+    };
+    test_roundtrip(IpcMessage::Client(msg));
+
+    // Test alias "prompt"
+    let json_prompt =
+        r#"{"action":"SubmitTask","payload":{"session_id":"sess-f9","prompt":"Via prompt alias"}}"#;
+    let decoded: ClientMessage =
+        serde_json::from_str(json_prompt).expect("deserialize prompt alias");
+    match decoded {
+        ClientMessage::SubmitTask { session_id, task } => {
+            assert_eq!(session_id, sess);
+            assert_eq!(task, "Via prompt alias");
+        }
+        _ => panic!("Expected SubmitTask"),
+    }
+}
+
+#[test]
+fn test_f10_route_outcome_typed_and_non_launchable_sentinel() {
+    // 1. Dispatchable recommendation
+    let rec = RouteOutcome::recommendation(
+        HarnessId::CursorAgent,
+        Some("frontier".to_string()),
+        Some("gpt-4o".to_string()),
+        Some(300),
+    );
+    assert!(rec.is_dispatchable());
+    assert_eq!(rec.harness(), Some(HarnessId::CursorAgent));
+    assert_eq!(rec.lane(), Some("frontier"));
+    assert_eq!(rec.model(), Some("gpt-4o"));
+    assert_eq!(rec.holds_until_s(), Some(300));
+    assert_eq!(rec.reason(), None);
+
+    let json_rec = serde_json::to_string(&rec).expect("serialize rec");
+    assert!(json_rec.contains("\"status\":\"recommendation\""));
+    let deserialized_rec: RouteOutcome = serde_json::from_str(&json_rec).expect("deserialize rec");
+    assert_eq!(rec, deserialized_rec);
+
+    // 2. No capacity outcome - cannot be mistaken for a launch
+    let no_cap = RouteOutcome::no_capacity("Exhausted all quota slots");
+    assert!(!no_cap.is_dispatchable());
+    assert_eq!(no_cap.harness(), None);
+    assert_eq!(no_cap.lane(), None);
+    assert_eq!(no_cap.model(), None);
+    assert_eq!(no_cap.holds_until_s(), None);
+    assert_eq!(no_cap.reason(), Some("Exhausted all quota slots"));
+
+    let json_no_cap = serde_json::to_string(&no_cap).expect("serialize no_cap");
+    assert!(json_no_cap.contains("\"status\":\"no_capacity\""));
+    let deserialized_no_cap: RouteOutcome =
+        serde_json::from_str(&json_no_cap).expect("deserialize no_cap");
+    assert_eq!(no_cap, deserialized_no_cap);
+}
+
+#[test]
+fn test_f13_attached_summary_deserializes_with_default() {
+    // Frames without "summary" field must deserialize using SessionSummary::default()
+    let json_without_summary =
+        r#"{"event":"Attached","payload":{"session_id":"s1","scrollback":"dGVzdA=="}}"#;
+    let decoded: DaemonMessage =
+        serde_json::from_str(json_without_summary).expect("deserialize old Attached");
+    match decoded {
+        DaemonMessage::Attached {
+            session_id,
+            scrollback,
+            summary,
+        } => {
+            assert_eq!(session_id, SessionId::new("s1"));
+            assert_eq!(scrollback.as_slice(), b"test");
+            assert_eq!(summary.harness, HarnessId::ClaudeCode);
+            assert!(!summary.active);
+        }
+        _ => panic!("Expected Attached"),
+    }
 }
