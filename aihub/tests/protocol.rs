@@ -396,7 +396,7 @@ async fn f8_reader_stays_in_sync_when_fragmented_frame_and_key_event_interleave(
 }
 
 #[test]
-fn f12_guard_restores_terminal_on_init_error() {
+fn f12_production_initializer_restores_terminal_on_error() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     struct FailingWriter;
@@ -428,7 +428,7 @@ fn f12_guard_restores_terminal_on_init_error() {
         raw_clone2.store(false, Ordering::SeqCst);
     };
 
-    // Calling new_with_seam with a failing writer:
+    // Calling the shared initializer (which powers new_with_writer and new) with a failing writer:
     // Raw mode is enabled first, then write/flush fails.
     // The guard must be constructed immediately and restore raw mode before returning error.
     let result = TerminalGuard::new_with_seam(FailingWriter, enable_raw, disable_raw);
@@ -441,6 +441,11 @@ fn f12_guard_restores_terminal_on_init_error() {
         !raw_mode_active.load(Ordering::SeqCst),
         "Raw mode must be disabled after initialization error"
     );
+}
+
+#[test]
+fn f12_guard_restores_terminal_on_init_error() {
+    f12_production_initializer_restores_terminal_on_error();
 }
 
 #[test]

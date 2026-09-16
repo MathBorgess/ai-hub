@@ -20,6 +20,19 @@ use tokio::{
 
 pub type Operation<T> = Pin<Box<dyn Future<Output = Result<T>> + Send>>;
 
+/// A stop barrier could not be confirmed (F4/F5): the client sees `stop_unconfirmed`, never the
+/// generic request-failed code, so merge/switch refusal is distinguishable from other failures.
+#[derive(Debug, thiserror::Error)]
+#[error("stop could not be confirmed: {0}")]
+pub struct StopUnconfirmed(String);
+
+fn project_identity(originating_checkout: &Path) -> String {
+    originating_checkout
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| originating_checkout.display().to_string())
+}
+
 pub fn log_lifecycle(level: &str, event: &str, details: &str) {
     let now = std::time::SystemTime::now();
     let duration = now
@@ -90,11 +103,19 @@ pub struct Pty {
     pub try_write: Arc<dyn Fn(Vec<u8>) -> Result<()> + Send + Sync>,
 }
 
-pub fn spawn_pty(harness: HarnessId, options: PtySpawnOptions) -> Result<Pty> {
+pub fn spawn_pty(
+    harness: HarnessId,
+    options: PtySpawnOptions,
+    model: Option<String>,
+) -> Result<Pty> {
     let handle = if let Ok(cmd) = std::env::var("AIHUB_PTY_COMMAND") {
         Arc::new(aihub_pty::spawn_command(&cmd, &[], options)?)
     } else {
-        Arc::new(aihub_pty::spawn_harness(harness, options)?)
+        Arc::new(aihub_pty::spawn_harness(
+            harness,
+            options,
+            model.as_deref(),
+        )?)
     };
     let output = handle.subscribe_output();
     let scrollback = handle.scrollback_snapshot();
@@ -288,19 +309,30 @@ impl State {
     }
 }
 
-type Spawner = dyn Fn(HarnessId, PtySpawnOptions) -> Result<Pty> + Send + Sync;
+type Spawner = dyn Fn(HarnessId, PtySpawnOptions, Option<String>) -> Result<Pty> + Send + Sync;
 type Probe =
     dyn Fn() -> Pin<Box<dyn Future<Output = Vec<QuotaSnapshot>> + Send + 'static>> + Send + Sync;
 type Classifier = dyn Fn(&str) -> Pin<Box<dyn Future<Output = aihub_router::Classification> + Send + 'static>>
     + Send
     + Sync;
-type Router =
-    dyn Fn(TaskTier, TaskSize, &[QuotaSnapshot], u64) -> Result<RouteOutcome> + Send + Sync;
+type Router = dyn Fn(
+        TaskTier,
+        TaskSize,
+        &[QuotaSnapshot],
+        u64,
+        &aihub_router::ModelCatalog,
+    ) -> Result<RouteOutcome>
+    + Send
+    + Sync;
+type CatalogPath = dyn Fn(HarnessId) -> Option<PathBuf> + Send + Sync;
+type Drain =
+    dyn Fn() -> Pin<Box<dyn Future<Output = Result<usize>> + Send + 'static>> + Send + Sync;
 type MemoryRecorder = dyn Fn(
         &SessionId,
         HarnessId,
         HarnessId,
         &aihub_memory::BriefPair,
+        &str,
     )
         -> Pin<Box<dyn Future<Output = Result<aihub_memory::HandoffDestination>> + Send + 'static>>
     + Send
@@ -338,6 +370,9 @@ pub struct Daemon {
     git_diff: Arc<GitDiff>,
     git_finish: Arc<GitFinish>,
     refresh: Arc<tokio::sync::Notify>,
+    catalog: Arc<Mutex<aihub_router::ModelCatalog>>,
+    catalog_paths: Arc<CatalogPath>,
+    drain: Arc<Drain>,
 }
 
 impl Daemon {
@@ -345,7 +380,7 @@ impl Daemon {
     where
         P: Fn() -> F + Send + Sync + 'static,
         F: Future<Output = Vec<QuotaSnapshot>> + Send + 'static,
-        S: Fn(HarnessId, PtySpawnOptions) -> Result<Pty> + Send + Sync + 'static,
+        S: Fn(HarnessId, PtySpawnOptions, Option<String>) -> Result<Pty> + Send + Sync + 'static,
     {
         Self {
             state: Arc::new(Mutex::new(State::default())),
@@ -366,24 +401,34 @@ impl Daemon {
                     }
                 })
             }),
-            router: Arc::new(|tier, size, snapshots, horizon| {
-                aihub_router::route_outcome(tier, size, snapshots, horizon).map_err(Into::into)
+            router: Arc::new(|tier, size, snapshots, horizon, catalog| {
+                aihub_router::route_outcome(tier, size, snapshots, horizon, catalog)
+                    .map_err(Into::into)
             }),
-            memory_recorder: Arc::new(|session_id, from, to, brief| {
+            memory_recorder: Arc::new(|session_id, from, to, brief, project| {
                 let id = session_id.clone();
                 let b = brief.clone();
+                let project = project.to_string();
                 let id_call = id.clone();
                 let b_call = b.clone();
+                let project_call = project.clone();
                 Box::pin(async move {
                     let join = tokio::task::spawn(async move {
-                        aihub_memory::record_handoff_destination(&id_call, from, to, &b_call).await
+                        aihub_memory::record_handoff_destination(
+                            &id_call,
+                            from,
+                            to,
+                            &b_call,
+                            &project_call,
+                        )
+                        .await
                     })
                     .await;
                     match join {
                         Ok(Ok(dest)) => Ok(dest),
                         Ok(Err(e)) => Err(anyhow::anyhow!(e)),
                         Err(_) => {
-                            aihub_memory::record_handoff(&id, from, to, &b).await?;
+                            aihub_memory::record_handoff(&id, from, to, &b, &project).await?;
                             Ok(aihub_memory::HandoffDestination::Spooled)
                         }
                     }
@@ -419,7 +464,31 @@ impl Daemon {
                 })
             }),
             refresh: Arc::new(tokio::sync::Notify::new()),
+            catalog: Arc::new(Mutex::new(aihub_router::ModelCatalog::default())),
+            // No default catalog executables: tests must never spawn a real `cursor-agent`/`agy`
+            // by accident. main.rs opts in explicitly via `with_catalog_paths`.
+            catalog_paths: Arc::new(|_| None),
+            // No-op by default: tests must never poll a real ai-memory on 127.0.0.1:49374.
+            // main.rs opts in explicitly via `with_drain`.
+            drain: Arc::new(|| Box::pin(async { Ok(0) })),
         }
+    }
+
+    pub fn with_catalog_paths<C>(mut self, resolver: C) -> Self
+    where
+        C: Fn(HarnessId) -> Option<PathBuf> + Send + Sync + 'static,
+    {
+        self.catalog_paths = Arc::new(resolver);
+        self
+    }
+
+    pub fn with_drain<D, F>(mut self, drain: D) -> Self
+    where
+        D: Fn() -> F + Send + Sync + 'static,
+        F: Future<Output = Result<usize>> + Send + 'static,
+    {
+        self.drain = Arc::new(move || Box::pin(drain()));
+        self
     }
 
     pub fn with_classifier<C, F>(mut self, classifier: C) -> Self
@@ -433,7 +502,13 @@ impl Daemon {
 
     pub fn with_router<R>(mut self, router: R) -> Self
     where
-        R: Fn(TaskTier, TaskSize, &[QuotaSnapshot], u64) -> Result<RouteOutcome>
+        R: Fn(
+                TaskTier,
+                TaskSize,
+                &[QuotaSnapshot],
+                u64,
+                &aihub_router::ModelCatalog,
+            ) -> Result<RouteOutcome>
             + Send
             + Sync
             + 'static,
@@ -444,13 +519,13 @@ impl Daemon {
 
     pub fn with_memory_recorder<M, F>(mut self, recorder: M) -> Self
     where
-        M: Fn(&SessionId, HarnessId, HarnessId, &aihub_memory::BriefPair) -> F
+        M: Fn(&SessionId, HarnessId, HarnessId, &aihub_memory::BriefPair, &str) -> F
             + Send
             + Sync
             + 'static,
         F: Future<Output = Result<aihub_memory::HandoffDestination>> + Send + 'static,
     {
-        self.memory_recorder = Arc::new(move |s, f, t, b| Box::pin(recorder(s, f, t, b)));
+        self.memory_recorder = Arc::new(move |s, f, t, b, p| Box::pin(recorder(s, f, t, b, p)));
         self
     }
 
@@ -494,8 +569,126 @@ impl Daemon {
         target: HarnessId,
         handoff: bool,
     ) -> Result<Option<aihub_memory::HandoffDestination>> {
-        let mut state = self.state.lock().await;
-        self.switch(&mut state, id, target, handoff).await
+        self.switch_and_deliver(id, target, handoff, None).await
+    }
+
+    /// Prepares a switch under the registry lock, then delivers the handoff (if any) after
+    /// releasing it, so a hung sidecar never blocks other clients or shutdown (N1).
+    async fn switch_and_deliver(
+        &self,
+        id: &SessionId,
+        target: HarnessId,
+        handoff: bool,
+        model: Option<&str>,
+    ) -> Result<Option<aihub_memory::HandoffDestination>> {
+        let pending = {
+            let mut state = self.state.lock().await;
+            self.switch(&mut state, id, target, handoff, model).await?
+        };
+        let Some((old, brief, project)) = pending else {
+            return Ok(None);
+        };
+        match (self.memory_recorder)(id, old, target, &brief, &project).await {
+            Ok(dest) => {
+                log_lifecycle(
+                    "INFO",
+                    "session switch",
+                    &format!(
+                        "session_id={} from={} to={} handoff_dest={:?}",
+                        id, old, target, dest
+                    ),
+                );
+                Ok(Some(dest))
+            }
+            Err(err) => {
+                let spool_full = err
+                    .downcast_ref::<aihub_memory::MemoryError>()
+                    .is_some_and(|e| matches!(e, aihub_memory::MemoryError::SpoolFull(_)));
+                log_lifecycle(
+                    "ERROR",
+                    "handoff_record",
+                    &format!("session_id={} handoff record failed: {}", id, err),
+                );
+                let mut state = self.state.lock().await;
+                if spool_full {
+                    state.broadcast(error(
+                        "handoff_spool_full",
+                        "Handoff spool storage limit reached; harness switched without a durable audit record",
+                    ));
+                } else {
+                    state.broadcast(error(
+                        "handoff_record",
+                        "Harness switched, but handoff metadata could not be recorded",
+                    ));
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    /// Stops a session through the confirmed group barrier (F4). On error the session is left
+    /// visibly stopped rather than retried, and the caller must not finalize Git or launch a
+    /// replacement harness.
+    async fn quiesce(&self, state: &mut State, id: &SessionId) -> Result<()> {
+        let s = state.session(id)?;
+        if !s.summary.active {
+            return Ok(());
+        }
+        let stop_fn = s.pty.stop.clone();
+        let result = stop_fn(Duration::from_secs(5)).await;
+        let s = state.session(id)?;
+        s.summary.active = false;
+        match result {
+            Ok(_) => {
+                for task in s.tasks.drain(..) {
+                    task.abort();
+                }
+                log_lifecycle("INFO", "session stop", &format!("session_id={id} stopped"));
+                Ok(())
+            }
+            Err(e) => {
+                log_lifecycle(
+                    "ERROR",
+                    "stop_unconfirmed",
+                    &format!("session_id={id} stop barrier failed: {e}"),
+                );
+                Err(StopUnconfirmed(format!("session {id} could not be confirmed stopped")).into())
+            }
+        }
+    }
+
+    /// Waits for an autonomous recommendation's hold to pass, then dispatches it if the
+    /// session is still eligible (blocker 5). Tracked in `session.tasks` so shutdown cancels it.
+    fn schedule_hold_dispatch(
+        &self,
+        state: &mut State,
+        id: &SessionId,
+        harness: HarnessId,
+        hold_s: u64,
+        model: Option<String>,
+    ) {
+        let daemon = self.clone();
+        let task_id = id.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(hold_s)).await;
+            let eligible = {
+                let mut state = daemon.state.lock().await;
+                matches!(
+                    state.session(&task_id),
+                    Ok(s) if s.summary.mode == Mode::Autonomous
+                        && s.summary.active
+                        && s.summary.harness != harness
+                )
+            };
+            if eligible {
+                let _ = daemon
+                    .switch_and_deliver(&task_id, harness, true, model.as_deref())
+                    .await;
+            }
+        });
+        if let Ok(s) = state.session(id) {
+            s.tasks.push(handle);
+        }
     }
 
     fn add_locked(
@@ -513,7 +706,7 @@ impl Daemon {
         {
             bail!("duplicate session");
         }
-        let pty = (self.spawner)(harness, options(wt.path.clone(), prompt.clone()))?;
+        let pty = (self.spawner)(harness, options(wt.path.clone(), prompt.clone()), None)?;
         let id = wt.session_id.clone();
         let mut session = Session {
             summary: SessionSummary {
@@ -629,6 +822,10 @@ impl Daemon {
         tasks.spawn(async move {
             daemon.quota_loop().await;
         });
+        let daemon = self.clone();
+        tasks.spawn(async move {
+            daemon.drain_loop().await;
+        });
         tokio::pin!(shutdown);
         let result = loop {
             tokio::select! {
@@ -659,8 +856,16 @@ impl Daemon {
             }
             if s.summary.active {
                 let stop_fn = s.pty.stop.clone();
-                if stop_fn(Duration::from_secs(5)).await.is_err() {
+                if let Err(e) = stop_fn(Duration::from_secs(5)).await {
                     stop_failed = true;
+                    log_lifecycle(
+                        "ERROR",
+                        "shutdown_stop_failed",
+                        &format!(
+                            "session_id={} stop barrier failed: {e}",
+                            s.summary.session_id
+                        ),
+                    );
                 }
                 s.summary.active = false;
                 log_lifecycle(
@@ -689,21 +894,55 @@ impl Daemon {
                 "probe refresh",
                 &format!("refreshed {} quota snapshots", snapshots.len()),
             );
-            let mut state = self.state.lock().await;
-            *self.cache.lock().await = snapshots.clone();
-            state.broadcast(DaemonMessage::QuotaPush {
-                snapshots: snapshots.clone(),
-            });
-            let requests: Vec<_> = state
-                .sessions
-                .iter()
-                .filter(|s| s.summary.active)
-                .filter_map(|s| s.prompt.clone().map(|p| (s.summary.session_id.clone(), p)))
-                .collect();
+            // N6: refresh the model catalog here, off the registry lock. A hanging
+            // model-list executable only delays the next catalog snapshot, never a client.
+            for harness in [HarnessId::CursorAgent, HarnessId::Antigravity] {
+                if let Some(path) = (self.catalog_paths)(harness) {
+                    let current = self.catalog.lock().await.clone();
+                    match current.refresh(harness, &path).await {
+                        Ok(next) => *self.catalog.lock().await = next,
+                        Err(e) => {
+                            log_lifecycle("WARN", "catalog_refresh", &format!("{harness}: {e}"))
+                        }
+                    }
+                }
+            }
+            let requests: Vec<_> = {
+                let mut state = self.state.lock().await;
+                *self.cache.lock().await = snapshots.clone();
+                state.broadcast(DaemonMessage::QuotaPush {
+                    snapshots: snapshots.clone(),
+                });
+                state
+                    .sessions
+                    .iter()
+                    .filter(|s| s.summary.active)
+                    .filter_map(|s| s.prompt.clone().map(|p| (s.summary.session_id.clone(), p)))
+                    .collect()
+            };
             for (id, prompt) in requests {
                 let _ = self
-                    .recommend(&mut state, &prompt, Some(id), TaskSize::M, &snapshots)
+                    .recommend(&prompt, Some(id), TaskSize::M, &snapshots)
                     .await;
+            }
+        }
+    }
+
+    /// Periodically retries delivery of anything still spooled, independent of a new handoff
+    /// (N1). Entirely off the registry lock: it never touches `self.state`.
+    async fn drain_loop(&self) {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            match (self.drain)().await {
+                Ok(0) => {}
+                Ok(n) => log_lifecycle(
+                    "INFO",
+                    "handoff_drain",
+                    &format!("drained {n} spooled handoffs"),
+                ),
+                Err(e) => log_lifecycle("ERROR", "handoff_drain", &format!("drain failed: {e}")),
             }
         }
     }
@@ -763,11 +1002,13 @@ impl Daemon {
                 message = read_message(&mut reader) => match message { Ok(m) => m, Err(_) => break },
             };
             // A disconnect must not cancel a switch after the incoming PTY starts.
-            if self.handle(id, message).await.is_err() {
-                self.state.lock().await.send(
-                    id,
-                    error("request_failed", "request could not be completed"),
-                );
+            if let Err(e) = self.handle(id, message).await {
+                let response = if e.downcast_ref::<StopUnconfirmed>().is_some() {
+                    error("stop_unconfirmed", &e.to_string())
+                } else {
+                    error("request_failed", "request could not be completed")
+                };
+                self.state.lock().await.send(id, response);
             }
         }
         self.state.lock().await.clients.remove(&id);
@@ -884,8 +1125,13 @@ impl Daemon {
                 session_id,
                 target,
                 with_handoff,
+                model,
             } => {
-                self.switch(&mut state, &session_id, target, with_handoff)
+                // Manual /switch is the user's explicit choice: it ignores holds, and drops the
+                // registry lock before delivering the handoff so a hung sidecar can't block
+                // other clients or shutdown (N1).
+                drop(state);
+                self.switch_and_deliver(&session_id, target, with_handoff, model.as_deref())
                     .await?;
             }
             ClientMessage::RouteRequest {
@@ -913,14 +1159,9 @@ impl Daemon {
                     })
                 };
                 let snapshots = self.cache.lock().await.clone();
-                self.recommend(
-                    &mut state,
-                    &prompt,
-                    id,
-                    size_hint.unwrap_or(TaskSize::M),
-                    &snapshots,
-                )
-                .await?;
+                drop(state);
+                self.recommend(&prompt, id, size_hint.unwrap_or(TaskSize::M), &snapshots)
+                    .await?;
             }
             ClientMessage::MergeRequest {
                 session_id,
@@ -951,21 +1192,9 @@ impl Daemon {
                     });
                 } else {
                     c.merge = None;
-                    // F4: Quiesce and reap through the stop barrier
-                    let s = state.session(&session_id)?;
-                    if s.summary.active {
-                        let stop_fn = s.pty.stop.clone();
-                        stop_fn(Duration::from_secs(5)).await?;
-                        s.summary.active = false;
-                        for task in s.tasks.drain(..) {
-                            task.abort();
-                        }
-                        log_lifecycle(
-                            "INFO",
-                            "session stop",
-                            &format!("session_id={} stopped for merge", session_id),
-                        );
-                    }
+                    // F4: an unconfirmed stop refuses to finalize Git; never launch a
+                    // replacement and never reach the final diff below.
+                    self.quiesce(&mut state, &session_id).await?;
                     // Only after the child group is reaped do they take the final diff
                     let stopped_diff = (self.git_diff)(&path, &base, true).await?;
                     if stopped_diff != diff {
@@ -1009,7 +1238,9 @@ impl Daemon {
                     )
                 };
                 let classification = (self.classifier)(&task).await;
-                let outcome = (self.router)(classification.tier, TaskSize::M, &snapshots, 120)?;
+                let catalog = self.catalog.lock().await.clone();
+                let outcome =
+                    (self.router)(classification.tier, TaskSize::M, &snapshots, 120, &catalog)?;
                 state.send(
                     client,
                     DaemonMessage::RouteRecommendation {
@@ -1021,11 +1252,30 @@ impl Daemon {
                     if let RouteOutcome::Recommendation {
                         harness,
                         holds_until_s,
+                        model,
                         ..
                     } = &outcome
                     {
-                        if *harness != current_harness && holds_until_s.unwrap_or(0) == 0 {
-                            self.switch(&mut state, &session_id, *harness, true).await?;
+                        if *harness != current_harness {
+                            let hold = holds_until_s.unwrap_or(0);
+                            if hold == 0 {
+                                drop(state);
+                                self.switch_and_deliver(
+                                    &session_id,
+                                    *harness,
+                                    true,
+                                    model.as_deref(),
+                                )
+                                .await?;
+                                return Ok(());
+                            }
+                            self.schedule_hold_dispatch(
+                                &mut state,
+                                &session_id,
+                                *harness,
+                                hold,
+                                model.clone(),
+                            );
                         }
                     }
                     // NoCapacity is never dispatched (F10)
@@ -1038,69 +1288,88 @@ impl Daemon {
 
     async fn recommend(
         &self,
-        state: &mut State,
         prompt: &str,
         id: Option<SessionId>,
         size: TaskSize,
         snapshots: &[QuotaSnapshot],
     ) -> Result<()> {
         let classification = (self.classifier)(prompt).await;
-        let outcome = (self.router)(classification.tier, size, snapshots, 120)?;
+        let catalog = self.catalog.lock().await.clone();
+        let outcome = (self.router)(classification.tier, size, snapshots, 120, &catalog)?;
         let session_id = id.clone().unwrap_or_else(|| SessionId::new("unknown"));
-        state.broadcast(DaemonMessage::RouteRecommendation {
-            session_id: session_id.clone(),
-            outcome: outcome.clone(),
-        });
+        {
+            let mut state = self.state.lock().await;
+            state.broadcast(DaemonMessage::RouteRecommendation {
+                session_id: session_id.clone(),
+                outcome: outcome.clone(),
+            });
+        }
         if let Some(id) = id {
-            if let Ok(s) = state.session(&id) {
-                if s.summary.mode == Mode::Autonomous {
-                    if let RouteOutcome::Recommendation {
-                        harness,
-                        holds_until_s,
-                        ..
-                    } = &outcome
-                    {
-                        if s.summary.harness != *harness && holds_until_s.unwrap_or(0) == 0 {
-                            self.switch(state, &id, *harness, true).await?;
+            let current_harness = {
+                let mut state = self.state.lock().await;
+                match state.session(&id) {
+                    Ok(s) if s.summary.mode == Mode::Autonomous => Some(s.summary.harness),
+                    _ => None,
+                }
+            };
+            if let Some(current_harness) = current_harness {
+                if let RouteOutcome::Recommendation {
+                    harness,
+                    holds_until_s,
+                    model,
+                    ..
+                } = &outcome
+                {
+                    if *harness != current_harness {
+                        let hold = holds_until_s.unwrap_or(0);
+                        if hold == 0 {
+                            self.switch_and_deliver(&id, *harness, true, model.as_deref())
+                                .await?;
+                        } else {
+                            let mut state = self.state.lock().await;
+                            self.schedule_hold_dispatch(
+                                &mut state,
+                                &id,
+                                *harness,
+                                hold,
+                                model.clone(),
+                            );
                         }
                     }
-                    // NoCapacity is never dispatched (F10)
                 }
+                // NoCapacity is never dispatched (F10)
             }
         }
         Ok(())
     }
 
+    /// Prepares a switch under the registry lock: quiesces the outgoing harness through the
+    /// confirmed stop barrier (F4/F5), extracts and writes the handoff brief, and launches the
+    /// incoming harness. Returns the brief and project identity for the caller to deliver
+    /// *after* releasing the lock (N1) instead of network-calling memory here.
     pub(crate) async fn switch(
         &self,
         state: &mut State,
         id: &SessionId,
         target: HarnessId,
         handoff: bool,
-    ) -> Result<Option<aihub_memory::HandoffDestination>> {
+        model: Option<&str>,
+    ) -> Result<Option<(HarnessId, aihub_memory::BriefPair, String)>> {
         let s = state.session(id)?;
-        if s.summary.harness == target {
+        // F5: only same-harness *and already running* is a no-op. A same-harness switch on a
+        // stopped session (e.g. after a failed spawn) must relaunch it.
+        if s.summary.harness == target && s.summary.active {
             return Ok(None);
         }
         let old = s.summary.harness;
         let wt_path = s.summary.worktree_path.clone();
         let prompt_fallback = s.prompt.clone();
         let generation = s.generation;
+        let project = project_identity(&s.originating_checkout);
 
-        // 1. Quiesce outgoing harness through the stop barrier (F5)
-        if s.summary.active {
-            let stop_fn = s.pty.stop.clone();
-            stop_fn(Duration::from_secs(5)).await?;
-            s.summary.active = false;
-            for task in s.tasks.drain(..) {
-                task.abort();
-            }
-            log_lifecycle(
-                "INFO",
-                "session stop",
-                &format!("session_id={} quiesced for switch", id),
-            );
-        }
+        // 1. Quiesce outgoing harness through the confirmed stop barrier (F4/F5). An
+        // unconfirmed stop refuses to launch the replacement harness.
+        self.quiesce(state, id).await?;
 
         // 2. Extract final context
         let brief = if handoff {
@@ -1122,7 +1391,11 @@ impl Daemon {
         };
 
         // 4. Launch incoming harness (F5)
-        let incoming = match (self.spawner)(target, options(wt_path.clone(), prompt)) {
+        let incoming = match (self.spawner)(
+            target,
+            options(wt_path.clone(), prompt),
+            model.map(str::to_string),
+        ) {
             Ok(pty) => pty,
             Err(e) => {
                 // If incoming spawn fails, session ends in recoverable stopped state (F5)
@@ -1158,44 +1431,20 @@ impl Daemon {
             handoff_path,
         });
 
-        let mut destination = None;
-        if let Some(b) = brief {
-            match (self.memory_recorder)(id, old, target, &b).await {
-                Ok(dest) => {
-                    destination = Some(dest);
-                    log_lifecycle(
-                        "INFO",
-                        "session switch",
-                        &format!(
-                            "session_id={} from={} to={} handoff_dest={:?}",
-                            id, old, target, dest
-                        ),
-                    );
-                }
-                Err(err) => {
-                    log_lifecycle(
-                        "ERROR",
-                        "handoff_record",
-                        &format!("session_id={} handoff record failed: {}", id, err),
-                    );
-                    state.broadcast(error(
-                        "handoff_record",
-                        "Harness switched, but handoff metadata could not be recorded",
-                    ));
-                }
+        match brief {
+            Some(b) => Ok(Some((old, b, project))),
+            None => {
+                log_lifecycle(
+                    "INFO",
+                    "session switch",
+                    &format!(
+                        "session_id={} from={} to={} handoff_dest=none",
+                        id, old, target
+                    ),
+                );
+                Ok(None)
             }
-        } else {
-            log_lifecycle(
-                "INFO",
-                "session switch",
-                &format!(
-                    "session_id={} from={} to={} handoff_dest=none",
-                    id, old, target
-                ),
-            );
         }
-
-        Ok(destination)
     }
 }
 fn options(cwd: PathBuf, initial_prompt: Option<String>) -> PtySpawnOptions {
@@ -1263,7 +1512,7 @@ mod tests {
                 _ => panic!("wrong direction"),
             }
         }
-        let daemon = Daemon::new(|| async { vec![] }, |_, _| panic!("no spawn"));
+        let daemon = Daemon::new(|| async { vec![] }, |_, _, _| panic!("no spawn"));
         let mut workers = JoinSet::new();
         let mut clients = vec![];
         for _ in 0..2 {
@@ -1350,7 +1599,7 @@ mod tests {
         let kills = stops.clone();
         let daemon = Daemon::new(
             || async { vec![] },
-            move |harness, opts| {
+            move |harness, opts, _model| {
                 assert_eq!(opts.cwd, PathBuf::from("/fake/wt"));
                 let order = calls.fetch_add(1, Ordering::SeqCst);
                 assert_eq!(
@@ -1424,7 +1673,7 @@ mod tests {
             .unwrap();
         let mut state = daemon.state.lock().await;
         daemon
-            .switch(&mut state, &id, HarnessId::ClaudeCode, false)
+            .switch(&mut state, &id, HarnessId::ClaudeCode, false, None)
             .await
             .unwrap();
         assert_eq!(stops.load(Ordering::SeqCst), 1);
@@ -1459,7 +1708,7 @@ mod tests {
                     }]
                 }
             },
-            |_, _| panic!("no PTY requested"),
+            |_, _, _| panic!("no PTY requested"),
         );
         let (tx, mut rx) = mpsc::channel(16);
         daemon.state.lock().await.clients.insert(

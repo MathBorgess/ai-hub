@@ -137,13 +137,82 @@ pub fn next_session_index(output_dir: &Path) -> u32 {
     max_idx + 1
 }
 
+/// Extracted context from a written brief file (`NN.md`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractedBriefContext {
+    pub goal: String,
+    pub decisions: Vec<String>,
+    pub last_output_summary: String,
+}
+
+/// Parses the goal, decisions, and last output summary from a written brief string.
+pub fn parse_brief_context(content: &str) -> ExtractedBriefContext {
+    let mut goal = String::new();
+    let mut decisions = Vec::new();
+    let mut last_output_summary = String::new();
+
+    if let Some(pos) = content.find("## Goal\n") {
+        let after = &content[pos + 8..];
+        let end = after.find("\n## ").unwrap_or(after.len());
+        goal = after[..end].trim().to_string();
+    }
+
+    if let Some(pos) = content.find("## Constraints\n") {
+        let after = &content[pos + 15..];
+        let end = after.find("\n## ").unwrap_or(after.len());
+        let section = &after[..end];
+        for line in section.lines() {
+            let trimmed = line.trim();
+            if let Some(bullet) = trimmed.strip_prefix("- ") {
+                let bullet = bullet.trim();
+                if bullet.starts_with("(none recorded)")
+                    || bullet.starts_with("Outgoing harness transcript missing")
+                {
+                    continue;
+                }
+                if let Some(ctx) = bullet.strip_prefix("Context: ") {
+                    if last_output_summary.is_empty() {
+                        last_output_summary = ctx.trim().to_string();
+                    }
+                } else {
+                    decisions.push(bullet.to_string());
+                }
+            }
+        }
+    }
+
+    if let Some(pos) = content.find("## Last turn (outgoing harness)\n") {
+        let after = &content[pos + 32..];
+        let end = after.find("\n## ").unwrap_or(after.len());
+        let turn_text = after[..end].trim();
+        if !turn_text.is_empty()
+            && !turn_text.starts_with("_Outgoing harness had no final assistant message")
+        {
+            last_output_summary = turn_text.to_string();
+        }
+    }
+
+    ExtractedBriefContext {
+        goal,
+        decisions,
+        last_output_summary,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn writes_numbered_brief_pair_with_redaction() {
-        let dir = std::env::temp_dir().join("aihub-memory-brief-test");
+        let dir = std::env::temp_dir().join(format!(
+            "aihub-memory-brief-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
@@ -175,7 +244,14 @@ mod tests {
 
     #[test]
     fn brief_template_is_generic_without_repo_specific_instructions() {
-        let dir = std::env::temp_dir().join("aihub-memory-generic-brief-test");
+        let dir = std::env::temp_dir().join(format!(
+            "aihub-memory-generic-brief-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 

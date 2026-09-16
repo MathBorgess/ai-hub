@@ -89,10 +89,12 @@ fn test_prefix_actions() {
     app.session_id = Some(session.clone());
     app.harness = HarnessId::ClaudeCode;
     app.mode = Mode::Assisted;
+    app.task = Some("existing task".to_string());
     app.recommendation = Some(RecommendationState::Recommended {
         tier: TaskTier::Mechanical,
         harness: HarnessId::Antigravity,
         lane: None,
+        model: None,
         holds_until_s: None,
         confidence: 0.9,
         reason: "mechanical task".to_string(),
@@ -125,6 +127,7 @@ fn test_prefix_actions() {
             session_id: session.clone(),
             target: HarnessId::Antigravity,
             with_handoff: true,
+            model: None,
         })
     );
 
@@ -138,6 +141,7 @@ fn test_prefix_actions() {
             session_id: session.clone(),
             target: expected_next,
             with_handoff: true,
+            model: None,
         })
     );
 
@@ -188,6 +192,7 @@ fn test_palette_commands_execution() {
     let mut app = App::new(PathBuf::from("/test/repo"));
     let session = SessionId::new("test-session");
     app.session_id = Some(session.clone());
+    app.task = Some("test task".to_string());
 
     // Test /switch agy
     let action = aihub::keys::execute_palette_command(&mut app, "/switch agy");
@@ -197,6 +202,7 @@ fn test_palette_commands_execution() {
             session_id: session.clone(),
             target: HarnessId::Antigravity,
             with_handoff: true,
+            model: None,
         })
     );
 
@@ -208,6 +214,7 @@ fn test_palette_commands_execution() {
             session_id: session.clone(),
             target: HarnessId::ClaudeCode,
             with_handoff: true,
+            model: None,
         })
     );
 
@@ -472,6 +479,7 @@ fn test_tab_cycles_available_harnesses_only() {
             session_id: session,
             target: HarnessId::CursorAgent,
             with_handoff: true,
+            model: None,
         })
     );
 }
@@ -520,4 +528,194 @@ fn test_merge_strategy_preserved_across_merge_result() {
         }
         _ => panic!("Expected UiMode::MergeReview"),
     }
+}
+
+#[test]
+fn f9_autonomous_without_task_opens_task_prompt() {
+    let mut app = App::new(PathBuf::from("/test/repo"));
+    let session = SessionId::new("sess-f9-notask");
+    app.session_id = Some(session.clone());
+    app.mode = Mode::Assisted;
+    assert!(!app.has_task());
+
+    let ctrl_bracket = make_key(KeyCode::Char(']'), KeyModifiers::CONTROL);
+
+    // Press Ctrl+] then 'm' to toggle Autonomous
+    let act1 = handle_key(&mut app, ctrl_bracket);
+    assert_eq!(act1, AppAction::None);
+    assert!(app.prefix_active);
+
+    let act2 = handle_key(&mut app, plain_key(KeyCode::Char('m')));
+    // Must NOT emit SetMode IPC message
+    assert_eq!(
+        act2,
+        AppAction::None,
+        "Toggling autonomous without a task must emit no IPC message"
+    );
+
+    // Must open task prompt
+    match &app.ui_mode {
+        UiMode::Palette { input, .. } => {
+            assert!(
+                input.starts_with("/task"),
+                "Palette input must be pre-filled with task prompt, got: '{}'",
+                input
+            );
+        }
+        other => panic!("Expected UiMode::Palette, got {:?}", other),
+    }
+
+    // Must show a one-line notice explaining that Autonomous needs a task
+    assert!(
+        app.status_message.is_some(),
+        "Notice must be displayed when autonomous toggle is gated by task"
+    );
+    let (notice, _) = app.status_message.as_ref().unwrap();
+    let notice_lower = notice.to_lowercase();
+    assert!(
+        notice_lower.contains("autônomo") || notice_lower.contains("autonomous"),
+        "Notice should mention Autonomous, got: '{}'",
+        notice
+    );
+    assert_eq!(
+        app.mode,
+        Mode::Assisted,
+        "Mode must remain Assisted until task is submitted"
+    );
+}
+
+#[test]
+fn f9_autonomous_after_task_submission_enables_mode() {
+    let mut app = App::new(PathBuf::from("/test/repo"));
+    let session = SessionId::new("sess-f9-submit");
+    app.session_id = Some(session.clone());
+    app.mode = Mode::Assisted;
+
+    let ctrl_bracket = make_key(KeyCode::Char(']'), KeyModifiers::CONTROL);
+
+    // 1. Toggle mode without a task -> gates on task prompt
+    handle_key(&mut app, ctrl_bracket);
+    let act = handle_key(&mut app, plain_key(KeyCode::Char('m')));
+    assert_eq!(act, AppAction::None);
+    assert!(matches!(app.ui_mode, UiMode::Palette { .. }));
+
+    // 2. Drive key events to type task description
+    let task_text = "refactor routing module";
+    for c in task_text.chars() {
+        let char_act = handle_key(&mut app, plain_key(KeyCode::Char(c)));
+        assert_eq!(char_act, AppAction::None);
+    }
+
+    // 3. Press Enter to submit task
+    let submit_act = handle_key(&mut app, plain_key(KeyCode::Enter));
+
+    // Must emit both SubmitTask and SetMode to Autonomous
+    assert_eq!(
+        submit_act,
+        AppAction::SendMessages(vec![
+            ClientMessage::SubmitTask {
+                session_id: session.clone(),
+                task: task_text.to_string(),
+            },
+            ClientMessage::SetMode {
+                session_id: session.clone(),
+                mode: Mode::Autonomous,
+            },
+        ]),
+        "Submitting task must emit SubmitTask and SetMode to Autonomous"
+    );
+
+    assert_eq!(app.mode, Mode::Autonomous, "Mode must now be Autonomous");
+    assert!(app.has_task(), "Task must now be stored");
+    assert_eq!(app.ui_mode, UiMode::Normal, "UI mode must return to Normal");
+
+    // 4. With a task already stored, toggle behaves as today (switches to Assisted)
+    handle_key(&mut app, ctrl_bracket);
+    let toggle_to_assisted = handle_key(&mut app, plain_key(KeyCode::Char('m')));
+    assert_eq!(
+        toggle_to_assisted,
+        AppAction::SendMessage(ClientMessage::SetMode {
+            session_id: session.clone(),
+            mode: Mode::Assisted,
+        })
+    );
+    app.mode = Mode::Assisted;
+
+    // 5. Toggling back to Autonomous with task already stored does NOT prompt again
+    handle_key(&mut app, ctrl_bracket);
+    let toggle_to_auto = handle_key(&mut app, plain_key(KeyCode::Char('m')));
+    assert_eq!(
+        toggle_to_auto,
+        AppAction::SendMessage(ClientMessage::SetMode {
+            session_id: session.clone(),
+            mode: Mode::Autonomous,
+        })
+    );
+    assert_eq!(app.ui_mode, UiMode::Normal);
+
+    // 6. Normal typing stays plain PTY input
+    let pty_act = handle_key(&mut app, plain_key(KeyCode::Char('x')));
+    assert_eq!(pty_act, AppAction::SendPtyInput(b"x".to_vec()));
+}
+
+#[test]
+fn hold_assisted_enter_refuses_until_hold_expires() {
+    use aihub::keys::handle_key_at;
+
+    let mut app = App::new(PathBuf::from("/test/repo"));
+    let session = SessionId::new("sess-hold");
+    app.session_id = Some(session.clone());
+    app.mode = Mode::Assisted;
+
+    // Recommendation with a hold until epoch seconds 50400 (14:00 UTC)
+    let hold_target_s = 50400u64;
+    app.recommendation = Some(RecommendationState::Recommended {
+        tier: TaskTier::Mechanical,
+        harness: HarnessId::Antigravity,
+        lane: Some("gemini".to_string()),
+        model: Some("gemini-recommended".to_string()),
+        holds_until_s: Some(hold_target_s),
+        confidence: 0.95,
+        reason: "Fast mechanical refactor".to_string(),
+    });
+
+    let ctrl_bracket = make_key(KeyCode::Char(']'), KeyModifiers::CONTROL);
+
+    // 1. Clock is in the past: now = 50000 < 50400
+    let now_before = 50000u64;
+    handle_key_at(&mut app, ctrl_bracket, now_before);
+    assert!(app.prefix_active);
+
+    let action_before = handle_key_at(&mut app, plain_key(KeyCode::Enter), now_before);
+    assert_eq!(
+        action_before,
+        AppAction::None,
+        "Accepting recommendation while hold is in the future must emit no message"
+    );
+    assert!(
+        app.status_message.is_some(),
+        "Status notice must be shown when hold is active"
+    );
+    let (notice, _) = app.status_message.as_ref().unwrap();
+    assert!(
+        notice.contains("held until 14:00"),
+        "Notice should show 'held until HH:MM', got: '{}'",
+        notice
+    );
+
+    // 2. Clock reaches or passes the hold: now = 50400
+    handle_key_at(&mut app, ctrl_bracket, hold_target_s);
+    assert!(app.prefix_active);
+
+    let action_after = handle_key_at(&mut app, plain_key(KeyCode::Enter), hold_target_s);
+    assert_eq!(
+        action_after,
+        AppAction::SendMessage(ClientMessage::SwitchHarness {
+            session_id: session.clone(),
+            target: HarnessId::Antigravity,
+            with_handoff: true,
+            model: Some("gemini-recommended".to_string()),
+        }),
+        "Accepting recommendation once hold has expired must switch harness with the recommendation's model"
+    );
 }

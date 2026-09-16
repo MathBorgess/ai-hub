@@ -85,6 +85,7 @@ fn test_all_client_messages_roundtrip() {
             session_id: sess_id.clone(),
             target: HarnessId::Codex,
             with_handoff: true,
+            model: Some("claude-opus-5".into()),
         },
         // 11. SetMode
         ClientMessage::SetMode {

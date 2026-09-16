@@ -16,30 +16,12 @@ impl TerminalGuard {
     }
 
     /// Seam allowing custom writer for terminal initialization.
-    /// Builds the guard immediately after enabling raw mode, so any error
-    /// during alternate screen setup or flush restores the terminal.
-    pub fn new_with_writer<W: Write>(mut writer: W) -> Result<Self> {
-        crossterm::terminal::enable_raw_mode()?;
-        let mut guard = Self {
-            active: true,
-            restore_fn: None,
-        };
-
-        if let Err(e) = crossterm::execute!(
-            writer,
-            crossterm::terminal::EnterAlternateScreen,
-            crossterm::cursor::Hide
-        ) {
-            guard.restore();
-            return Err(e.into());
-        }
-
-        if let Err(e) = writer.flush() {
-            guard.restore();
-            return Err(e.into());
-        }
-
-        Ok(guard)
+    /// Delegates to `new_with_seam` so both production and test paths
+    /// share a single unified initializer.
+    pub fn new_with_writer<W: Write>(writer: W) -> Result<Self> {
+        Self::new_with_seam(writer, crossterm::terminal::enable_raw_mode, || {
+            let _ = crossterm::terminal::disable_raw_mode();
+        })
     }
 
     /// Testable seam for custom enable/disable closures and writer.

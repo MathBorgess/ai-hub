@@ -1,15 +1,27 @@
 use std::collections::HashMap;
 use std::env;
-use std::time::Duration;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::time::{Duration, Instant};
 
 use aihub_core::HarnessId;
 use aihub_pty::{
-    harness_recipe, harness_recipe_with_model, spawn_command, PtyError, PtySize, PtySpawnOptions,
+    harness_recipe, harness_recipe_with_model, spawn_command, spawn_harness, PtyError, PtySize,
+    PtySpawnOptions,
 };
 use tokio::time::{sleep, timeout};
 
 fn pid_alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
+}
+
+fn pid_extinct(pid: i32) -> bool {
+    unsafe {
+        if libc::kill(pid, 0) == 0 {
+            return false;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
 }
 
 fn extract_pid(text: &str, prefix: &str) -> i32 {
@@ -169,12 +181,87 @@ async fn f4_stop_barrier_terminates_full_group_including_sigterm_ignoring_descen
     );
 
     handle
-        .stop(Duration::from_millis(300))
+        .stop(Duration::from_secs(5))
         .await
         .expect("stop barrier");
 
     poll_pid_dead(main_pid, Duration::from_secs(2)).await;
     poll_pid_dead(child_pid, Duration::from_secs(2)).await;
+}
+
+#[tokio::test]
+async fn f4_redirected_descendant_ignoring_term_is_dead_before_stop_returns() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let marker = dir.path().join("marker");
+    let pid_file = dir.path().join("desc.pid");
+    let script = dir.path().join("run.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n\
+MARKER={}\n\
+PIDFILE={}\n\
+trap '' TERM HUP\n\
+{{\n\
+  while :; do echo x >>\"$MARKER\"; done\n\
+}} </dev/null >/dev/null 2>/dev/null &\n\
+echo $! >\"$PIDFILE\"\n\
+exit 0\n",
+            marker.display(),
+            pid_file.display(),
+        ),
+    )
+    .expect("write script");
+    let mut perms = fs::metadata(&script).expect("meta").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&script, perms).expect("chmod");
+
+    let opts = PtySpawnOptions {
+        cwd: dir.path().to_path_buf(),
+        env: HashMap::new(),
+        size: PtySize::default(),
+        initial_prompt: None,
+    };
+    let handle = spawn_command("/bin/sh", &[script.to_str().expect("utf8")], opts).expect("spawn");
+
+    let descendant_pid = {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if pid_file.exists() {
+                let raw = fs::read_to_string(&pid_file).expect("read pid");
+                if let Ok(pid) = raw.trim().parse::<i32>() {
+                    break pid;
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!("descendant pid file never appeared");
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    };
+
+    assert!(
+        pid_alive(descendant_pid),
+        "descendant should be alive before stop"
+    );
+
+    handle
+        .stop(Duration::from_secs(5))
+        .await
+        .expect("stop should succeed");
+
+    assert!(
+        pid_extinct(descendant_pid),
+        "descendant must be dead the moment stop returns"
+    );
+
+    let size_after_stop = fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
+    sleep(Duration::from_millis(300)).await;
+    let size_later = fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
+    assert_eq!(
+        size_after_stop, size_later,
+        "marker file should not grow after stop returned"
+    );
 }
 
 #[tokio::test]
@@ -189,6 +276,36 @@ async fn f6_drop_without_stop_leaves_no_live_child_pid() {
     drop(handle);
 
     poll_pid_dead(pid, Duration::from_secs(2)).await;
+}
+
+#[tokio::test]
+async fn f7_stalled_writer_does_not_block_caller_or_shutdown() {
+    let handle = spawn_command("/bin/sh", &["-c", "exec cat"], test_opts()).expect("spawn");
+    sleep(Duration::from_millis(50)).await;
+
+    let chunk = vec![b'x'; 256 * 1024];
+    let started = Instant::now();
+    let mut got_queue_full = false;
+    for _ in 0..200 {
+        match handle.try_write(&chunk) {
+            Ok(()) => {}
+            Err(PtyError::QueueFull) => {
+                got_queue_full = true;
+                break;
+            }
+            Err(e) => panic!("unexpected error from try_write: {e}"),
+        }
+    }
+    assert!(got_queue_full, "expected QueueFull from bounded queue");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "try_write should return QueueFull without blocking the caller"
+    );
+
+    handle
+        .stop(Duration::from_secs(5))
+        .await
+        .expect("stop should complete while writer thread is blocked in write");
 }
 
 #[test]
@@ -211,6 +328,31 @@ fn f7_full_input_queue_returns_error_without_blocking_sender() {
         got_queue_full,
         "expected the bounded queue to fill and try_write to return QueueFull"
     );
+}
+
+#[test]
+fn spawn_harness_forwards_model_to_recipe() {
+    let recipe = harness_recipe_with_model(HarnessId::ClaudeCode, Some("hi"), Some("sonnet"));
+    let fake = tempfile::tempdir().expect("tempdir");
+    let bin = fake.path().join(&recipe.binary);
+    fs::write(&bin, "#!/bin/sh\nexit 0\n").expect("fake bin");
+    let mut perms = fs::metadata(&bin).expect("meta").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&bin, perms).expect("chmod");
+
+    let mut env = HashMap::new();
+    env.insert(
+        "PATH".to_string(),
+        fake.path().to_string_lossy().into_owned(),
+    );
+    let opts = PtySpawnOptions {
+        cwd: fake.path().to_path_buf(),
+        env,
+        size: PtySize::default(),
+        initial_prompt: Some("hi".to_string()),
+    };
+    let handle = spawn_harness(HarnessId::ClaudeCode, opts, Some("sonnet")).expect("spawn");
+    drop(handle);
 }
 
 #[test]

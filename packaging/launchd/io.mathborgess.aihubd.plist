@@ -2,9 +2,7 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
   Per-user LaunchAgent for aihubd.
-  Substitute before install:
-    __AIHUBD_BIN__  absolute path to aihubd (typically ~/.local/bin/aihubd)
-    __HOME__        absolute path to the user's home directory
+  install.sh renders string values with plutil (never sed).
 -->
 <plist version="1.0">
 <dict>
@@ -15,8 +13,14 @@
   <array>
     <string>__AIHUBD_BIN__</string>
     <string>--socket</string>
-    <string>__HOME__/.local/share/aihub/aihub.sock</string>
+    <string>__AIHUB_SOCKET__</string>
   </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__LAUNCHD_PATH__</string>
+  </dict>
 
   <key>RunAtLoad</key>
   <true/>
@@ -27,8 +31,8 @@
   <string>Interactive</string>
 
   <key>StandardOutPath</key>
-  <string>__HOME__/Library/Logs/aihub/aihubd.stdout.log</string>
+  <string>__AIHUBD_STDOUT__</string>
   <key>StandardErrorPath</key>
-  <string>__HOME__/Library/Logs/aihub/aihubd.stderr.log</string>
+  <string>__AIHUBD_STDERR__</string>
 </dict>
 </plist>

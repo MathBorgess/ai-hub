@@ -180,6 +180,7 @@ fn test_render_recommendation_banner_and_prefix_hint() {
         tier: TaskTier::Mechanical,
         harness: HarnessId::Antigravity,
         lane: Some("gemini".to_string()),
+        model: None,
         holds_until_s: None,
         confidence: 0.92,
         reason: "Refactor mecánico rápido".to_string(),
@@ -210,6 +211,36 @@ fn test_render_recommendation_banner_and_prefix_hint() {
 
     let text2 = buffer_to_text(terminal.backend().buffer());
     assert!(text2.contains("PREFIXO ATIVO (^])"));
+}
+
+#[test]
+fn test_render_recommendation_banner_held_until() {
+    let backend = TestBackend::new(140, 5);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    let mut app = App::new(PathBuf::from("/test/repo"));
+    app.mode = Mode::Assisted;
+    app.now_override = Some(50000);
+    app.recommendation = Some(RecommendationState::Recommended {
+        tier: TaskTier::Mechanical,
+        harness: HarnessId::Antigravity,
+        lane: Some("gemini".to_string()),
+        model: None,
+        holds_until_s: Some(50400),
+        confidence: 0.92,
+        reason: "Refactor mecánico rápido".to_string(),
+    });
+
+    terminal
+        .draw(|f| {
+            ui::footer::render_footer(&app, Rect::new(0, 0, 140, 3), f.buffer_mut());
+        })
+        .unwrap();
+
+    let text = buffer_to_text(terminal.backend().buffer());
+    assert!(text.contains("RECOMENDAÇÃO"));
+    assert!(text.contains("Trocar para agy"));
+    assert!(text.contains("held until 14:00"));
 }
 
 #[test]

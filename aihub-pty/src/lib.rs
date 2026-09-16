@@ -22,6 +22,15 @@ pub enum PtyError {
 
     #[error("Input queue is full")]
     QueueFull,
+
+    #[error("Stop barrier timed out before the process group was confirmed dead")]
+    StopTimeout,
+
+    #[error("Stop barrier signal failed: {0}")]
+    StopSignal(String),
+
+    #[error("Stop barrier failed to reap child: {0}")]
+    StopReap(String),
 }
 
 /// Terminal window dimensions.
@@ -61,8 +70,12 @@ pub fn spawn_command(
 }
 
 /// Spawns an agent harness using its standard launch recipe inside a new PTY.
-pub fn spawn_harness(harness: HarnessId, opts: PtySpawnOptions) -> Result<PtyHandle, PtyError> {
-    let recipe = harness::harness_recipe(harness, opts.initial_prompt.as_deref());
+pub fn spawn_harness(
+    harness: HarnessId,
+    opts: PtySpawnOptions,
+    model: Option<&str>,
+) -> Result<PtyHandle, PtyError> {
+    let recipe = harness::harness_recipe_with_model(harness, opts.initial_prompt.as_deref(), model);
     let spawn_opts = spawn::merge_spawn_opts(opts.cwd, opts.size, recipe.env, opts.env, None);
     let arg_refs: Vec<&str> = recipe.args.iter().map(String::as_str).collect();
     spawn_command(&recipe.binary, &arg_refs, spawn_opts)

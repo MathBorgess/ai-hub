@@ -85,7 +85,7 @@ async fn cached_quota_broadcast_attach_and_disconnect() {
                 }]
             }
         },
-        move |_, _| {
+        move |_, _, _| {
             let dead1 = dead.clone();
             let dead2 = dead.clone();
             Ok(Pty {
@@ -275,7 +275,7 @@ async fn stale_socket_permissions_and_shutdown() {
     let path = socket();
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
-    let daemon = aihubd::Daemon::new(|| async { vec![] }, |_, _| panic!("no PTY requested"));
+    let daemon = aihubd::Daemon::new(|| async { vec![] }, |_, _, _| panic!("no PTY requested"));
     let (stop, stopped) = tokio::sync::oneshot::channel();
     let p = path.clone();
     let task = tokio::spawn(async move {
@@ -305,7 +305,7 @@ async fn stale_socket_permissions_and_shutdown() {
     );
     let other = aihubd::Daemon::new(
         || async { panic!("must refuse before probe") },
-        |_, _| panic!("no PTY requested"),
+        |_, _, _| panic!("no PTY requested"),
     );
     assert!(other
         .run(path.clone(), std::future::pending())
@@ -326,7 +326,7 @@ async fn signal_worker() {
     let Some(path) = std::env::var_os("AIHUBD_TEST_SOCKET") else {
         return;
     };
-    aihubd::Daemon::new(|| async { vec![] }, |_, _| panic!("no PTY requested"))
+    aihubd::Daemon::new(|| async { vec![] }, |_, _, _| panic!("no PTY requested"))
         .run(path.into(), aihubd::shutdown_signal())
         .await
         .unwrap();

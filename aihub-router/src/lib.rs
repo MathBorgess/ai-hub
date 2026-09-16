@@ -1,6 +1,5 @@
 use std::future::Future;
-use std::process::Command;
-use std::sync::{Mutex, OnceLock};
+use std::path::Path;
 use std::time::Duration;
 
 use aihub_core::{HarnessId, LaneKind, QuotaSnapshot, RouteOutcome, TaskSize, TaskTier};
@@ -204,6 +203,7 @@ pub fn route_outcome(
     size: TaskSize,
     snapshots: &[QuotaSnapshot],
     horizon_s: u64,
+    catalog: &ModelCatalog,
 ) -> Result<RouteOutcome, RouterError> {
     let Some((snapshot, lane, hold)) =
         select_route_candidate(tier, size, snapshots, horizon_s, true)?
@@ -218,7 +218,7 @@ pub fn route_outcome(
     Ok(RouteOutcome::Recommendation {
         harness: snapshot.slot.harness,
         lane: lane.map(|l| l.name.clone()),
-        model: model_for_lane(snapshot.slot.harness, lane.map(|l| l.name.as_str())),
+        model: catalog.model_for_lane(snapshot.slot.harness, lane.map(|l| l.name.as_str())),
         holds_until_s: hold,
     })
 }
@@ -229,8 +229,9 @@ pub fn route_typed(
     size: TaskSize,
     snapshots: &[QuotaSnapshot],
     horizon_s: u64,
+    catalog: &ModelCatalog,
 ) -> Result<RouteOutcome, RouterError> {
-    route_outcome(tier, size, snapshots, horizon_s)
+    route_outcome(tier, size, snapshots, horizon_s, catalog)
 }
 
 /// Async classification entry that invokes LLM fallback for ambiguous or long tasks (F9).
@@ -299,49 +300,116 @@ pub fn lane_to_model_id_from_list(
     pick_model_for_lane(harness, lane, &models)
 }
 
-/// Resolves the recommended CLI model identifier for a given harness and lane (plan §3.3).
-pub fn lane_to_model_id(harness: HarnessId, lane: &str) -> Option<String> {
-    let models = cached_cli_models(harness)?;
-    pick_model_for_lane(harness, lane, &models)
+/// Immutable model snapshot. Refresh a clone outside the daemon lock, then publish
+/// the returned snapshot; on failure retain the previous snapshot.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelCatalog {
+    cursor: Vec<String>,
+    antigravity: Vec<String>,
 }
 
-/// Helper mapping an optional lane name to a model identifier for a harness.
-pub fn model_for_lane(harness: HarnessId, lane: Option<&str>) -> Option<String> {
-    lane.and_then(|name| lane_to_model_id(harness, name))
+#[derive(Debug, Error)]
+pub enum CatalogError {
+    #[error("model-list command timed out")]
+    Timeout,
+    #[error("model-list stdout reached the 256 KiB limit")]
+    OutputLimit,
+    #[error("model-list process I/O failed: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("model-list command failed")]
+    Failed,
+    #[error("model-list output contains no valid models")]
+    InvalidOutput,
+    #[error("harness does not support model discovery")]
+    UnsupportedHarness,
 }
 
-fn cached_cli_models(harness: HarnessId) -> Option<Vec<String>> {
-    static CURSOR: OnceLock<Mutex<Option<Vec<String>>>> = OnceLock::new();
-    static AGY: OnceLock<Mutex<Option<Vec<String>>>> = OnceLock::new();
-    let slot = match harness {
-        HarnessId::CursorAgent => CURSOR.get_or_init(|| Mutex::new(None)),
-        HarnessId::Antigravity => AGY.get_or_init(|| Mutex::new(None)),
+impl ModelCatalog {
+    /// Run one harness discovery asynchronously with a 10-second deadline.
+    /// Stdout is strictly capped at 256 KiB (a full buffer is rejected).
+    /// Errors leave self untouched. The child is killed and reaped on failure;
+    /// cancellation also kills the child through kill_on_drop.
+    pub async fn refresh(
+        &self,
+        harness: HarnessId,
+        executable: &Path,
+    ) -> Result<Self, CatalogError> {
+        use std::process::Stdio;
+        use tokio::io::AsyncReadExt;
+        let args = match harness {
+            HarnessId::CursorAgent => "--list-models",
+            HarnessId::Antigravity => "models",
+            _ => return Err(CatalogError::UnsupportedHarness),
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut child = tokio::process::Command::new(executable)
+            .arg(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()?;
+        let operation = async {
+            let stdout = child.stdout.take().ok_or(CatalogError::InvalidOutput)?;
+            let mut bytes = Vec::new();
+            stdout.take(256 * 1024).read_to_end(&mut bytes).await?;
+            if bytes.len() == 256 * 1024 {
+                return Err(CatalogError::OutputLimit);
+            }
+            if !child.wait().await?.success() {
+                return Err(CatalogError::Failed);
+            }
+            let output = std::str::from_utf8(&bytes).map_err(|_| CatalogError::InvalidOutput)?;
+            let models = parse_cli_model_list(output);
+            if models.is_empty() {
+                return Err(CatalogError::InvalidOutput);
+            }
+            Ok(models)
+        };
+        let result = match tokio::time::timeout_at(deadline, operation).await {
+            Ok(result) => result,
+            Err(_) => Err(CatalogError::Timeout),
+        };
+        match result {
+            Ok(models) => {
+                let mut next = self.clone();
+                match harness {
+                    HarnessId::CursorAgent => next.cursor = models,
+                    HarnessId::Antigravity => next.antigravity = models,
+                    _ => return Err(CatalogError::UnsupportedHarness),
+                }
+                Ok(next)
+            }
+            Err(error) => {
+                // kill() also waits: no live child or zombie remains at return.
+                child.kill().await?;
+                Err(error)
+            }
+        }
+    }
+
+    pub fn model_for_lane(&self, harness: HarnessId, lane: Option<&str>) -> Option<String> {
+        model_for_lane(harness, lane, self)
+    }
+}
+
+/// Resolve a lane using only the supplied snapshot, without I/O.
+pub fn lane_to_model_id(harness: HarnessId, lane: &str, catalog: &ModelCatalog) -> Option<String> {
+    let models = match harness {
+        HarnessId::CursorAgent => &catalog.cursor,
+        HarnessId::Antigravity => &catalog.antigravity,
         _ => return None,
     };
-    let mut guard = slot.lock().ok()?;
-    if guard.is_none() {
-        *guard = Some(fetch_cli_models(harness).unwrap_or_default());
-    }
-    guard.as_ref().filter(|v| !v.is_empty()).cloned()
+    pick_model_for_lane(harness, lane, models)
 }
 
-fn fetch_cli_models(harness: HarnessId) -> Option<Vec<String>> {
-    let (bin, args): (&str, &[&str]) = match harness {
-        HarnessId::CursorAgent => ("cursor-agent", &["--list-models"]),
-        HarnessId::Antigravity => ("agy", &["models"]),
-        _ => return None,
-    };
-    let output = Command::new(bin)
-        .args(args)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())?;
-    let list = parse_cli_model_list(&String::from_utf8_lossy(&output.stdout));
-    if list.is_empty() {
-        None
-    } else {
-        Some(list)
-    }
+/// Resolve an optional lane using only the supplied snapshot.
+pub fn model_for_lane(
+    harness: HarnessId,
+    lane: Option<&str>,
+    catalog: &ModelCatalog,
+) -> Option<String> {
+    lane.and_then(|name| lane_to_model_id(harness, name, catalog))
 }
 
 fn lane_kind_for_name(lane: &str) -> Option<LaneKind> {

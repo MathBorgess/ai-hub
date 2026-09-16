@@ -1,18 +1,11 @@
 use aihub_core::{LaneKind, WindowKind};
 use aihub_probe::antigravity::{
-    discover_ls_bases, parse_csrf_token, parse_lsof_ports, parse_quota_summary,
+    discover_ls_bases_from, parse_csrf_token, parse_lsof_ports, parse_quota_summary,
 };
 use aihub_probe::cursor::{
     extract_cursor_jwt, parse_dashboard_usage, parse_summary_usage, read_cursor_ide_token_from_path,
 };
 use rusqlite::Connection;
-use std::sync::{Mutex, OnceLock};
-
-static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-fn env_lock() -> &'static Mutex<()> {
-    ENV_LOCK.get_or_init(|| Mutex::new(()))
-}
 
 fn fixture(path: &str) -> String {
     std::fs::read_to_string(path).expect("fixture")
@@ -151,22 +144,13 @@ fn antigravity_csrf_from_html() {
 
 #[test]
 fn antigravity_ls_address_override_prepended() {
-    let _guard = env_lock().lock().expect("lock");
-    unsafe { std::env::set_var("ANTIGRAVITY_LS_ADDRESS", "127.0.0.1:4242") };
     let lsof = fixture("tests/fixtures/antigravity/lsof_pcn.txt");
-    let ports = parse_lsof_ports(&lsof);
-    let mut bases: Vec<String> = vec!["http://127.0.0.1:4242".into()];
-    for port in ports {
-        let base = format!("http://127.0.0.1:{port}");
-        if !bases.contains(&base) {
-            bases.push(base);
-        }
-    }
-    let discovered = discover_ls_bases();
+    let discovered = discover_ls_bases_from(Some("127.0.0.1:4242"), &lsof);
     assert_eq!(
         discovered.first().map(String::as_str),
         Some("http://127.0.0.1:4242")
     );
-    assert!(discovered.len() >= bases.len());
-    unsafe { std::env::remove_var("ANTIGRAVITY_LS_ADDRESS") };
+    for port in parse_lsof_ports(&lsof) {
+        assert!(discovered.contains(&format!("http://127.0.0.1:{port}")));
+    }
 }

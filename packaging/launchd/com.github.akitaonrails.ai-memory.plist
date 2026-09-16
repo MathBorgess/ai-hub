@@ -2,9 +2,7 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
   Per-user LaunchAgent for ai-memory (transitional; bundled with aihub install).
-  Substitute before install:
-    __AI_MEMORY_BIN__  absolute path to ai-memory (typically ~/.local/bin/ai-memory)
-    __HOME__           absolute path to the user's home directory
+  install.sh renders string values with plutil (never sed).
 -->
 <plist version="1.0">
 <dict>
@@ -21,10 +19,16 @@
     <string>127.0.0.1:49374</string>
     <string>--enable-web</string>
     <string>--data-dir</string>
-    <string>__HOME__/.local/share/ai-memory</string>
+    <string>__AI_MEMORY_DATA_DIR__</string>
     <string>--config</string>
-    <string>__HOME__/.config/ai-memory/config.toml</string>
+    <string>__AI_MEMORY_CONFIG__</string>
   </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>AI_MEMORY_BIND</key>
+    <string>127.0.0.1:49374</string>
+  </dict>
 
   <key>RunAtLoad</key>
   <true/>
@@ -35,8 +39,8 @@
   <string>Interactive</string>
 
   <key>StandardOutPath</key>
-  <string>__HOME__/Library/Logs/aihub/ai-memory.stdout.log</string>
+  <string>__AI_MEMORY_STDOUT__</string>
   <key>StandardErrorPath</key>
-  <string>__HOME__/Library/Logs/aihub/ai-memory.stderr.log</string>
+  <string>__AI_MEMORY_STDERR__</string>
 </dict>
 </plist>

@@ -32,6 +32,7 @@ pub enum RecommendationState {
         tier: TaskTier,
         harness: HarnessId,
         lane: Option<String>,
+        model: Option<String>,
         holds_until_s: Option<u64>,
         confidence: f32,
         reason: String,
@@ -58,6 +59,9 @@ pub struct App {
     pub should_exit: bool,
     pub last_terminal_size: (u16, u16),
     pub active: bool,
+    pub task: Option<String>,
+    pub pending_autonomous: bool,
+    pub now_override: Option<u64>,
 }
 
 impl App {
@@ -79,7 +83,15 @@ impl App {
             should_exit: false,
             last_terminal_size: (80, 24),
             active: true,
+            task: None,
+            pending_autonomous: false,
+            now_override: None,
         }
+    }
+
+    /// Checks if a non-empty task description is currently stored.
+    pub fn has_task(&self) -> bool {
+        self.task.as_ref().is_some_and(|t| !t.trim().is_empty())
     }
 
     /// Set a transient status message to be shown in the footer.

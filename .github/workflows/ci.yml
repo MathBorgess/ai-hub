@@ -34,3 +34,9 @@ jobs:
             brew install shellcheck
             shellcheck scripts/*.sh
           fi
+
+      - name: test install script
+        run: bash scripts/test-install.sh
+
+      - name: e2e ai-memory
+        run: bash scripts/e2e-ai-memory.sh

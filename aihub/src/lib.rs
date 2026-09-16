@@ -184,6 +184,7 @@ pub async fn run(cli: Cli) -> Result<()> {
 
     // Submit initial task if provided via CLI argument (F9)
     if let Some(task_text) = &cli.task {
+        app.task = Some(task_text.clone());
         if let Some(session_id) = &app.session_id {
             let _ = send_msg(
                 &mut writer,
@@ -259,6 +260,11 @@ pub async fn run(cli: Cli) -> Result<()> {
                             }
                             AppAction::SendMessage(msg) => {
                                 let _ = send_msg(&mut writer, &msg).await;
+                            }
+                            AppAction::SendMessages(msgs) => {
+                                for msg in msgs {
+                                    let _ = send_msg(&mut writer, &msg).await;
+                                }
                             }
                             AppAction::SetUiMode(mode) => {
                                 app.ui_mode = mode;
@@ -343,6 +349,7 @@ async fn create_new_session(
     repo_path: &std::path::Path,
     initial_prompt: Option<String>,
 ) -> Result<()> {
+    app.task = initial_prompt.clone();
     send_msg(
         writer,
         &ClientMessage::NewSession {
@@ -452,6 +459,7 @@ pub fn handle_daemon_msg(app: &mut App, msg: DaemonMessage) {
                 aihub_core::RouteOutcome::Recommendation {
                     harness,
                     lane,
+                    model,
                     holds_until_s,
                     ..
                 } => {
@@ -459,6 +467,7 @@ pub fn handle_daemon_msg(app: &mut App, msg: DaemonMessage) {
                         tier: aihub_core::TaskTier::Design,
                         harness,
                         lane,
+                        model,
                         holds_until_s,
                         confidence: 1.0,
                         reason: String::new(),

@@ -86,6 +86,7 @@ dependencies = [
  "aihub-core",
  "libc",
  "portable-pty",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",
@@ -96,10 +97,12 @@ name = "aihub-router"
 version = "0.1.0"
 dependencies = [
  "aihub-core",
+ "libc",
  "regex",
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
 ]

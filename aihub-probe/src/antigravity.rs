@@ -207,31 +207,34 @@ pub fn parse_csrf_token(html: &str) -> Option<String> {
 }
 
 pub fn discover_ls_bases() -> Vec<String> {
-    let mut bases = Vec::new();
-    if let Ok(override_addr) = std::env::var("ANTIGRAVITY_LS_ADDRESS") {
-        let trimmed = override_addr.trim();
-        if !trimmed.is_empty() {
-            if let Some(base) = normalize_ls_override(trimmed) {
-                bases.push(base);
-            }
-        }
-    }
-
-    if which("lsof") {
-        let output = std::process::Command::new("lsof")
+    let override_addr = std::env::var("ANTIGRAVITY_LS_ADDRESS").ok();
+    let output = if which("lsof") {
+        std::process::Command::new("lsof")
             .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcn"])
             .output()
             .ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default();
-        for port in parse_lsof_ports(&output) {
-            let base = format!("http://127.0.0.1:{port}");
-            if !bases.contains(&base) {
-                bases.push(base);
-            }
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    discover_ls_bases_from(override_addr.as_deref(), &output)
+}
+
+/// Discover bases from explicit inputs; no environment access or subprocesses.
+pub fn discover_ls_bases_from(override_addr: Option<&str>, lsof_output: &str) -> Vec<String> {
+    let mut bases = Vec::new();
+    if let Some(override_addr) = override_addr {
+        if let Some(base) = normalize_ls_override(override_addr.trim()) {
+            bases.push(base);
         }
     }
-
+    for port in parse_lsof_ports(lsof_output) {
+        let base = format!("http://127.0.0.1:{port}");
+        if !bases.contains(&base) {
+            bases.push(base);
+        }
+    }
     bases
 }
 

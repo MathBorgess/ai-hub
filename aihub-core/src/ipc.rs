@@ -122,6 +122,10 @@ pub enum ClientMessage {
         session_id: SessionId,
         target: HarnessId,
         with_handoff: bool,
+        /// Explicit model id to pass to the incoming harness (blocker 5). Additive; absent on
+        /// older clients defaults to `None`, which launches without a `--model` flag.
+        #[serde(default)]
+        model: Option<String>,
     },
     /// Toggle or set session operating mode (Assisted or Autonomous).
     SetMode { session_id: SessionId, mode: Mode },

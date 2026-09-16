@@ -207,6 +207,8 @@ pub enum ClientMessage {
         session_id: SessionId,
         target: HarnessId,
         with_handoff: bool,
+        /// Recommended CLI model id when accepting a route recommendation; omitted on manual `/switch`.
+        model: Option<String>, // `#[serde(default)]` — absent on older clients
     },
     SetMode { session_id: SessionId, mode: Mode },
     MergeRequest { session_id: SessionId, strategy: MergeStrategy },
@@ -414,7 +416,11 @@ impl PtyHandle {
 }
 
 pub fn spawn_command(cmd: &str, args: &[&str], opts: PtySpawnOptions) -> Result<PtyHandle, PtyError>;
-pub fn spawn_harness(harness: HarnessId, opts: PtySpawnOptions) -> Result<PtyHandle, PtyError>;
+pub fn spawn_harness(
+    harness: HarnessId,
+    opts: PtySpawnOptions,
+    model: Option<&str>,
+) -> Result<PtyHandle, PtyError>;
 
 pub struct HarnessLaunchRecipe {
     pub binary: String,
@@ -577,6 +583,7 @@ These new public signatures are added additively for production readiness, each 
       size: TaskSize,
       snapshots: &[QuotaSnapshot],
       horizon_s: u64,
+      catalog: &ModelCatalog,
   ) -> Result<RouteOutcome, RouterError>;
 
   pub fn route_typed(
@@ -584,6 +591,7 @@ These new public signatures are added additively for production readiness, each 
       size: TaskSize,
       snapshots: &[QuotaSnapshot],
       horizon_s: u64,
+      catalog: &ModelCatalog,
   ) -> Result<RouteOutcome, RouterError>;
   ```
 - **Async classify-with-fallback (Finding F9):** Entry the daemon calls for long or ambiguous prompts.
@@ -592,8 +600,16 @@ These new public signatures are added additively for production readiness, each 
   ```
 - **Lane to model-id helper (Plan §3.3):** Maps harness and lane to recommended CLI model identifier for the launch recipe.
   ```rust
-  pub fn lane_to_model_id(harness: HarnessId, lane: &str) -> Option<String>;
-  pub fn model_for_lane(harness: HarnessId, lane: Option<&str>) -> Option<String>;
+  pub fn lane_to_model_id(harness: HarnessId, lane: &str, catalog: &ModelCatalog) -> Option<String>;
+  pub fn model_for_lane(harness: HarnessId, lane: Option<&str>, catalog: &ModelCatalog) -> Option<String>;
+
+  /// Immutable snapshot of CLI `--model` lists; refreshed off the daemon lock (N6).
+  pub struct ModelCatalog { /* … */ }
+  impl ModelCatalog {
+      pub fn refresh(&self, harness: HarnessId, executable: &Path) -> impl Future<Output = Result<Self, CatalogError>>;
+      pub fn model_for_lane(&self, harness: HarnessId, lane: Option<&str>) -> Option<String>;
+  }
+  pub enum CatalogError { /* Timeout, OutputLimit, Io, Failed, InvalidOutput, UnsupportedHarness */ }
   ```
 
 ### 3.3. `aihub-git` (Owned by Session 02)
@@ -690,4 +706,31 @@ These pre–production-round entry points were superseded in sessions 02–09 an
 | `aihub-memory` | `HandoffDestination::was_spooled_locally()` | `HandoffDestination::is_spooled()` |
 
 All callers in `aihubd` and its tests were updated in the same pass; no behavior changed.
+
+---
+
+## 6. Handoff run 20260915T225713Z (sessions 01–04 integrator notes)
+
+Additive changes landed in this production round; session 07 wired the TUI to the IPC field below.
+
+### 6.1 `aihub-pty` (session 01)
+
+- `spawn_harness(..., model: Option<&str>)` — optional `--model` via `harness_recipe_with_model`.
+- `PtyHandle::stop` / `stop_barrier` — process-group termination with timeout, kill escalation, and typed `PtyError` (`StopTimeout`, `StopSignal`, `StopReap`, `QueueFull` on non-blocking input).
+
+### 6.2 `aihub-memory` (session 02)
+
+- Handoff recording takes **repository identity** (`project: &str`) at every public entry point; callers must pass stable repo id, not ephemeral worktree/session dir names.
+- `SpooledRecord`, `MemoryError::SpoolFull` / `DeliveryFailed`, bounded MCP delivery (5s, 1 MiB cap), atomic spool rewrite with `File::lock`.
+- `drain_spooled_handoffs` / `drain_spooled_handoffs_to` — timer-driven retry without a new handoff.
+
+### 6.3 `aihub-router` / `aihub-probe` (session 03)
+
+- Routing and lane helpers require `&ModelCatalog`; refresh is async, bounded, and must not run under the daemon registry lock.
+- `discover_ls_bases_from(override_addr, lsof_output)` — pure antigravity LS discovery for tests (production wrapper may shell out to `lsof`).
+
+### 6.4 `aihub-core` / `aihubd` (session 04)
+
+- `ClientMessage::SwitchHarness.model: Option<String>` — threads recommendation model id to spawn; TUI sets it on Enter-to-accept after hold expiry.
+- `aihubd::spawn_pty(..., model: Option<String>)` and daemon seams `with_catalog_paths`, `with_drain`, extended `with_router` / `with_memory_recorder` closures (see session 04 result `api:` block).
 

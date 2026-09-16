@@ -24,7 +24,14 @@ fn f10_exhausted_supply_returns_no_capacity_not_a_placeholder_harness() {
         QuotaStatus::Ok,
         vec![window(100., Some(8000), Some(18000))],
     );
-    let outcome = route_outcome(TaskTier::Review, TaskSize::S, &[exhausted], 7200).unwrap();
+    let outcome = route_outcome(
+        TaskTier::Review,
+        TaskSize::S,
+        &[exhausted],
+        7200,
+        &aihub_router::ModelCatalog::default(),
+    )
+    .unwrap();
     match outcome {
         RouteOutcome::NoCapacity { reason } => {
             assert!(reason.contains("No available slots:"));
@@ -38,6 +45,13 @@ fn f10_exhausted_supply_returns_no_capacity_not_a_placeholder_harness() {
 fn f10_unknown_slots_are_never_candidates() {
     let mut unknown = slot(HarnessId::ClaudeCode, QuotaStatus::Unknown, vec![]);
     unknown.windows = vec![window(10., None, None)];
-    let outcome = route_outcome(TaskTier::Mechanical, TaskSize::M, &[unknown], 7200).unwrap();
+    let outcome = route_outcome(
+        TaskTier::Mechanical,
+        TaskSize::M,
+        &[unknown],
+        7200,
+        &aihub_router::ModelCatalog::default(),
+    )
+    .unwrap();
     assert!(matches!(outcome, RouteOutcome::NoCapacity { .. }));
 }

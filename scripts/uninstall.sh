@@ -4,19 +4,22 @@ set -euo pipefail
 
 DRY_RUN=0
 PURGE=0
+PURGE_AI_MEMORY=0
 
 LOCAL_BIN="${HOME}/.local/bin"
 LAUNCH_AGENTS="${HOME}/Library/LaunchAgents"
+INSTALL_AI_MEMORY_MARKER="${HOME}/.local/share/aihub/.installed-ai-memory-by-aihub"
 
 AI_MEMORY_LABEL="com.github.akitaonrails.ai-memory"
 AIHUBD_LABEL="io.mathborgess.aihubd"
 
 usage() {
   cat <<'EOF'
-Usage: uninstall.sh [--dry-run] [--purge]
+Usage: uninstall.sh [--dry-run] [--purge] [--purge-ai-memory]
 
-  --dry-run   Print planned actions without changing the system.
-  --purge     Remove ai-memory and aihub data directories and config.
+  --dry-run            Print planned actions without changing the system.
+  --purge              Remove aihub data under ~/.local/share/aihub.
+  --purge-ai-memory    Remove ai-memory data, config, and hooks paths (explicit opt-in).
 EOF
 }
 
@@ -28,6 +31,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --purge)
       PURGE=1
+      shift
+      ;;
+    --purge-ai-memory)
+      PURGE_AI_MEMORY=1
       shift
       ;;
     -h | --help)
@@ -77,16 +84,25 @@ unregister_launchd() {
 
 remove_binaries() {
   local bin
-  for bin in aihub aihubd ai-memory; do
+  for bin in aihub aihubd; do
     if [[ -e "${LOCAL_BIN}/${bin}" ]]; then
       run rm -f "${LOCAL_BIN}/${bin}"
     fi
   done
+
+  if [[ -f "${INSTALL_AI_MEMORY_MARKER}" ]]; then
+    if [[ -e "${LOCAL_BIN}/ai-memory" ]]; then
+      run rm -f "${LOCAL_BIN}/ai-memory"
+    fi
+    run rm -f "${INSTALL_AI_MEMORY_MARKER}"
+  else
+    log "keeping pre-existing ai-memory binary (no install marker)"
+  fi
 }
 
 # --- ai-memory (transitional): delete this block when aihub-native memory ships ---
 purge_ai_memory_data() {
-  if [[ "${PURGE}" -ne 1 ]]; then
+  if [[ "${PURGE_AI_MEMORY}" -ne 1 ]]; then
     return 0
   fi
   run rm -rf "${HOME}/.local/share/ai-memory"
@@ -106,8 +122,8 @@ purge_aihub_data() {
 main() {
   unregister_launchd
   remove_binaries
-  purge_ai_memory_data
   purge_aihub_data
+  purge_ai_memory_data
   log "done"
 }
 

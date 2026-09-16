@@ -10,6 +10,7 @@ pub enum AppAction {
     None,
     SendPtyInput(Vec<u8>),
     SendMessage(ClientMessage),
+    SendMessages(Vec<ClientMessage>),
     SetUiMode(UiMode),
     Exit,
 }
@@ -113,17 +114,37 @@ pub fn key_event_to_bytes(key: KeyEvent) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// Formats epoch seconds into HH:MM UTC.
+pub fn format_hold_time(epoch_s: u64) -> String {
+    let total_mins = epoch_s / 60;
+    let min = total_mins % 60;
+    let total_hours = total_mins / 60;
+    let hour = total_hours % 24;
+    format!("{:02}:{:02}", hour, min)
+}
+
 /// Main key routing function for the application.
 pub fn handle_key(app: &mut App, key: KeyEvent) -> AppAction {
+    let now = app.now_override.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    });
+    handle_key_at(app, key, now)
+}
+
+/// Main key routing function with an explicit clock parameter in seconds.
+pub fn handle_key_at(app: &mut App, key: KeyEvent, now_s: u64) -> AppAction {
     match &mut app.ui_mode {
-        UiMode::Normal => handle_normal_key(app, key),
+        UiMode::Normal => handle_normal_key_at(app, key, now_s),
         UiMode::Palette { .. } => handle_palette_key(app, key),
         UiMode::QuotaTable { .. } => handle_quota_table_key(app, key),
         UiMode::MergeReview { .. } => handle_merge_review_key(app, key),
     }
 }
 
-fn handle_normal_key(app: &mut App, key: KeyEvent) -> AppAction {
+fn handle_normal_key_at(app: &mut App, key: KeyEvent, now_s: u64) -> AppAction {
     let is_ctrl_bracket = (key.code == KeyCode::Char(']')
         && key.modifiers.contains(KeyModifiers::CONTROL))
         || (key.code == KeyCode::Char('\x1d'));
@@ -154,12 +175,25 @@ fn handle_normal_key(app: &mut App, key: KeyEvent) -> AppAction {
             KeyCode::Enter => {
                 // Accept assisted-mode recommendation
                 match &app.recommendation {
-                    Some(RecommendationState::Recommended { harness, .. }) => {
+                    Some(RecommendationState::Recommended {
+                        harness,
+                        model,
+                        holds_until_s,
+                        ..
+                    }) => {
+                        if let Some(hold_s) = *holds_until_s {
+                            if hold_s > now_s {
+                                let time_str = format_hold_time(hold_s);
+                                app.set_status(format!("held until {}", time_str));
+                                return AppAction::None;
+                            }
+                        }
                         if let Some(session_id) = &app.session_id {
                             return AppAction::SendMessage(ClientMessage::SwitchHarness {
                                 session_id: session_id.clone(),
                                 target: *harness,
                                 with_handoff: true,
+                                model: model.clone(),
                             });
                         }
                     }
@@ -180,6 +214,7 @@ fn handle_normal_key(app: &mut App, key: KeyEvent) -> AppAction {
                             session_id: session_id.clone(),
                             target: next,
                             with_handoff: true,
+                            model: None,
                         })
                     } else {
                         app.set_status(format!(
@@ -193,7 +228,17 @@ fn handle_normal_key(app: &mut App, key: KeyEvent) -> AppAction {
                 }
             }
             KeyCode::Char('m') => {
-                // Toggle mode
+                // Toggle mode: Autonomous requires a task context (Finding F9)
+                if app.mode == Mode::Assisted && !app.has_task() {
+                    app.pending_autonomous = true;
+                    app.ui_mode = UiMode::Palette {
+                        input: "/task ".to_string(),
+                        selected_index: 0,
+                    };
+                    app.set_status("O modo Autônomo requer uma tarefa (Autonomous needs a task)");
+                    return AppAction::None;
+                }
+
                 let next_mode = match app.mode {
                     Mode::Assisted => Mode::Autonomous,
                     Mode::Autonomous => Mode::Assisted,
@@ -245,6 +290,7 @@ fn handle_palette_key(app: &mut App, key: KeyEvent) -> AppAction {
 
     match key.code {
         KeyCode::Esc => {
+            app.pending_autonomous = false;
             app.ui_mode = UiMode::Normal;
             AppAction::None
         }
@@ -254,6 +300,7 @@ fn handle_palette_key(app: &mut App, key: KeyEvent) -> AppAction {
                 input.pop();
                 if input.is_empty() {
                     // Leaving palette if backspaced empty
+                    app.pending_autonomous = false;
                     app.ui_mode = UiMode::Normal;
                 }
             }
@@ -299,6 +346,7 @@ fn autocomplete_palette(app: &mut App) {
 }
 
 /// Executes command from palette input:
+/// - `/task <descrição>`
 /// - `/switch <harness>`
 /// - `/merge`
 /// - `/quota`
@@ -329,17 +377,30 @@ pub fn execute_palette_command(app: &mut App, raw_cmd: &str) -> AppAction {
                 app.set_status("Uso: /task <texto da tarefa>");
                 AppAction::None
             } else if let Some(session_id) = app.session_id.clone() {
+                app.task = Some(task_text.clone());
                 app.set_status(format!("Tarefa enviada: {}", task_text));
-                AppAction::SendMessage(ClientMessage::SubmitTask {
-                    session_id,
+                let submit_msg = ClientMessage::SubmitTask {
+                    session_id: session_id.clone(),
                     task: task_text,
-                })
+                };
+                if app.pending_autonomous {
+                    app.pending_autonomous = false;
+                    app.mode = Mode::Autonomous;
+                    let mode_msg = ClientMessage::SetMode {
+                        session_id,
+                        mode: Mode::Autonomous,
+                    };
+                    AppAction::SendMessages(vec![submit_msg, mode_msg])
+                } else {
+                    AppAction::SendMessage(submit_msg)
+                }
             } else {
                 app.set_status("Nenhuma sessão ativa para submeter tarefa");
                 AppAction::None
             }
         }
         "switch" => {
+            app.pending_autonomous = false;
             let target_str = parts.next().unwrap_or("");
             let harness = match target_str {
                 "claude" | "claude-code" => Some(HarnessId::ClaudeCode),
@@ -356,6 +417,7 @@ pub fn execute_palette_command(app: &mut App, raw_cmd: &str) -> AppAction {
                         session_id: session_id.clone(),
                         target,
                         with_handoff: true,
+                        model: None,
                     })
                 } else {
                     app.set_status("Nenhuma sessão ativa para alternar harness");
@@ -370,6 +432,7 @@ pub fn execute_palette_command(app: &mut App, raw_cmd: &str) -> AppAction {
             }
         }
         "merge" => {
+            app.pending_autonomous = false;
             app.ui_mode = UiMode::Normal;
             if let Some(session_id) = &app.session_id {
                 // Sends initial MergeRequest to retrieve review diff from daemon
@@ -383,11 +446,21 @@ pub fn execute_palette_command(app: &mut App, raw_cmd: &str) -> AppAction {
             }
         }
         "quota" => {
+            app.pending_autonomous = false;
             app.ui_mode = UiMode::QuotaTable { scroll: 0 };
             AppAction::None
         }
         "mode" => {
             app.ui_mode = UiMode::Normal;
+            if app.mode == Mode::Assisted && !app.has_task() {
+                app.pending_autonomous = true;
+                app.ui_mode = UiMode::Palette {
+                    input: "/task ".to_string(),
+                    selected_index: 0,
+                };
+                app.set_status("O modo Autônomo requer uma tarefa (Autonomous needs a task)");
+                return AppAction::None;
+            }
             let next_mode = match app.mode {
                 Mode::Assisted => Mode::Autonomous,
                 Mode::Autonomous => Mode::Assisted,
@@ -402,6 +475,7 @@ pub fn execute_palette_command(app: &mut App, raw_cmd: &str) -> AppAction {
             }
         }
         "detach" => {
+            app.pending_autonomous = false;
             app.ui_mode = UiMode::Normal;
             if let Some(session_id) = &app.session_id {
                 AppAction::SendMessage(ClientMessage::Detach {
@@ -412,11 +486,31 @@ pub fn execute_palette_command(app: &mut App, raw_cmd: &str) -> AppAction {
             }
         }
         "" => {
+            app.pending_autonomous = false;
             app.ui_mode = UiMode::Normal;
             AppAction::None
         }
         _ => {
             app.ui_mode = UiMode::Normal;
+            if app.pending_autonomous && !cmd.is_empty() {
+                app.pending_autonomous = false;
+                let task_text = cmd.to_string();
+                if let Some(session_id) = app.session_id.clone() {
+                    app.task = Some(task_text.clone());
+                    app.mode = Mode::Autonomous;
+                    app.set_status(format!("Tarefa enviada: {}", task_text));
+                    let submit_msg = ClientMessage::SubmitTask {
+                        session_id: session_id.clone(),
+                        task: task_text,
+                    };
+                    let mode_msg = ClientMessage::SetMode {
+                        session_id,
+                        mode: Mode::Autonomous,
+                    };
+                    return AppAction::SendMessages(vec![submit_msg, mode_msg]);
+                }
+            }
+            app.pending_autonomous = false;
             app.set_status(format!("Comando desconhecido: /{}", verb));
             AppAction::None
         }

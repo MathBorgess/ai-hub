@@ -32,33 +32,58 @@ pub fn render_footer(app: &App, area: Rect, buf: &mut Buffer) {
                         harness,
                         reason,
                         confidence,
+                        holds_until_s,
                         ..
-                    } => Line::from(vec![
-                        Span::styled(
-                            "💡 [RECOMENDAÇÃO] ",
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw("Trocar para "),
-                        Span::styled(
-                            harness.binary_name(),
-                            Style::default()
-                                .fg(Color::Cyan)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw(format!(
-                            " ({}) [confiança: {:.0}%] — ",
-                            reason,
-                            confidence * 100.0
-                        )),
-                        Span::styled(
-                            "Pressione ^] seguido de Enter para aceitar",
-                            Style::default()
-                                .fg(Color::Green)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                    ]),
+                    } => {
+                        let is_held = holds_until_s.is_some_and(|h| {
+                            let now = app.now_override.unwrap_or_else(|| {
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0)
+                            });
+                            h > now
+                        });
+                        let (prompt_text, prompt_style) = if is_held {
+                            (
+                                format!(
+                                    "held until {}",
+                                    crate::keys::format_hold_time(holds_until_s.unwrap())
+                                ),
+                                Style::default()
+                                    .fg(Color::Yellow)
+                                    .add_modifier(Modifier::BOLD),
+                            )
+                        } else {
+                            (
+                                "Pressione ^] seguido de Enter para aceitar".to_string(),
+                                Style::default()
+                                    .fg(Color::Green)
+                                    .add_modifier(Modifier::BOLD),
+                            )
+                        };
+                        Line::from(vec![
+                            Span::styled(
+                                "💡 [RECOMENDAÇÃO] ",
+                                Style::default()
+                                    .fg(Color::Yellow)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::raw("Trocar para "),
+                            Span::styled(
+                                harness.binary_name(),
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::raw(format!(
+                                " ({}) [confiança: {:.0}%] — ",
+                                reason,
+                                confidence * 100.0
+                            )),
+                            Span::styled(prompt_text, prompt_style),
+                        ])
+                    }
                     RecommendationState::NoCapacity { reason } => Line::from(vec![
                         Span::styled(
                             "ℹ️ [SEM CAPACIDADE] ",

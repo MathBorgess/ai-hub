@@ -10,10 +10,11 @@ use aihub_core::{HarnessId, SessionId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub use ai_memory::record_handoff_to;
+pub use ai_memory::{drain_spool, drain_spool_with_hook, record_handoff_to, SpooledRecord};
 pub use brief::{next_session_index, write_brief_pair};
 pub use record::{
-    handoffs_log_path, record_handoff, record_handoff_delivered, record_handoff_destination,
+    drain_spooled_handoffs, drain_spooled_handoffs_to, handoffs_log_path, record_handoff,
+    record_handoff_delivered, record_handoff_destination,
 };
 
 /// Reports whether the recorded handoff reached the live backend or was spooled locally (§3.5).
@@ -49,6 +50,12 @@ pub enum MemoryError {
 
     #[error("Memory serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+
+    #[error("Spool storage limit reached: {0}")]
+    SpoolFull(String),
+
+    #[error("Handoff delivery failed: {0}")]
+    DeliveryFailed(String),
 }
 
 /// Extracted context and decisions from the outgoing harness's final turn.
@@ -113,7 +120,14 @@ mod integration {
 
     #[tokio::test]
     async fn extract_uses_fixture_roots_via_internal_modules() {
-        let dir = std::env::temp_dir().join("aihub-memory-integration");
+        let dir = std::env::temp_dir().join(format!(
+            "aihub-memory-integration-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("t.jsonl");
@@ -137,7 +151,14 @@ mod integration {
 
     #[tokio::test]
     async fn extract_antigravity_turn_from_fixture() {
-        let dir = std::env::temp_dir().join("aihub-memory-agy-integration");
+        let dir = std::env::temp_dir().join(format!(
+            "aihub-memory-agy-integration-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let _ = fs::remove_dir_all(&dir);
         let logs = dir.join("sess-test").join(".system_generated").join("logs");
         fs::create_dir_all(&logs).unwrap();

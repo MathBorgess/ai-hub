@@ -397,7 +397,7 @@ impl RealSystem {
         std::fs::write(&script, r#"#!/bin/sh
 mkdir -p .scratch
 file=.scratch/writes-$$
-trap 'i=0; while [ "$i" -lt 5 ]; do echo stopping >> "$file"; i=$((i+1)); sleep 0.04; done; exit 0' TERM
+trap 'i=0; while [ "$i" -lt 5 ]; do echo stopping >> "$file"; i=$((i+1)); sleep 0.04; done; exit 0' TERM HUP
 while :; do echo running >> "$file"; sleep 0.02; done
 "#).unwrap();
         let launches = Arc::new(AtomicUsize::new(0));
@@ -422,7 +422,7 @@ while :; do echo running >> "$file"; sleep 0.02; done
                     })
                     .collect()
             },
-            move |_, mut opts| {
+            move |_, mut opts, _model| {
                 // The actual PTY adapter; no fake lifecycle methods.
                 opts.env
                     .insert("HOME".into(), opts.cwd.display().to_string());
@@ -619,6 +619,7 @@ async fn f5_real_switch_waits_for_sigterm_writes() {
             session_id: id,
             target: HarnessId::ClaudeCode,
             with_handoff: false,
+            model: None,
         },
     )
     .await;
@@ -772,6 +773,7 @@ async fn f13_real_clients_receive_only_attached_session_events() {
             session_id: id_b,
             target: HarnessId::ClaudeCode,
             with_handoff: false,
+            model: None,
         },
     )
     .await;
