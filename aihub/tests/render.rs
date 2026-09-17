@@ -1,15 +1,15 @@
 //! Rendering tests using ratatui's TestBackend.
 
-use std::path::PathBuf;
 use aihub_core::{
-    HarnessId, LaneKind, MergeStrategy, Mode, QuotaLane, QuotaSnapshot, QuotaStatus,
-    QuotaWindow, SlotId, TaskTier, WindowKind,
+    HarnessId, LaneKind, MergeStrategy, Mode, QuotaLane, QuotaSnapshot, QuotaStatus, QuotaWindow,
+    SlotId, TaskTier, WindowKind,
 };
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier};
 use ratatui::Terminal;
+use std::path::PathBuf;
 
 use aihub::colors::{quota_color, QUOTA_CRIT_PCT, QUOTA_WARN_PCT};
 use aihub::state::{App, RecommendationState};
@@ -53,8 +53,14 @@ fn test_render_header_assisted_and_autonomous() {
         .unwrap();
 
     let text = buffer_to_text(terminal.backend().buffer());
-    assert!(text.contains("[ASSISTIDO]"), "Header should contain [ASSISTIDO]");
-    assert!(text.contains("[agy]"), "Header should contain harness [agy]");
+    assert!(
+        text.contains("[ASSISTIDO]"),
+        "Header should contain [ASSISTIDO]"
+    );
+    assert!(
+        text.contains("[agy]"),
+        "Header should contain harness [agy]"
+    );
     assert!(
         text.contains("(session/test-worktree)"),
         "Header should contain branch name"
@@ -70,7 +76,10 @@ fn test_render_header_assisted_and_autonomous() {
         .unwrap();
 
     let text = buffer_to_text(terminal.backend().buffer());
-    assert!(text.contains("[AUTÔNOMO]"), "Header should contain [AUTÔNOMO]");
+    assert!(
+        text.contains("[AUTÔNOMO]"),
+        "Header should contain [AUTÔNOMO]"
+    );
     assert!(text.contains("[claude]"), "Header should contain [claude]");
 }
 
@@ -128,6 +137,14 @@ fn test_render_header_quota_bars_multi_window_and_lanes() {
     assert!(text.contains("cursor-agent:"));
     assert!(text.contains("cursor-models:20%"));
     assert!(text.contains("other-models:95%"));
+    assert!(
+        text.contains('█'),
+        "Header should contain filled gauge blocks"
+    );
+    assert!(
+        text.contains('░'),
+        "Header should contain empty gauge blocks"
+    );
 
     // Check specific cell colors
     let buf = terminal.backend().buffer();
@@ -159,13 +176,15 @@ fn test_render_recommendation_banner_and_prefix_hint() {
 
     let mut app = App::new(PathBuf::from("/test/repo"));
     app.mode = Mode::Assisted;
-    app.recommendation = Some(RecommendationState {
+    app.recommendation = Some(RecommendationState::Recommended {
         tier: TaskTier::Mechanical,
         harness: HarnessId::Antigravity,
         lane: Some("gemini".to_string()),
+        model: None,
         holds_until_s: None,
         confidence: 0.92,
         reason: "Refactor mecánico rápido".to_string(),
+        recommendation_id: 0,
     });
 
     terminal
@@ -196,6 +215,37 @@ fn test_render_recommendation_banner_and_prefix_hint() {
 }
 
 #[test]
+fn test_render_recommendation_banner_held_until() {
+    let backend = TestBackend::new(140, 5);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    let mut app = App::new(PathBuf::from("/test/repo"));
+    app.mode = Mode::Assisted;
+    app.now_override = Some(50000);
+    app.recommendation = Some(RecommendationState::Recommended {
+        tier: TaskTier::Mechanical,
+        harness: HarnessId::Antigravity,
+        lane: Some("gemini".to_string()),
+        model: None,
+        holds_until_s: Some(50400),
+        confidence: 0.92,
+        reason: "Refactor mecánico rápido".to_string(),
+        recommendation_id: 0,
+    });
+
+    terminal
+        .draw(|f| {
+            ui::footer::render_footer(&app, Rect::new(0, 0, 140, 3), f.buffer_mut());
+        })
+        .unwrap();
+
+    let text = buffer_to_text(terminal.backend().buffer());
+    assert!(text.contains("RECOMENDAÇÃO"));
+    assert!(text.contains("Trocar para agy"));
+    assert!(text.contains("held until 14:00"));
+}
+
+#[test]
 fn test_render_palette() {
     let backend = TestBackend::new(90, 15);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -222,25 +272,33 @@ fn test_render_quota_table() {
     let backend = TestBackend::new(100, 20);
     let mut terminal = Terminal::new(backend).unwrap();
 
-    let snapshots = vec![
-        QuotaSnapshot {
-            slot: SlotId::new(HarnessId::Antigravity, "work"),
-            status: QuotaStatus::Ok,
-            source: aihub_core::QuotaSource::Vendor,
-            estimated: false,
-            note: None,
-            windows: vec![QuotaWindow::new(WindowKind::FiveHour, 45.0, Some(1800), Some(18000))],
-            lanes: vec![QuotaLane {
-                name: "gemini-flash".to_string(),
-                kind: LaneKind::Own,
-                windows: vec![QuotaWindow::new(WindowKind::FiveHour, 15.0, None, None)],
-            }],
-        },
-    ];
+    let snapshots = vec![QuotaSnapshot {
+        slot: SlotId::new(HarnessId::Antigravity, "work"),
+        status: QuotaStatus::Ok,
+        source: aihub_core::QuotaSource::Vendor,
+        estimated: false,
+        note: None,
+        windows: vec![QuotaWindow::new(
+            WindowKind::FiveHour,
+            45.0,
+            Some(1800),
+            Some(18000),
+        )],
+        lanes: vec![QuotaLane {
+            name: "gemini-flash".to_string(),
+            kind: LaneKind::Own,
+            windows: vec![QuotaWindow::new(WindowKind::FiveHour, 15.0, None, None)],
+        }],
+    }];
 
     terminal
         .draw(|f| {
-            ui::quota_table::render_quota_table(&snapshots, 0, Rect::new(0, 0, 100, 20), f.buffer_mut());
+            ui::quota_table::render_quota_table(
+                &snapshots,
+                0,
+                Rect::new(0, 0, 100, 20),
+                f.buffer_mut(),
+            );
         })
         .unwrap();
 
@@ -306,7 +364,8 @@ fn test_render_terminal_vt100() {
 
     terminal
         .draw(|f| {
-            let cursor = ui::terminal::render_terminal(vt.screen(), Rect::new(0, 0, 80, 10), f.buffer_mut());
+            let cursor =
+                ui::terminal::render_terminal(vt.screen(), Rect::new(0, 0, 80, 10), f.buffer_mut());
             assert!(cursor.is_some(), "Cursor should be positioned by vt100");
         })
         .unwrap();
@@ -321,4 +380,112 @@ fn test_render_terminal_vt100() {
     assert_eq!(buf[(0, 0)].style().fg, Some(Color::Indexed(2))); // ANSI green
     assert_eq!(buf[(5, 0)].symbol(), "A");
     assert!(buf[(5, 0)].style().add_modifier.contains(Modifier::BOLD));
+}
+
+#[test]
+fn test_render_header_wrap_to_second_line_when_width_constrained() {
+    let backend = TestBackend::new(90, 5);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    let mut app = App::new(PathBuf::from("/test/repo"));
+    app.snapshots = vec![
+        QuotaSnapshot {
+            slot: SlotId::new(HarnessId::ClaudeCode, "pro"),
+            status: QuotaStatus::Ok,
+            source: aihub_core::QuotaSource::Vendor,
+            estimated: false,
+            note: None,
+            windows: vec![QuotaWindow::new(WindowKind::FiveHour, 40.0, None, None)],
+            lanes: vec![],
+        },
+        QuotaSnapshot {
+            slot: SlotId::new(HarnessId::Antigravity, "work"),
+            status: QuotaStatus::Ok,
+            source: aihub_core::QuotaSource::Vendor,
+            estimated: false,
+            note: None,
+            windows: vec![QuotaWindow::new(WindowKind::FiveHour, 50.0, None, None)],
+            lanes: vec![],
+        },
+        QuotaSnapshot {
+            slot: SlotId::new(HarnessId::Codex, "corp"),
+            status: QuotaStatus::Ok,
+            source: aihub_core::QuotaSource::Vendor,
+            estimated: false,
+            note: None,
+            windows: vec![QuotaWindow::new(WindowKind::FiveHour, 60.0, None, None)],
+            lanes: vec![],
+        },
+        QuotaSnapshot {
+            slot: SlotId::new(HarnessId::CursorAgent, "team"),
+            status: QuotaStatus::Ok,
+            source: aihub_core::QuotaSource::Vendor,
+            estimated: false,
+            note: None,
+            windows: vec![QuotaWindow::new(WindowKind::FiveHour, 70.0, None, None)],
+            lanes: vec![],
+        },
+    ];
+
+    // Height 2 allows wrapping to second line
+    terminal
+        .draw(|f| {
+            ui::header::render_header(&app, Rect::new(0, 0, 90, 2), f.buffer_mut());
+        })
+        .unwrap();
+
+    let text = buffer_to_text(terminal.backend().buffer());
+
+    // Verify all 4 harness slots are rendered without truncation
+    assert!(text.contains("claude:"), "Line 1 should contain claude:");
+    assert!(text.contains("agy:"), "Should contain agy:");
+    assert!(text.contains("codex:"), "Should contain codex:");
+    assert!(
+        text.contains("cursor-agent:"),
+        "Wrapped line should contain cursor-agent:"
+    );
+    assert!(text.contains('█'), "Should contain gauge blocks");
+
+    // Line 0 and line 1 should both have content
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(
+        lines[0].contains("claude:"),
+        "Line 0 has prefix and initial slots"
+    );
+    assert!(
+        lines[1].contains("cursor-agent:") || lines[1].contains("codex:"),
+        "Line 1 contains wrapped slots"
+    );
+}
+
+#[test]
+fn test_render_header_no_capacity_informational_banner() {
+    let backend = TestBackend::new(120, 5);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    let mut app = App::new(PathBuf::from("/test/repo"));
+    app.mode = Mode::Assisted;
+    app.recommendation = Some(RecommendationState::NoCapacity {
+        reason: "Sem cota disponível em todas as contas".to_string(),
+    });
+
+    terminal
+        .draw(|f| {
+            ui::footer::render_footer(&app, Rect::new(0, 0, 120, 3), f.buffer_mut());
+        })
+        .unwrap();
+
+    let text = buffer_to_text(terminal.backend().buffer());
+    assert!(
+        text.contains("SEM CAPACIDADE"),
+        "Footer should show SEM CAPACIDADE badge"
+    );
+    assert!(
+        text.contains("Sem cota disponível em todas as contas"),
+        "Footer should show reason"
+    );
+    assert!(
+        text.contains("Aceitar indisponível"),
+        "Footer should indicate accept is unavailable"
+    );
 }

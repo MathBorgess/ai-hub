@@ -1,10 +1,8 @@
 //! Application state models for the `aihub` TUI client.
 
+use aihub_core::{HarnessId, MergeStrategy, Mode, QuotaSnapshot, SessionId, TaskTier};
 use std::path::PathBuf;
 use std::time::Instant;
-use aihub_core::{
-    HarnessId, MergeStrategy, Mode, QuotaSnapshot, SessionId, TaskTier,
-};
 
 /// UI display mode / overlay state.
 #[derive(Debug, Clone, PartialEq)]
@@ -17,9 +15,7 @@ pub enum UiMode {
         selected_index: usize,
     },
     /// Full windows x lanes quota table modal.
-    QuotaTable {
-        scroll: usize,
-    },
+    QuotaTable { scroll: usize },
     /// Merge confirmation and diff review modal.
     MergeReview {
         diff: String,
@@ -29,15 +25,22 @@ pub enum UiMode {
     },
 }
 
-/// Route recommendation from the daemon.
+/// Route recommendation or no-capacity status from the daemon.
 #[derive(Debug, Clone, PartialEq)]
-pub struct RecommendationState {
-    pub tier: TaskTier,
-    pub harness: HarnessId,
-    pub lane: Option<String>,
-    pub holds_until_s: Option<u64>,
-    pub confidence: f32,
-    pub reason: String,
+pub enum RecommendationState {
+    Recommended {
+        tier: TaskTier,
+        harness: HarnessId,
+        lane: Option<String>,
+        model: Option<String>,
+        holds_until_s: Option<u64>,
+        confidence: f32,
+        reason: String,
+        recommendation_id: u64,
+    },
+    NoCapacity {
+        reason: String,
+    },
 }
 
 /// Central state of the aihub TUI client.
@@ -57,6 +60,9 @@ pub struct App {
     pub should_exit: bool,
     pub last_terminal_size: (u16, u16),
     pub active: bool,
+    pub task: Option<String>,
+    pub pending_autonomous: bool,
+    pub now_override: Option<u64>,
 }
 
 impl App {
@@ -78,7 +84,15 @@ impl App {
             should_exit: false,
             last_terminal_size: (80, 24),
             active: true,
+            task: None,
+            pending_autonomous: false,
+            now_override: None,
         }
+    }
+
+    /// Checks if a non-empty task description is currently stored.
+    pub fn has_task(&self) -> bool {
+        self.task.as_ref().is_some_and(|t| !t.trim().is_empty())
     }
 
     /// Set a transient status message to be shown in the footer.

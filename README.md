@@ -4,6 +4,22 @@ A unified terminal supervisor and orchestration daemon for AI coding agent harne
 
 `ai-hub` provides live quota monitoring (5-hour and 7-day rolling windows, billing cycles), intelligent prompt-tier routing (Design, Mechanical, Review), shadow Git worktree isolation, seamless harness switching with automatic handoff briefs, and a Ratatui-based TUI client with PTY multiplexing.
 
+## Install
+
+On macOS, install `aihub`, `aihubd`, and the transitional **ai-memory** v2.2.2 binary into `~/.local/bin`, plus optional LaunchAgents:
+
+```bash
+./scripts/install.sh
+```
+
+Dry-run (no system changes):
+
+```bash
+./scripts/install.sh --dry-run
+```
+
+Full steps, prerequisites, and uninstall: [docs/INSTALL.md](docs/INSTALL.md).
+
 ---
 
 ## Documentation

@@ -1,12 +1,15 @@
-use std::path::PathBuf;
+use crate::quota::QuotaSnapshot;
+use crate::types::{
+    HarnessId, MergeStrategy, Mode, RouteOutcome, SessionId, SessionSummary, SessionTarget,
+    TaskSize,
+};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use crate::quota::QuotaSnapshot;
-use crate::types::{HarnessId, MergeStrategy, Mode, SessionId, SessionSummary, SessionTarget, TaskSize, TaskTier};
+use std::path::PathBuf;
 
 /// Current IPC protocol version.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Byte container that serializes to/from standard Base64 string in JSON.
 ///
@@ -82,9 +85,7 @@ impl From<&[u8]> for Base64Bytes {
 #[serde(tag = "action", content = "payload")]
 pub enum ClientMessage {
     /// Handshake initiating connection with protocol version.
-    Hello {
-        version: u32,
-    },
+    Hello { version: u32 },
     /// Request the list of active/recent sessions.
     ListSessions,
     /// Create a new session worktree and launch specified harness.
@@ -94,13 +95,9 @@ pub enum ClientMessage {
         initial_prompt: Option<String>,
     },
     /// Attach to an existing session or the latest session for a repository.
-    Attach {
-        target: SessionTarget,
-    },
+    Attach { target: SessionTarget },
     /// Detach client from active session without terminating it.
-    Detach {
-        session_id: SessionId,
-    },
+    Detach { session_id: SessionId },
     /// Send raw keystroke / input bytes to the session PTY.
     PtyInput {
         session_id: SessionId,
@@ -125,16 +122,29 @@ pub enum ClientMessage {
         session_id: SessionId,
         target: HarnessId,
         with_handoff: bool,
+        /// Explicit model id to pass to the incoming harness (blocker 5). Additive; absent on
+        /// older clients defaults to `None`, which launches without a `--model` flag.
+        #[serde(default)]
+        model: Option<String>,
     },
     /// Toggle or set session operating mode (Assisted or Autonomous).
-    SetMode {
-        session_id: SessionId,
-        mode: Mode,
-    },
+    SetMode { session_id: SessionId, mode: Mode },
     /// Conclude session and merge or discard worktree changes.
     MergeRequest {
         session_id: SessionId,
         strategy: MergeStrategy,
+    },
+    /// Submit task text for a session to provide routing context (F9).
+    SubmitTask {
+        session_id: SessionId,
+        #[serde(alias = "prompt", alias = "text")]
+        task: String,
+    },
+    /// Accept the current assisted recommendation for a session (R3).
+    AcceptRecommendation {
+        session_id: SessionId,
+        #[serde(default)]
+        recommendation_id: Option<u64>,
     },
 }
 
@@ -143,13 +153,9 @@ pub enum ClientMessage {
 #[serde(tag = "event", content = "payload")]
 pub enum DaemonMessage {
     /// Handshake response confirming protocol version.
-    Hello {
-        version: u32,
-    },
+    Hello { version: u32 },
     /// Response to `ListSessions`.
-    SessionList {
-        sessions: Vec<SessionSummary>,
-    },
+    SessionList { sessions: Vec<SessionSummary> },
     /// Confirmation that a new session worktree was created and launched.
     SessionCreated {
         session_id: SessionId,
@@ -157,15 +163,15 @@ pub enum DaemonMessage {
         worktree_path: PathBuf,
         branch: String,
     },
-    /// Confirmation of attach, replaying terminal scrollback before live stream.
+    /// Confirmation of attach, replaying terminal scrollback and session summary (F13).
     Attached {
         session_id: SessionId,
         scrollback: Base64Bytes,
+        #[serde(default)]
+        summary: SessionSummary,
     },
     /// Confirmation that client was detached.
-    Detached {
-        session_id: SessionId,
-    },
+    Detached { session_id: SessionId },
     /// Stream of output bytes from the running PTY.
     PtyOutput {
         session_id: SessionId,
@@ -177,17 +183,13 @@ pub enum DaemonMessage {
         exit_code: Option<i32>,
     },
     /// Pushed telemetry: current quota snapshots for all probed slots and lanes.
-    QuotaPush {
-        snapshots: Vec<QuotaSnapshot>,
-    },
-    /// Routing recommendation reply in response to `RouteRequest`.
+    QuotaPush { snapshots: Vec<QuotaSnapshot> },
+    /// Routing recommendation reply tied to a session carrying a typed outcome (F10, F13).
     RouteRecommendation {
-        tier: TaskTier,
-        harness: HarnessId,
-        lane: Option<String>,
-        holds_until_s: Option<u64>,
-        confidence: f32,
-        reason: String,
+        session_id: SessionId,
+        outcome: RouteOutcome,
+        #[serde(default)]
+        recommendation_id: u64,
     },
     /// Confirmation that harness switch succeeded.
     HarnessSwitched {
@@ -195,12 +197,11 @@ pub enum DaemonMessage {
         old_harness: HarnessId,
         new_harness: HarnessId,
         handoff_path: Option<PathBuf>,
+        #[serde(default)]
+        model: Option<String>,
     },
     /// Confirmation of mode update.
-    ModeSet {
-        session_id: SessionId,
-        mode: Mode,
-    },
+    ModeSet { session_id: SessionId, mode: Mode },
     /// Result of worktree merge or discard action.
     MergeResult {
         session_id: SessionId,
@@ -209,10 +210,7 @@ pub enum DaemonMessage {
         message: String,
     },
     /// General or fatal IPC error.
-    Error {
-        code: String,
-        message: String,
-    },
+    Error { code: String, message: String },
 }
 
 /// Top-level bidirectional IPC message envelope.

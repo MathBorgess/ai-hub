@@ -7,11 +7,17 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
 const PALETTE_HELP: &[(&str, &str)] = &[
-    ("/switch <harness>", "Troca o harness ativo (claude, agy, codex, cursor-agent)"),
+    (
+        "/switch <harness>",
+        "Troca o harness ativo (claude, agy, codex, cursor-agent)",
+    ),
     ("/merge", "Inicia merge assistido com revisão de diff"),
     ("/quota", "Exibe tabela analítica de quotas e janelas"),
     ("/mode", "Alterna entre modo [ASSISTIDO] e [AUTÔNOMO]"),
-    ("/detach", "Desconecta do terminal mantendo a sessão no daemon"),
+    (
+        "/detach",
+        "Desconecta do terminal mantendo a sessão no daemon",
+    ),
 ];
 
 /// Renders the command palette centered overlay.

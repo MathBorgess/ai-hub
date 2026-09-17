@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::HandoffTurn;
 use crate::redact::redact_secrets;
+use crate::HandoffTurn;
 
 use super::paths::{collect_decisions, paths_match_worktree, read_jsonl, walk_jsonl_files};
 
@@ -62,13 +62,14 @@ fn extract_file(session_id: &str, worktree_path: &Path, path: &Path) -> Option<H
 
         if value.get("type").and_then(Value::as_str) == Some("user") {
             if let Some(text) = claude_user_text(&value) {
-                last_user = text;
+                last_user = redact_secrets(&text);
             }
         }
         if value.get("type").and_then(Value::as_str) == Some("assistant") {
             if let Some(text) = claude_assistant_text(&value) {
-                decisions.extend(collect_decisions(&text));
-                last_assistant = text;
+                let redacted = redact_secrets(&text);
+                decisions.extend(collect_decisions(&redacted));
+                last_assistant = redacted;
             }
         }
     }
@@ -86,10 +87,7 @@ fn extract_file(session_id: &str, worktree_path: &Path, path: &Path) -> Option<H
     Some(HandoffTurn {
         summary: redact_secrets(&summary),
         last_output: redact_secrets(&last_assistant),
-        decisions: decisions
-            .into_iter()
-            .map(|d| redact_secrets(&d))
-            .collect(),
+        decisions: decisions.into_iter().map(|d| redact_secrets(&d)).collect(),
     })
 }
 
@@ -137,7 +135,10 @@ mod tests {
 
     #[test]
     fn extracts_last_assistant_from_fixture() {
-        let dir = std::env::temp_dir().join("aihub-memory-claude-fixture");
+        let dir = std::env::temp_dir().join(format!(
+            "aihub-memory-claude-fixture-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("sess.jsonl");

@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master, fix/**]
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+
+      - name: cargo fmt
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --locked
+
+      - name: shellcheck
+        run: |
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck scripts/*.sh
+          else
+            brew install shellcheck
+            shellcheck scripts/*.sh
+          fi
+
+      - name: test install script
+        run: bash scripts/test-install.sh
+
+      - name: e2e ai-memory
+        run: bash scripts/e2e-ai-memory.sh

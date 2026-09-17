@@ -5,11 +5,14 @@ use tokio::{
     net::UnixStream,
 };
 
+static SOCKET_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 fn socket() -> PathBuf {
     std::env::temp_dir()
         .join(format!(
-            "ah08-{}-{}",
+            "ah08-{}-{}-{}",
             std::process::id(),
+            SOCKET_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -82,8 +85,9 @@ async fn cached_quota_broadcast_attach_and_disconnect() {
                 }]
             }
         },
-        move |_, _| {
-            let dead = dead.clone();
+        move |_, _, _| {
+            let dead1 = dead.clone();
+            let dead2 = dead.clone();
             Ok(Pty {
                 output: out.subscribe(),
                 scrollback: b"before attach".to_vec(),
@@ -91,12 +95,20 @@ async fn cached_quota_broadcast_attach_and_disconnect() {
                 resize: Box::new(|_| Ok(())),
                 wait: Box::new(|| Box::pin(std::future::pending())),
                 kill: Box::new(move || {
-                    let dead = dead.clone();
+                    let dead = dead1.clone();
                     Box::pin(async move {
                         dead.fetch_add(1, Ordering::SeqCst);
                         Ok(())
                     })
                 }),
+                stop: Arc::new(move |_| {
+                    let dead = dead2.clone();
+                    Box::pin(async move {
+                        dead.fetch_add(1, Ordering::SeqCst);
+                        Ok(Some(0))
+                    })
+                }),
+                try_write: Arc::new(|_| Ok(())),
             })
         },
     );
@@ -109,6 +121,7 @@ async fn cached_quota_broadcast_attach_and_disconnect() {
                 path: PathBuf::from("/fake/wt"),
                 branch: id.branch_name(),
                 base_branch: "main".into(),
+                originating_checkout: PathBuf::from("/fake/repo"),
             },
             HarnessId::Codex,
             None,
@@ -134,10 +147,16 @@ async fn cached_quota_broadcast_attach_and_disconnect() {
     })
     .await
     .expect("daemon must bind a socket within 3 seconds");
-    send(&mut a, ClientMessage::Hello { version: 1 }).await;
+    send(
+        &mut a,
+        ClientMessage::Hello {
+            version: PROTOCOL_VERSION,
+        },
+    )
+    .await;
     assert!(matches!(
         recv(&mut a).await,
-        DaemonMessage::Hello { version: 1 }
+        DaemonMessage::Hello { version } if version == PROTOCOL_VERSION
     ));
     let snap = loop {
         match recv(&mut a).await {
@@ -147,7 +166,13 @@ async fn cached_quota_broadcast_attach_and_disconnect() {
         }
     };
     let mut b = UnixStream::connect(&path).await.unwrap();
-    send(&mut b, ClientMessage::Hello { version: 1 }).await;
+    send(
+        &mut b,
+        ClientMessage::Hello {
+            version: PROTOCOL_VERSION,
+        },
+    )
+    .await;
     assert!(matches!(recv(&mut b).await, DaemonMessage::Hello { .. }));
     match recv(&mut b).await {
         DaemonMessage::QuotaPush { snapshots } => assert!(!snapshots.is_empty()),
@@ -169,13 +194,17 @@ async fn cached_quota_broadcast_attach_and_disconnect() {
         },
     )
     .await;
-    assert_eq!(
-        recv(&mut b).await,
+    match recv(&mut b).await {
         DaemonMessage::Attached {
-            session_id: id.clone(),
-            scrollback: b"before attach".to_vec().into()
+            session_id,
+            scrollback,
+            ..
+        } => {
+            assert_eq!(session_id, id.clone());
+            assert_eq!(scrollback, b"before attach".to_vec().into());
         }
-    );
+        other => panic!("expected Attached, got {other:?}"),
+    }
     output.send(b"live".to_vec()).unwrap();
     assert_eq!(
         recv(&mut b).await,
@@ -187,7 +216,13 @@ async fn cached_quota_broadcast_attach_and_disconnect() {
     drop(b);
     assert_eq!(killed.load(Ordering::SeqCst), 0);
     let mut c = UnixStream::connect(&path).await.unwrap();
-    send(&mut c, ClientMessage::Hello { version: 1 }).await;
+    send(
+        &mut c,
+        ClientMessage::Hello {
+            version: PROTOCOL_VERSION,
+        },
+    )
+    .await;
     recv(&mut c).await;
     recv(&mut c).await;
     send(
@@ -197,13 +232,17 @@ async fn cached_quota_broadcast_attach_and_disconnect() {
         },
     )
     .await;
-    assert_eq!(
-        recv(&mut c).await,
+    match recv(&mut c).await {
         DaemonMessage::Attached {
-            session_id: id.clone(),
-            scrollback: b"before attachlive".to_vec().into()
+            session_id,
+            scrollback,
+            ..
+        } => {
+            assert_eq!(session_id, id.clone());
+            assert_eq!(scrollback, b"before attachlive".to_vec().into());
         }
-    );
+        other => panic!("expected Attached, got {other:?}"),
+    }
     send(
         &mut c,
         ClientMessage::SetMode {
@@ -213,11 +252,6 @@ async fn cached_quota_broadcast_attach_and_disconnect() {
     )
     .await;
     assert!(matches!(recv(&mut c).await, DaemonMessage::ModeSet { .. }));
-    loop {
-        if matches!(recv(&mut a).await, DaemonMessage::ModeSet { .. }) {
-            break;
-        }
-    }
     send(&mut c, ClientMessage::RequestQuota).await;
     assert!(matches!(
         recv(&mut c).await,
@@ -241,7 +275,7 @@ async fn stale_socket_permissions_and_shutdown() {
     let path = socket();
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
-    let daemon = aihubd::Daemon::new(|| async { vec![] }, |_, _| panic!("no PTY requested"));
+    let daemon = aihubd::Daemon::new(|| async { vec![] }, |_, _, _| panic!("no PTY requested"));
     let (stop, stopped) = tokio::sync::oneshot::channel();
     let p = path.clone();
     let task = tokio::spawn(async move {
@@ -271,7 +305,7 @@ async fn stale_socket_permissions_and_shutdown() {
     );
     let other = aihubd::Daemon::new(
         || async { panic!("must refuse before probe") },
-        |_, _| panic!("no PTY requested"),
+        |_, _, _| panic!("no PTY requested"),
     );
     assert!(other
         .run(path.clone(), std::future::pending())
@@ -292,7 +326,7 @@ async fn signal_worker() {
     let Some(path) = std::env::var_os("AIHUBD_TEST_SOCKET") else {
         return;
     };
-    aihubd::Daemon::new(|| async { vec![] }, |_, _| panic!("no PTY requested"))
+    aihubd::Daemon::new(|| async { vec![] }, |_, _, _| panic!("no PTY requested"))
         .run(path.into(), aihubd::shutdown_signal())
         .await
         .unwrap();

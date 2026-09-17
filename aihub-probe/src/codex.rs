@@ -1,9 +1,9 @@
-use std::path::{Path, PathBuf};
+use crate::ProbeError;
 use aihub_core::{
     HarnessId, QuotaSnapshot, QuotaSource, QuotaStatus, QuotaWindow, SlotId, WindowKind,
 };
 use serde::{Deserialize, Serialize};
-use crate::ProbeError;
+use std::path::{Path, PathBuf};
 
 /// Auth data format in `~/.codex/auth.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -145,7 +145,9 @@ pub fn parse_codex_usage(json: &str) -> Result<Vec<QuotaWindow>, ProbeError> {
     }
 
     if windows.is_empty() {
-        return Err(ProbeError::Failure("no rate_limit windows in response".into()));
+        return Err(ProbeError::Failure(
+            "no rate_limit windows in response".into(),
+        ));
     }
 
     Ok(windows)
@@ -165,7 +167,11 @@ pub fn read_codex_auth_first_usable(now_ms: i64) -> (Option<CodexAuth>, Option<S
                             expired_seen = true;
                             continue;
                         }
-                        return (Some(auth), Some(auth_path.to_string_lossy().to_string()), expired_seen);
+                        return (
+                            Some(auth),
+                            Some(auth_path.to_string_lossy().to_string()),
+                            expired_seen,
+                        );
                     }
                 }
             }
@@ -211,6 +217,26 @@ fn is_leap_year(y: u64) -> bool {
     (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
 }
 
+/// Snapshot returned when no usable auth token is available.
+pub fn missing_credentials_snapshot(expired_seen: bool) -> QuotaSnapshot {
+    let slot = SlotId::default_for(HarnessId::Codex);
+    let note = if expired_seen {
+        "every credential found is expired — run `codex` once to refresh"
+    } else {
+        "no credential found — run `codex` once to log in"
+    };
+
+    QuotaSnapshot {
+        slot,
+        status: QuotaStatus::Unknown,
+        source: QuotaSource::OAuth,
+        estimated: false,
+        note: Some(note.to_string()),
+        windows: vec![],
+        lanes: vec![],
+    }
+}
+
 /// Probes OpenAI Codex usage from local auth tokens and usage endpoint.
 /// Owned by session 02.
 pub async fn probe() -> Result<QuotaSnapshot, ProbeError> {
@@ -219,40 +245,15 @@ pub async fn probe() -> Result<QuotaSnapshot, ProbeError> {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
 
-    let (auth, source_label, expired_seen) = read_codex_auth_first_usable(now_ms);
+    let (auth, source_label, expired_seen) =
+        tokio::task::spawn_blocking(move || read_codex_auth_first_usable(now_ms))
+            .await
+            .map_err(|e| ProbeError::Failure(format!("auth read task failed: {e}")))?;
 
     let slot = SlotId::default_for(HarnessId::Codex);
 
     let Some(auth) = auth else {
-        let note = if expired_seen {
-            "every credential found is expired — run `codex` once to refresh"
-        } else {
-            "no credential found — run `codex` once to log in"
-        };
-
-        // Try local transcript fallback
-        if let Ok(transcripts) = crate::transcripts::probe().await {
-            if let Some(snap) = transcripts.into_iter().find(|s| s.slot.harness == HarnessId::Codex) {
-                let combined_note = match &snap.note {
-                    Some(n) => format!("{note}; {n}"),
-                    None => note.to_string(),
-                };
-                return Ok(QuotaSnapshot {
-                    note: Some(combined_note),
-                    ..snap
-                });
-            }
-        }
-
-        return Ok(QuotaSnapshot {
-            slot,
-            status: QuotaStatus::Unknown,
-            source: QuotaSource::OAuth,
-            estimated: false,
-            note: Some(note.to_string()),
-            windows: vec![],
-            lanes: vec![],
-        });
+        return Ok(missing_credentials_snapshot(expired_seen));
     };
 
     let (token, account_id) = match valid_codex_tokens(&auth, now_ms) {
@@ -270,9 +271,7 @@ pub async fn probe() -> Result<QuotaSnapshot, ProbeError> {
         }
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()?;
+    let client = crate::build_probe_http_client()?;
 
     let mut req = client
         .get("https://chatgpt.com/backend-api/wham/usage")
@@ -317,16 +316,14 @@ pub async fn probe() -> Result<QuotaSnapshot, ProbeError> {
                 lanes: vec![],
             })
         }
-        Err(e) => {
-            Ok(QuotaSnapshot {
-                slot,
-                status: QuotaStatus::Unknown,
-                source: QuotaSource::OAuth,
-                estimated: false,
-                note: Some(format!("probe failed: {e}")),
-                windows: vec![],
-                lanes: vec![],
-            })
-        }
+        Err(e) => Ok(QuotaSnapshot {
+            slot,
+            status: QuotaStatus::Unknown,
+            source: QuotaSource::OAuth,
+            estimated: false,
+            note: Some(crate::http_failure_note(&e)),
+            windows: vec![],
+            lanes: vec![],
+        }),
     }
 }

@@ -1,9 +1,9 @@
-use std::path::{Path, PathBuf};
+use crate::ProbeError;
 use aihub_core::{
     HarnessId, QuotaSnapshot, QuotaSource, QuotaStatus, QuotaWindow, SlotId, WindowKind,
 };
 use serde::{Deserialize, Serialize};
-use crate::ProbeError;
+use std::path::{Path, PathBuf};
 
 /// Credentials stored in ~/.claude/.credentials.json or macOS Keychain service "Claude Code-credentials".
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -72,7 +72,10 @@ pub fn is_claude_expired(creds: &ClaudeOAuthCredentials, now_ms: i64) -> bool {
 }
 
 /// Pure helper: extracts access token if not expired.
-pub fn valid_claude_access_token(creds: &ClaudeOAuthCredentials, now_ms: i64) -> Result<String, &'static str> {
+pub fn valid_claude_access_token(
+    creds: &ClaudeOAuthCredentials,
+    now_ms: i64,
+) -> Result<String, &'static str> {
     let oauth = match &creds.claude_ai_oauth {
         Some(o) => o,
         None => return Err("no claudeAiOauth field in credential"),
@@ -134,7 +137,11 @@ fn parse_resets_in_s(iso_or_epoch: &str) -> Option<u64> {
 
     // If it's pure digits
     if let Ok(epoch_s) = iso_or_epoch.parse::<u64>() {
-        let s = if epoch_s > 100_000_000_000 { epoch_s / 1000 } else { epoch_s };
+        let s = if epoch_s > 100_000_000_000 {
+            epoch_s / 1000
+        } else {
+            epoch_s
+        };
         return if s > now { Some(s - now) } else { Some(0) };
     }
 
@@ -205,7 +212,9 @@ pub fn read_keychain_claude_credentials() -> Option<String> {
 /// 2. macOS Keychain `Claude Code-credentials`.
 ///
 /// Returns (credentials, source_label, was_expired_seen)
-pub fn read_claude_credentials_first_usable(now_ms: i64) -> (Option<ClaudeOAuthCredentials>, Option<String>, bool) {
+pub fn read_claude_credentials_first_usable(
+    now_ms: i64,
+) -> (Option<ClaudeOAuthCredentials>, Option<String>, bool) {
     let mut expired_seen = false;
 
     // 1. Files
@@ -219,7 +228,11 @@ pub fn read_claude_credentials_first_usable(now_ms: i64) -> (Option<ClaudeOAuthC
                             expired_seen = true;
                             continue;
                         }
-                        return (Some(creds), Some(cred_path.to_string_lossy().to_string()), expired_seen);
+                        return (
+                            Some(creds),
+                            Some(cred_path.to_string_lossy().to_string()),
+                            expired_seen,
+                        );
                     }
                 }
             }
@@ -246,6 +259,26 @@ pub fn read_claude_credentials_first_usable(now_ms: i64) -> (Option<ClaudeOAuthC
     (None, None, expired_seen)
 }
 
+/// Snapshot returned when no usable OAuth credential is available.
+pub fn missing_credentials_snapshot(expired_seen: bool) -> QuotaSnapshot {
+    let slot = SlotId::default_for(HarnessId::ClaudeCode);
+    let note = if expired_seen {
+        "every credential found is expired — run `claude` once to refresh"
+    } else {
+        "no credential found — run `claude` once to log in"
+    };
+
+    QuotaSnapshot {
+        slot,
+        status: QuotaStatus::Unknown,
+        source: QuotaSource::OAuth,
+        estimated: false,
+        note: Some(note.to_string()),
+        windows: vec![],
+        lanes: vec![],
+    }
+}
+
 /// Probes Claude Code usage from OAuth credentials and Anthropic usage endpoint.
 /// Owned by session 02.
 pub async fn probe() -> Result<QuotaSnapshot, ProbeError> {
@@ -254,41 +287,15 @@ pub async fn probe() -> Result<QuotaSnapshot, ProbeError> {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
 
-    let (creds, source_label, expired_seen) = read_claude_credentials_first_usable(now_ms);
+    let (creds, source_label, expired_seen) =
+        tokio::task::spawn_blocking(move || read_claude_credentials_first_usable(now_ms))
+            .await
+            .map_err(|e| ProbeError::Failure(format!("credential read task failed: {e}")))?;
 
     let slot = SlotId::default_for(HarnessId::ClaudeCode);
 
     let Some(creds) = creds else {
-        // Fallback to transcripts if no usable credentials
-        let note = if expired_seen {
-            "every credential found is expired — run `claude` once to refresh"
-        } else {
-            "no credential found — run `claude` once to log in"
-        };
-
-        // Try local transcript fallback
-        if let Ok(transcripts) = crate::transcripts::probe().await {
-            if let Some(snap) = transcripts.into_iter().find(|s| s.slot.harness == HarnessId::ClaudeCode) {
-                let combined_note = match &snap.note {
-                    Some(n) => format!("{note}; {n}"),
-                    None => note.to_string(),
-                };
-                return Ok(QuotaSnapshot {
-                    note: Some(combined_note),
-                    ..snap
-                });
-            }
-        }
-
-        return Ok(QuotaSnapshot {
-            slot,
-            status: QuotaStatus::Unknown,
-            source: QuotaSource::OAuth,
-            estimated: false,
-            note: Some(note.to_string()),
-            windows: vec![],
-            lanes: vec![],
-        });
+        return Ok(missing_credentials_snapshot(expired_seen));
     };
 
     let token = match valid_claude_access_token(&creds, now_ms) {
@@ -306,10 +313,7 @@ pub async fn probe() -> Result<QuotaSnapshot, ProbeError> {
         }
     };
 
-    // Query Anthropic usage endpoint
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()?;
+    let client = crate::build_probe_http_client()?;
 
     let res = client
         .get("https://api.anthropic.com/api/oauth/usage")
@@ -352,16 +356,14 @@ pub async fn probe() -> Result<QuotaSnapshot, ProbeError> {
                 lanes: vec![],
             })
         }
-        Err(e) => {
-            Ok(QuotaSnapshot {
-                slot,
-                status: QuotaStatus::Unknown,
-                source: QuotaSource::OAuth,
-                estimated: false,
-                note: Some(format!("probe failed: {e}")),
-                windows: vec![],
-                lanes: vec![],
-            })
-        }
+        Err(e) => Ok(QuotaSnapshot {
+            slot,
+            status: QuotaStatus::Unknown,
+            source: QuotaSource::OAuth,
+            estimated: false,
+            note: Some(crate::http_failure_note(&e)),
+            windows: vec![],
+            lanes: vec![],
+        }),
     }
 }

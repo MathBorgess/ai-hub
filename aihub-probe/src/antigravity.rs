@@ -9,8 +9,7 @@ use serde_json::Value;
 
 use crate::ProbeError;
 
-const AGY_QUOTA_RPC: &str =
-    "exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary";
+const AGY_QUOTA_RPC: &str = "exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary";
 const AGY_CLOUD_QUOTA: [&str; 2] = [
     "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
     "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
@@ -20,7 +19,9 @@ const GO_KEYRING_PREFIX: &str = "go-keyring-base64:";
 
 /// Probes Antigravity quota from running language server RPC or saved OS keyring session.
 pub async fn probe() -> Result<QuotaSnapshot, ProbeError> {
-    let bases = discover_ls_bases();
+    let bases = tokio::task::spawn_blocking(discover_ls_bases)
+        .await
+        .map_err(|e| ProbeError::Failure(format!("antigravity discovery failed: {e}")))?;
     if !bases.is_empty() {
         if let Ok(lanes) = fetch_local_quota(&bases).await {
             return Ok(build_snapshot(lanes, QuotaSource::Vendor, None));
@@ -28,7 +29,10 @@ pub async fn probe() -> Result<QuotaSnapshot, ProbeError> {
     }
 
     #[cfg(target_os = "macos")]
-    if let Some(session) = read_antigravity_session() {
+    if let Some(session) = tokio::task::spawn_blocking(read_antigravity_session)
+        .await
+        .map_err(|e| ProbeError::Failure(format!("antigravity session read failed: {e}")))?
+    {
         if let Ok(lanes) = fetch_cloud_quota(&session.token).await {
             return Ok(build_snapshot(lanes, QuotaSource::OAuth, None));
         }
@@ -155,9 +159,8 @@ pub fn parse_quota_summary(json: &str) -> Result<Vec<QuotaLane>, ProbeError> {
 /// Pure parser: parses `lsof -nP -iTCP -sTCP:LISTEN -F pcn` machine-readable output for candidate ports.
 pub fn parse_lsof_ports(lsof_output: &str) -> Vec<u16> {
     static PROC_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    let proc_re = PROC_RE.get_or_init(|| {
-        Regex::new(r"(^|/)agy$|language_server|antigravity").expect("regex")
-    });
+    let proc_re = PROC_RE
+        .get_or_init(|| Regex::new(r"(^|/)agy$|language_server|antigravity").expect("regex"));
 
     let mut per_pid: std::collections::BTreeMap<i32, Vec<u16>> = std::collections::BTreeMap::new();
     let mut pid: Option<i32> = None;
@@ -204,31 +207,34 @@ pub fn parse_csrf_token(html: &str) -> Option<String> {
 }
 
 pub fn discover_ls_bases() -> Vec<String> {
-    let mut bases = Vec::new();
-    if let Ok(override_addr) = std::env::var("ANTIGRAVITY_LS_ADDRESS") {
-        let trimmed = override_addr.trim();
-        if !trimmed.is_empty() {
-            if let Some(base) = normalize_ls_override(trimmed) {
-                bases.push(base);
-            }
-        }
-    }
-
-    if which("lsof") {
-        let output = std::process::Command::new("lsof")
+    let override_addr = std::env::var("ANTIGRAVITY_LS_ADDRESS").ok();
+    let output = if which("lsof") {
+        std::process::Command::new("lsof")
             .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcn"])
             .output()
             .ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default();
-        for port in parse_lsof_ports(&output) {
-            let base = format!("http://127.0.0.1:{port}");
-            if !bases.contains(&base) {
-                bases.push(base);
-            }
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    discover_ls_bases_from(override_addr.as_deref(), &output)
+}
+
+/// Discover bases from explicit inputs; no environment access or subprocesses.
+pub fn discover_ls_bases_from(override_addr: Option<&str>, lsof_output: &str) -> Vec<String> {
+    let mut bases = Vec::new();
+    if let Some(override_addr) = override_addr {
+        if let Some(base) = normalize_ls_override(override_addr.trim()) {
+            bases.push(base);
         }
     }
-
+    for port in parse_lsof_ports(lsof_output) {
+        let base = format!("http://127.0.0.1:{port}");
+        if !bases.contains(&base) {
+            bases.push(base);
+        }
+    }
     bases
 }
 
@@ -266,10 +272,7 @@ fn agy_probe_order(per_pid: &std::collections::BTreeMap<i32, Vec<u16>>) -> Vec<u
     let mut out = Vec::new();
     let mut rank = 0usize;
     loop {
-        let row: Vec<u16> = groups
-            .iter()
-            .filter_map(|g| g.get(rank).copied())
-            .collect();
+        let row: Vec<u16> = groups.iter().filter_map(|g| g.get(rank).copied()).collect();
         if row.is_empty() {
             break;
         }
@@ -314,10 +317,7 @@ async fn fetch_local_quota(bases: &[String]) -> Result<Vec<QuotaLane>, ProbeErro
 }
 
 async fn fetch_cloud_quota(token: &str) -> Result<Vec<QuotaLane>, ProbeError> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(ProbeError::Http)?;
+    let client = crate::build_probe_http_client()?;
 
     for url in AGY_CLOUD_QUOTA {
         let resp = client
@@ -376,8 +376,14 @@ fn parse_antigravity_session(raw: &str) -> Option<AntigravitySession> {
         .cloned()
         .unwrap_or(root);
     let token = [
-        "access_token", "accessToken", "token", "id_token", "idToken", "bearerToken",
-        "auth_token", "authToken",
+        "access_token",
+        "accessToken",
+        "token",
+        "id_token",
+        "idToken",
+        "bearerToken",
+        "auth_token",
+        "authToken",
     ]
     .iter()
     .find_map(|k| t.get(k).and_then(|v| v.as_str()))
@@ -445,7 +451,11 @@ fn standard_base64_decode(input: &str) -> Option<Vec<u8>> {
         out.push(((b2 & 0x03) << 6) | b3);
         i += 4;
     }
-    if out.is_empty() { None } else { Some(out) }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 #[cfg(target_os = "macos")]

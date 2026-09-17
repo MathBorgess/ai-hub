@@ -1,6 +1,6 @@
-use std::fmt;
-use serde::{Deserialize, Serialize};
 use crate::types::HarnessId;
+use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// Identifier for a quota slot (harness × account).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -78,7 +78,12 @@ pub struct QuotaWindow {
 }
 
 impl QuotaWindow {
-    pub fn new(kind: WindowKind, used_pct: f64, resets_in_s: Option<u64>, window_s: Option<u64>) -> Self {
+    pub fn new(
+        kind: WindowKind,
+        used_pct: f64,
+        resets_in_s: Option<u64>,
+        window_s: Option<u64>,
+    ) -> Self {
         Self {
             kind,
             used_pct: used_pct.clamp(0.0, 100.0),
@@ -205,6 +210,9 @@ impl QuotaSnapshot {
 
     /// Checks if all windows or the tightest window are within safe bounds.
     pub fn is_available(&self) -> bool {
-        matches!(self.status, QuotaStatus::Ok | QuotaStatus::Low | QuotaStatus::Unknown)
+        matches!(
+            self.status,
+            QuotaStatus::Ok | QuotaStatus::Low | QuotaStatus::Unknown
+        )
     }
 }

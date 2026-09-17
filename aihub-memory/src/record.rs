@@ -1,71 +1,73 @@
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use aihub_core::{HarnessId, SessionId, paths::default_data_dir};
-use serde::Serialize;
+use aihub_core::{paths::default_data_dir, HarnessId, SessionId};
 
-use crate::{BriefPair, MemoryError};
+use crate::ai_memory::{self, SpooledRecord};
+use crate::{BriefPair, HandoffDestination, MemoryError};
 
-/// Append-only handoff log when the ai-memory daemon is not available locally.
-/// Target schema mirrors `NewHandoff` in ai-memory (`crates/ai-memory-core/src/handoff.rs`, commit 968dac852aa4a41408ba4b9dcb2fe69eac957d21).
-#[derive(Serialize)]
-struct HandoffRecord<'a> {
-    session_id: &'a str,
-    from_harness: &'a str,
-    to_harness: &'a str,
-    brief_path: String,
-    prompt_path: String,
-    recorded_at: String,
-}
-
+/// Public API: Appends a handoff record to the local spool.
 pub async fn record_handoff(
     session_id: &SessionId,
     from: HarnessId,
     to: HarnessId,
     brief: &BriefPair,
+    project: &str,
 ) -> Result<(), MemoryError> {
     let data_dir = default_data_dir();
-    std::fs::create_dir_all(&data_dir)?;
-    let path = handoffs_log_path(&data_dir);
-    let record = HandoffRecord {
-        session_id: session_id.as_str(),
-        from_harness: harness_label(from),
-        to_harness: harness_label(to),
-        brief_path: brief.brief_path.display().to_string(),
-        prompt_path: brief.prompt_path.display().to_string(),
-        recorded_at: time_now_rfc3339(),
-    };
-    append_jsonl(&path, &record)?;
+    let spool_path = handoffs_log_path(&data_dir);
+    let record = SpooledRecord::from_brief(session_id, from, to, brief, project)?;
+    ai_memory::append_to_spool_file_async(&spool_path, &record).await?;
     Ok(())
+}
+
+/// Records handoff metadata and returns whether it reached the live backend or was spooled locally (§3.5).
+pub async fn record_handoff_destination(
+    session_id: &SessionId,
+    from: HarnessId,
+    to: HarnessId,
+    brief: &BriefPair,
+    project: &str,
+) -> Result<HandoffDestination, MemoryError> {
+    crate::ai_memory::record_handoff_destination(session_id, from, to, brief, project).await
+}
+
+/// Convenience alias returning true if delivered to the live backend, false if spooled locally.
+pub async fn record_handoff_delivered(
+    session_id: &SessionId,
+    from: HarnessId,
+    to: HarnessId,
+    brief: &BriefPair,
+    project: &str,
+) -> Result<bool, MemoryError> {
+    crate::ai_memory::record_handoff_delivered(session_id, from, to, brief, project).await
+}
+
+/// Public drain call that can be run on a timer without a new handoff (N5).
+/// Uses environment variables `AI_MEMORY_SERVER_URL`, `AI_MEMORY_AUTH_TOKEN`, and `AIHUB_DATA_DIR`.
+pub async fn drain_spooled_handoffs(limit: usize) -> Result<usize, MemoryError> {
+    let server_url = std::env::var("AI_MEMORY_SERVER_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:49374".to_string());
+    let auth_token = std::env::var("AI_MEMORY_AUTH_TOKEN").ok();
+    let data_dir = std::env::var_os("AIHUB_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_data_dir);
+
+    drain_spooled_handoffs_to(&server_url, auth_token.as_deref(), &data_dir, limit).await
+}
+
+/// Public drain call taking explicit server URL, auth token, and data directory (N5).
+pub async fn drain_spooled_handoffs_to(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    limit: usize,
+) -> Result<usize, MemoryError> {
+    let spool_path = handoffs_log_path(data_dir);
+    crate::ai_memory::drain_spool(server_url, auth_token, &spool_path, limit).await
 }
 
 pub fn handoffs_log_path(data_dir: &Path) -> PathBuf {
     data_dir.join("handoffs.jsonl")
-}
-
-fn harness_label(h: HarnessId) -> &'static str {
-    match h {
-        HarnessId::ClaudeCode => "claude-code",
-        HarnessId::Codex => "codex",
-        HarnessId::CursorAgent => "cursor-agent",
-        HarnessId::Antigravity => "antigravity",
-    }
-}
-
-fn append_jsonl(path: &Path, value: &impl Serialize) -> Result<(), MemoryError> {
-    let line = serde_json::to_string(value)?;
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    writeln!(file, "{line}")?;
-    Ok(())
-}
-
-fn time_now_rfc3339() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let dur = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    format!("{}Z", dur.as_secs())
 }
 
 #[cfg(test)]
@@ -75,26 +77,39 @@ mod tests {
 
     #[tokio::test]
     async fn appends_jsonl_in_temp_data_dir() {
-        let dir = std::env::temp_dir().join("aihub-memory-record-test");
+        let dir = std::env::temp_dir().join(format!(
+            "aihub-memory-record-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let log = handoffs_log_path(&dir);
+        let brief_path = dir.join("01.md");
+        fs::write(&brief_path, "## Goal\ntest record\n").unwrap();
         let brief = BriefPair {
-            brief_path: dir.join("01.md"),
+            brief_path,
             prompt_path: dir.join("01.prompt.md"),
         };
-        let record = HandoffRecord {
-            session_id: "sess-a",
-            from_harness: "claude-code",
-            to_harness: "codex",
-            brief_path: brief.brief_path.display().to_string(),
-            prompt_path: brief.prompt_path.display().to_string(),
-            recorded_at: "0Z".into(),
-        };
-        append_jsonl(&log, &record).unwrap();
+        let sid = SessionId::new("sess-a");
+        let record = SpooledRecord::from_brief(
+            &sid,
+            HarnessId::ClaudeCode,
+            HarnessId::Codex,
+            &brief,
+            "my-proj",
+        )
+        .unwrap();
+
+        ai_memory::append_to_spool_file(&log, &record).unwrap();
         let text = fs::read_to_string(&log).unwrap();
         assert!(text.contains("sess-a"));
         assert!(text.contains("claude-code"));
+        assert!(text.contains("my-proj"));
+        assert!(text.contains("test record"));
         let _ = fs::remove_dir_all(&dir);
     }
 }

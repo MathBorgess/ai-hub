@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Per-user LaunchAgent for aihubd.
+  install.sh renders string values with plutil (never sed).
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.mathborgess.aihubd</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__AIHUBD_BIN__</string>
+    <string>--socket</string>
+    <string>__AIHUB_SOCKET__</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__LAUNCHD_PATH__</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ProcessType</key>
+  <string>Interactive</string>
+
+  <key>StandardOutPath</key>
+  <string>__AIHUBD_STDOUT__</string>
+  <key>StandardErrorPath</key>
+  <string>__AIHUBD_STDERR__</string>
+</dict>
+</plist>

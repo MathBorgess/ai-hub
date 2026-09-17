@@ -13,3 +13,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 reqwest = { workspace = true }
 regex = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+libc = { workspace = true }

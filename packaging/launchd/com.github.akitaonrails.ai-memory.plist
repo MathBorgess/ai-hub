@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Per-user LaunchAgent for ai-memory (transitional; bundled with aihub install).
+  install.sh renders string values with plutil (never sed).
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.github.akitaonrails.ai-memory</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__AI_MEMORY_BIN__</string>
+    <string>serve</string>
+    <string>--transport</string>
+    <string>http</string>
+    <string>--bind</string>
+    <string>127.0.0.1:49374</string>
+    <string>--enable-web</string>
+    <string>--data-dir</string>
+    <string>__AI_MEMORY_DATA_DIR__</string>
+    <string>--config</string>
+    <string>__AI_MEMORY_CONFIG__</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>AI_MEMORY_BIND</key>
+    <string>127.0.0.1:49374</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ProcessType</key>
+  <string>Interactive</string>
+
+  <key>StandardOutPath</key>
+  <string>__AI_MEMORY_STDOUT__</string>
+  <key>StandardErrorPath</key>
+  <string>__AI_MEMORY_STDERR__</string>
+</dict>
+</plist>

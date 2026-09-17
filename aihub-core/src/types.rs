@@ -1,7 +1,7 @@
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use serde::{Deserialize, Serialize};
 
 /// Unique identifier for an aihub session.
 ///
@@ -272,4 +272,105 @@ pub struct SessionSummary {
     pub worktree_path: PathBuf,
     pub branch: String,
     pub active: bool,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub lane: Option<String>,
+}
+
+impl Default for SessionSummary {
+    fn default() -> Self {
+        Self {
+            session_id: SessionId::new(""),
+            harness: HarnessId::ClaudeCode,
+            mode: Mode::Assisted,
+            repo_path: PathBuf::new(),
+            worktree_path: PathBuf::new(),
+            branch: String::new(),
+            active: false,
+            model: None,
+            lane: None,
+        }
+    }
+}
+
+/// Typed routing outcome for task dispatch (F10).
+///
+/// Distinguishes between a dispatchable recommendation and a typed no-capacity outcome,
+/// preventing any placeholder harness sentinel from being mistaken for a launch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RouteOutcome {
+    Recommendation {
+        harness: HarnessId,
+        lane: Option<String>,
+        model: Option<String>,
+        holds_until_s: Option<u64>,
+    },
+    NoCapacity {
+        reason: String,
+    },
+}
+
+pub type RoutingOutcome = RouteOutcome;
+
+impl RouteOutcome {
+    pub fn recommendation(
+        harness: HarnessId,
+        lane: Option<String>,
+        model: Option<String>,
+        holds_until_s: Option<u64>,
+    ) -> Self {
+        Self::Recommendation {
+            harness,
+            lane,
+            model,
+            holds_until_s,
+        }
+    }
+
+    pub fn no_capacity(reason: impl Into<String>) -> Self {
+        Self::NoCapacity {
+            reason: reason.into(),
+        }
+    }
+
+    pub fn is_dispatchable(&self) -> bool {
+        matches!(self, RouteOutcome::Recommendation { .. })
+    }
+
+    pub fn harness(&self) -> Option<HarnessId> {
+        match self {
+            RouteOutcome::Recommendation { harness, .. } => Some(*harness),
+            RouteOutcome::NoCapacity { .. } => None,
+        }
+    }
+
+    pub fn lane(&self) -> Option<&str> {
+        match self {
+            RouteOutcome::Recommendation { lane, .. } => lane.as_deref(),
+            RouteOutcome::NoCapacity { .. } => None,
+        }
+    }
+
+    pub fn model(&self) -> Option<&str> {
+        match self {
+            RouteOutcome::Recommendation { model, .. } => model.as_deref(),
+            RouteOutcome::NoCapacity { .. } => None,
+        }
+    }
+
+    pub fn holds_until_s(&self) -> Option<u64> {
+        match self {
+            RouteOutcome::Recommendation { holds_until_s, .. } => *holds_until_s,
+            RouteOutcome::NoCapacity { .. } => None,
+        }
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            RouteOutcome::Recommendation { .. } => None,
+            RouteOutcome::NoCapacity { reason } => Some(reason),
+        }
+    }
 }

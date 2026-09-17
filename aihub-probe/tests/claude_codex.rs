@@ -2,13 +2,23 @@ use aihub_core::{QuotaStatus, WindowKind};
 use aihub_probe::claude::{
     is_claude_expired, parse_claude_usage, valid_claude_access_token, ClaudeOAuthCredentials,
 };
-use aihub_probe::codex::{
-    is_codex_expired, parse_codex_usage, valid_codex_tokens, CodexAuth,
-};
-use aihub_probe::transcripts::{
-    calculate_rolling_windows, parse_transcript_line, TranscriptTurn,
-};
+use aihub_probe::codex::{is_codex_expired, parse_codex_usage, valid_codex_tokens, CodexAuth};
+use aihub_probe::transcripts::{calculate_rolling_windows, parse_transcript_line, TranscriptTurn};
 use aihub_probe::windows::{bucket_for_usage, pick_tightest_window};
+
+#[test]
+fn probe_expired_credentials_snapshot_unknown_not_ok() {
+    let claude = aihub_probe::claude::missing_credentials_snapshot(true);
+    assert_eq!(claude.status, QuotaStatus::Unknown);
+    assert!(claude
+        .note
+        .as_deref()
+        .is_some_and(|n| n.contains("expired")));
+
+    let codex = aihub_probe::codex::missing_credentials_snapshot(true);
+    assert_eq!(codex.status, QuotaStatus::Unknown);
+    assert!(codex.note.as_deref().is_some_and(|n| n.contains("expired")));
+}
 
 #[test]
 fn test_claude_usage_parse() {
@@ -16,12 +26,18 @@ fn test_claude_usage_parse() {
     let windows = parse_claude_usage(fixture).expect("parse claude usage");
     assert_eq!(windows.len(), 2);
 
-    let w5 = windows.iter().find(|w| w.kind == WindowKind::FiveHour).expect("five_hour");
+    let w5 = windows
+        .iter()
+        .find(|w| w.kind == WindowKind::FiveHour)
+        .expect("five_hour");
     assert_eq!(w5.used_pct, 42.5);
     assert_eq!(w5.window_s, Some(18000));
     assert_eq!(w5.remaining_pct(), 57.5);
 
-    let w7 = windows.iter().find(|w| w.kind == WindowKind::SevenDay).expect("seven_day");
+    let w7 = windows
+        .iter()
+        .find(|w| w.kind == WindowKind::SevenDay)
+        .expect("seven_day");
     assert_eq!(w7.used_pct, 78.0);
     assert_eq!(w7.window_s, Some(604800));
     assert_eq!(w7.remaining_pct(), 22.0);
@@ -34,14 +50,16 @@ fn test_claude_usage_parse() {
 #[test]
 fn test_claude_credentials_valid_and_expired() {
     let valid_json = include_str!("fixtures/claude/credentials_valid.json");
-    let valid_creds: ClaudeOAuthCredentials = serde_json::from_str(valid_json).expect("valid creds json");
+    let valid_creds: ClaudeOAuthCredentials =
+        serde_json::from_str(valid_json).expect("valid creds json");
     let now_ms = 1750000000000; // before expiresAt (1789400000000)
     assert!(!is_claude_expired(&valid_creds, now_ms));
     let token = valid_claude_access_token(&valid_creds, now_ms).expect("valid token");
     assert_eq!(token, "fabricated-token-active-12345");
 
     let expired_json = include_str!("fixtures/claude/credentials_expired.json");
-    let expired_creds: ClaudeOAuthCredentials = serde_json::from_str(expired_json).expect("expired creds json");
+    let expired_creds: ClaudeOAuthCredentials =
+        serde_json::from_str(expired_json).expect("expired creds json");
     assert!(is_claude_expired(&expired_creds, now_ms));
     let err = valid_claude_access_token(&expired_creds, now_ms).expect_err("should be expired");
     assert_eq!(err, "credential expired");
@@ -53,11 +71,17 @@ fn test_codex_usage_parse() {
     let windows = parse_codex_usage(fixture).expect("parse codex usage");
     assert_eq!(windows.len(), 2);
 
-    let primary = windows.iter().find(|w| w.kind == WindowKind::FiveHour).expect("primary");
+    let primary = windows
+        .iter()
+        .find(|w| w.kind == WindowKind::FiveHour)
+        .expect("primary");
     assert_eq!(primary.used_pct, 15.0);
     assert_eq!(primary.window_s, Some(18000));
 
-    let secondary = windows.iter().find(|w| w.kind == WindowKind::SevenDay).expect("secondary");
+    let secondary = windows
+        .iter()
+        .find(|w| w.kind == WindowKind::SevenDay)
+        .expect("secondary");
     assert_eq!(secondary.used_pct, 65.5);
     assert_eq!(secondary.window_s, Some(604800));
 
@@ -94,7 +118,7 @@ fn test_claude_transcript_parse_and_rolling_window() {
     }
     assert_eq!(turns.len(), 2);
     assert_eq!(turns[0].tokens_used, 1200 + 300 + 150 + 50); // 1700
-    assert_eq!(turns[1].tokens_used, 2500 + 500 + 200);      // 3200
+    assert_eq!(turns[1].tokens_used, 2500 + 500 + 200); // 3200
 
     // Also test calculation with turns across multiple 5h windows
     let mut multi_turns = Vec::new();
@@ -141,7 +165,7 @@ fn test_codex_transcript_parse() {
         }
     }
     assert_eq!(turns.len(), 2);
-    assert_eq!(turns[0].tokens_used, 800 + 100 + 200);  // 1100
+    assert_eq!(turns[0].tokens_used, 800 + 100 + 200); // 1100
     assert_eq!(turns[1].tokens_used, 1500 + 300 + 400); // 2200
     assert_eq!(turns[0].session_id, "codex-sess-1");
 }

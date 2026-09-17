@@ -1,7 +1,7 @@
 //! CLI argument parsing and repo discovery.
 
-use std::path::PathBuf;
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -12,6 +12,10 @@ pub struct Cli {
     /// Custom socket path for aihubd Unix domain socket
     #[arg(long)]
     pub socket: Option<PathBuf>,
+
+    /// Optional task description to submit upon session startup
+    #[arg(value_name = "TASK")]
+    pub task: Option<String>,
 
     #[command(subcommand)]
     pub command: Option<Commands>,
