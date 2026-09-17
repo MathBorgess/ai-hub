@@ -18,15 +18,19 @@ const LOW_REMAINING_PCT: f64 = 20.0;
 
 fn read_cursor_token_blocking() -> Option<String> {
     read_cursor_ide_token().or_else(|| {
-        for path in cursor_auth_config_paths() {
-            if let Ok(data) = std::fs::read_to_string(&path) {
-                if let Some(jwt) = extract_cursor_jwt(&data) {
-                    return Some(jwt);
-                }
-            }
-        }
-        None
+        cursor_auth_config_paths()
+            .iter()
+            .find_map(|path| read_cursor_config_token_from_path(path))
     })
+}
+
+/// Reads a Cursor JWT from a JSON config file (e.g. `~/.config/cursor/auth.json`),
+/// independent of the desktop app's `state.vscdb`. Used by the config-file fallback
+/// (the only path available on a headless Linux box without the Cursor IDE) and
+/// directly by tests.
+pub fn read_cursor_config_token_from_path(path: &Path) -> Option<String> {
+    let data = std::fs::read_to_string(path).ok()?;
+    extract_cursor_jwt(&data)
 }
 
 /// Probes Cursor usage from Cursor IDE `state.vscdb` token and dashboard endpoints.

@@ -1,0 +1,6 @@
+{
+  "token": {
+    "accessToken": "synthetic-fixture-access-token",
+    "expiry": "2030-01-01T00:00:00Z"
+  }
+}
