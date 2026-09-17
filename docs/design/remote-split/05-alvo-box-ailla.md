@@ -23,9 +23,9 @@ O **ai-hub** é exatamente esse gap: um `aihubd` com policy, quota, multi-harnes
 | PID 1 | `tini` — **sem systemd** (`systemctl` ausente) |
 | `sshd` / `:22` | **Ausente** (sem openssh-server; nada escuta 22) |
 | `tmux` | **3.5a** presente |
-| `rustc` / `cargo` (distro) | **1.85.0** (Debian tarball) — **abaixo** do pin do repo (`rust-toolchain.toml` → **1.98.1**; `rust-version = "1.88"`) |
+| `rustc` / `cargo` | **rustup 1.98.1** ativo (`~/.cargo/bin`); distro 1.85 ainda no PATH se rustup não for sourcado |
 | `build-essential` / `cc` | **Presentes** (`/usr/bin/cc`, `gcc`, pacote `build-essential`) |
-| CLIs | `claude` ✓ · `codex` ✓ · `agy` ✓ · **`cursor-agent` / `agent` ausentes** |
+| CLIs | `claude` ✓ · `codex` ✓ · `agy` ✓ · **`cursor-agent`/`agent` 2026.09.15** (login headless pendente) |
 | Hermes A2A | processo em **`0.0.0.0:9900`** (não misturar com aihubd; aihubd continua só loopback) |
 | Auth broker / MCP | **`:9910`** loopback (`a2a.mathai.com.br` via named tunnel) |
 | Reports serve | **`:8787`** loopback (`reports.mathai.com.br` + Access) |
@@ -81,7 +81,7 @@ Regra invariante (docs 02/04 + MAT-223): **bind só `127.0.0.1:<porta>`**.
 | Caminho | Viabilidade nesta box | Notas |
 |---|---|---|
 | SSH `-L` → loopback | **Bloqueado hoje** (sem sshd) | Requer OK dono para openssh-server **ou** Tailscale SSH |
-| CF Tunnel Public Hostname → `127.0.0.1:9920` | **Viável** (padrão a2a/reports) | Hostname **novo** (ex. `aihub.mathai.com.br`); **nunca** reusar `a2a` / grants MCP |
+| CF Tunnel Public Hostname → `127.0.0.1:9920` | **Decidido; publicação no dashboard em curso** | Hostname **`aihub.mathai.com.br`** no named tunnel; **sem** Access; **nunca** reusar `a2a` / grants MCP |
 | Tailscale + SSH | Ausente | Opcional MAT-224 1ª; install à parte |
 | Expor `0.0.0.0` | **Proibido** | Anti-padrão |
 
@@ -94,7 +94,7 @@ Até haver SSH ou hostname Access, Fatias 1–2 testam-se **na própria box** (T
 | Claude Code | sim | Probe/credenciais headless: research + login assistido |
 | Codex | sim | Preferir padrões oficiais (`app-server` / ficheiros) onde couber |
 | Antigravity (`agy`) | sim | Probe macOS-only → Fatia 0; CLI pode existir sem quota probe |
-| Cursor Agent | **não** | Doc 03 não pode assumir 4/4; V1 na box = **3 harnesses** até install |
+| Cursor Agent | **em instalação (OK dono 2026-09-17)** | Após install+login, V1 pode ser **4 harnesses**; até login headless, router trata como ausente |
 
 ## 8. Lacunas de desenvolvimento (código)
 
@@ -124,7 +124,7 @@ Ordenadas pela migração em fatias do ADR §6:
 - [ ] Supervisão `nohup` + script; documentar órfãos `setsid`
 - [ ] `sessions.json` em disco para reconciliar PIDs no restart
 - [ ] Worktrees em `~/.local/share/aihub/worktrees` (não `/tmp` tmpfs)
-- [ ] Porta `9920` (ou config) + hostname CF **ou** sshd
+- [x] Porta `9920` + hostname CF `aihub.mathai.com.br` (sshd continua opcional)
 - [ ] Clone canónico do repo de trabalho na box; política de `git push` (Mac-push vs deploy key)
 
 ### Fatia 4 — quota / endurecimento
@@ -132,11 +132,22 @@ Ordenadas pela migração em fatias do ADR §6:
 - [ ] Rotação de log + sanitização de PTY
 - [ ] `aihub doctor --remote`
 
+## 8b. Decisões do dono (2026-09-17) — fechadas
+
+| Decisão | Valor | Implicação |
+|---|---|---|
+| Instalar toolchain / CLIs | **OK** | `rustup` 1.98.1 + `cursor-agent` na box |
+| Hostname CF | **`aihub.mathai.com.br`** → `http://127.0.0.1:9920` no named tunnel existente | **Não** reusar `a2a` / `reports`; sem Cloudflare Access neste host (auth de app) |
+| IdP de pareamento Mac↔`aihubd` | **GitHub** | Audience da credencial de pareamento = `aihubd` (distinto de MCP/`a2a`); fluxo Device Flow / OAuth GitHub do dono, alinhado ao padrão já usado em `a2a.mathai.com.br` |
+| Git push fase 1 | permanece Mac-first (Opção B) até nova ordem | Deploy key = fase posterior |
+
+Stub temporário: enquanto Fatia 3 não sobe `aihubd`, um HTTP stub em `127.0.0.1:9920` pode responder `aihubd-stub` para smoke do túnel — **não** é o daemon.
+
 ## 9. Lacunas de pesquisa (não-código / HITL)
 
 1. **ToS** Anthropic / OpenAI / Cursor / Google para CLI em VPS headless com conta pessoal — bloqueia spawn real de harness, não o esqueleto do daemon.
 2. **Credenciais headless** por CLI na box (OAuth device / ficheiros) sem copiar secrets para o vault.
-3. **IdP de pareamento Mac↔aihubd** — reusar superfície existente (CF Access OTP só-dono? GitHub Device Flow do broker?) **sem** misturar audience MCP/`a2a`.
+3. ~~**IdP de pareamento**~~ — **fechado: GitHub**, audience `aihubd` (sem misturar MCP/`a2a`). Restam: desenho do Device Flow no Hello v3 + allowlist de user GitHub do dono.
 4. **Probe Antigravity em Linux** — onde a sessão realmente vive no disco após `agy` login.
 5. **Capacidade de build** — medição: tempo/`target/` size de `cargo build --release -p aihubd` após rustup 1.98.1.
 6. **Comparativo day-1** — escrever checklist T0–T5 tmux (MAT-223) vs DoD Fatia 3 aihubd (o que o mux não entrega: policy, quota push, multi-session handles).
@@ -148,13 +159,15 @@ Este PR de docs considera o Remote Split **implementável na box Ailla** quando:
 - [x] Inventário da box documentado (este ficheiro)
 - [x] Contradição canal duplo resolvida por **channel_ticket** (ADR atualizado)
 - [x] Porta/colisão e regra “não usar a2a” documentadas
-- [x] Harnesses 3/4 (sem cursor-agent) explícitos
+- [x] Hostname CF `aihub.mathai.com.br` + IdP GitHub decididos (2026-09-17)
+- [x] OK dono para instalar rustup + cursor-agent
+- [ ] Harnesses: cursor-agent instalado + login headless (após install)
 - [ ] Dono OK escrito em ToS (pesquisa) — gate de **spawn**, não de coding Fatia 0–2
 - [ ] Issue(s) Linear abertas para Fatia 0 e Fatia 1 com DoD testável
 
 ## 11. Fora de escopo deste documento
 
 - Implementar Rust / abrir Fatia 0 neste PR
-- Instalar sshd / rustup / CF hostname sem OK do dono
+- Instalar sshd sem OK do dono (rustup/CF/cursor-agent já autorizados 2026-09-17)
 - Alterar broker MCP / reports
 - Invalidar day-1 tmux

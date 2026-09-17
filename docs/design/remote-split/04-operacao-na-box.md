@@ -91,7 +91,7 @@ O transporte de hoje é **Unix Domain Socket local**: `~/.local/share/aihub/aihu
 
 **Como o Mac alcança essa porta loopback:** o padrão já validado na box do dono é **túnel nomeado apontando para a porta em loopback**, com a regra dura de que túnel e zona DNS precisam estar na mesma conta do provedor — quando não estão, a borda recusa e o sintoma não é óbvio (confirmado operacionalmente na wiki privada; aqui citado como princípio, não como implantação). Esse túnel é a fronteira que a sessão 02 protege com autenticação; este documento só garante que, sem o túnel, a porta não é alcançável de fora da box.
 
-**Colisão de portas na box Ailla (2026-09-17):** `:8787` reports, `:9900` Hermes, `:9910` auth-broker/MCP já em uso. Sugestão de desenho para `aihubd` TCP: **`127.0.0.1:9920`**. Hostname CF, se houver, deve ser **novo** (ex. `aihub.mathai.com.br`) — **nunca** reusar `a2a.mathai.com.br` nem grants MCP. SSH `-L` está bloqueado hoje (sem sshd). Ver [05](05-alvo-box-ailla.md) §6.
+**Colisão de portas na box Ailla (2026-09-17):** `:8787` reports, `:9900` Hermes, `:9910` auth-broker/MCP já em uso. `aihubd` TCP: **`127.0.0.1:9920`**. Hostname CF **decidido:** **`aihub.mathai.com.br`** no named tunnel (sem Access; auth de app via GitHub) — **nunca** reusar `a2a.mathai.com.br` nem grants MCP. SSH `-L` continua opcional (sem sshd hoje). Ver [05](05-alvo-box-ailla.md) §6 e §8b.
 
 **O que autorizaria bind além de loopback:** nada, por padrão. Um cenário hipotético — a box já estar numa rede privada confiável (ex. mesma VPC/WireGuard) sem precisar de túnel público — mudaria isso, mas é uma pergunta em aberto sobre a topologia real da box que este desenho não assume.
 
@@ -155,5 +155,5 @@ Ainda abertas:
 1. **OK para instalar rustup 1.98.1** (e medir se `cargo build --release -p aihubd` cabe em disco/RAM).
 2. **Quem tem credencial git de push** (§6) — fase 1 recomenda push via Mac.
 3. **Upgrade de supervisão** (`supervisord`/`runit`) agora vs depois.
-4. **Caminho remoto Mac→9920:** CF hostname novo vs openssh-server / Tailscale.
+4. ~~Caminho remoto~~ — **fechado:** `aihub.mathai.com.br` (CF). sshd/Tailscale ficam opcionais.
 5. **Rotação de log** (`logrotate` vs truncamento no script) — checar pacote na install.

@@ -132,3 +132,10 @@ Nenhum desses três é dimensionado neste documento — os números concretos (q
 2. **Canal de revogação de emergência** (Pergunta 7): confirmar se é o mesmo IdP de aprovação ou um caminho separado, e se esse caminho funciona a partir de um dispositivo diferente do laptop supostamente roubado.
 3. **Os números concretos de limite** (Pergunta 9): teto de conexões não autenticadas simultâneas, janela e teto do rate limit de handshake, tamanho de frame pré-autenticação — dependem de uso real que este desenho não tem como estimar.
 4. **Se algum outro serviço de rede além de `aihubd`** está no horizonte próximo — determina se a decisão da Pergunta 0 (sem broker separado) continua certa ou se um componente de broker passa a valer o custo.
+
+
+---
+
+## Adenda 2026-09-17 — IdP escolhido
+
+**IdP de pareamento Mac↔`aihubd`:** GitHub (conta do dono). A credencial emitida após prova de posse / Device Flow deve carregar `audience = "aihubd"` e **não** ser aceita pelo broker MCP/`a2a`. Allowlist do principal GitHub fica na config da box. Cloudflare Access **não** é obrigatório neste hostname (`aihub.mathai.com.br`); a fronteira de app é este IdP.

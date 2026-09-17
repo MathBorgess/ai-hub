@@ -227,14 +227,18 @@ flowchart TD
 Fechadas pelo inventário / desenho (ver [05](05-alvo-box-ailla.md)):
 - Box alvo = Ailla; build default = nativo com rustup **1.98.1** + `cc` já presente.
 - Canal duplo = **channel_ticket** (Opção B).
-- Porta TCP sugerida = `127.0.0.1:9920`; **não** reusar `a2a` / `:9910` / `:9900` / `:8787`.
-- V1 harnesses na box = **3** (`claude`, `codex`, `agy`); `cursor-agent` ausente até install.
+- Porta TCP = `127.0.0.1:9920`; hostname público = **`aihub.mathai.com.br`**; **não** reusar `a2a` / `:9910` / `:9900` / `:8787`.
+- IdP pareamento = **GitHub** (`audience=aihubd`).
+- Harnesses: `claude` / `codex` / `agy` + **`cursor-agent` em instalação** (V1 pode passar a 4 após login).
 - Day-1 tmux permanece até Fatia 3.
 
-Ainda precisam do dono:
-1. **ToS headless** (Anthropic / OpenAI / Google; Cursor se/quando instalado) — gate de spawn.
+Fechadas pelo dono em **2026-09-17** (além do inventário):
+- OK instalar **rustup 1.98.1** + **cursor-agent**.
+- Caminho Mac→loopback: CF **`aihub.mathai.com.br`** → `127.0.0.1:9920` (sem Access; sshd continua opcional).
+- IdP de pareamento: **GitHub** (audience `aihubd`, separado de MCP/`a2a`).
+
+Ainda precisam do dono / pesquisa:
+1. **ToS headless** (Anthropic / OpenAI / Google / Cursor) — gate de spawn.
 2. **Homologar transporte:** WebSocket/TLS + `channel_ticket` (recomendado) vs QUIC.
-3. **Caminho Mac→loopback:** CF hostname novo (ex. `aihub.mathai.com.br` + Access) **ou** openssh-server / Tailscale SSH (hoje sem `:22`).
-4. **IdP de pareamento** Mac↔`aihubd` (audience `aihubd`, sem misturar MCP/`a2a`).
-5. **Git push:** (B) via Mac na fase 1 vs (A) deploy key na box.
-6. **OK para instalar rustup 1.98.1** (e, se quiser Fatia 3 remota, sshd ou hostname CF).
+3. **Git push:** (B) via Mac na fase 1 vs (A) deploy key na box — default desenhado = B.
+4. **Allowlist GitHub** do principal (username/id) para o primeiro pareamento.
