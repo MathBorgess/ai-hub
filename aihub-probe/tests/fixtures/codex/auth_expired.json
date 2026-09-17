@@ -1,0 +1,8 @@
+{
+  "tokens": {
+    "access_token": "fabricated-codex-token-expired",
+    "refresh_token": "fabricated-codex-refresh-expired",
+    "account_id": "fabricated-account-abc",
+    "expires_at": "2020-01-01T00:00:00.000Z"
+  }
+}

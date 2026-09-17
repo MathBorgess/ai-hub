@@ -1,0 +1,57 @@
+[workspace]
+resolver = "2"
+members = [
+    "aihub-core",
+    "aihub-probe",
+    "aihub-router",
+    "aihub-pty",
+    "aihub-git",
+    "aihub-memory",
+    "aihubd",
+    "aihub",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+authors = ["MathBorgess"]
+
+[workspace.dependencies]
+# Shared core crates
+aihub-core = { path = "aihub-core" }
+aihub-probe = { path = "aihub-probe" }
+aihub-router = { path = "aihub-router" }
+aihub-pty = { path = "aihub-pty" }
+aihub-git = { path = "aihub-git" }
+aihub-memory = { path = "aihub-memory" }
+
+# Async runtime & networking
+tokio = { version = "1.43", features = ["full"] }
+tokio-util = { version = "0.7.13", features = ["codec"] }
+reqwest = { version = "0.12.12", default-features = false, features = ["rustls-tls", "json"] }
+bytes = "1.10"
+
+# Serialization & error handling
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+thiserror = "2.0.12"
+base64 = "0.22.1"
+
+# CLI & binaries (anyhow, clap)
+anyhow = "1.0.97"
+clap = { version = "4.5.31", features = ["derive"] }
+
+# Terminal & PTY
+portable-pty = "0.8.1"
+ratatui = "0.29.0"
+crossterm = { version = "0.28.1", features = ["event-stream"] }
+vt100 = "0.15.2"
+
+# Database & OS
+rusqlite = { version = "0.33.0", features = ["bundled"] }
+security-framework = "3.2.0"
+
+# Utilities & test
+regex = "1.11.1"
+tempfile = "3.17.1"
