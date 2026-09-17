@@ -1,19 +1,23 @@
 //! Foreground Unix socket supervisor. Client lifetimes never own child PTYs.
+pub mod auth;
+use crate::auth::{Allowlist, PrincipalId};
 use aihub_core::*;
 use aihub_pty::{PtySize, PtySpawnOptions};
 use anyhow::{anyhow, bail, Result};
+use rand::Rng;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
+    net::SocketAddr,
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
     time::Duration,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{UnixListener, UnixStream},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::{TcpListener, UnixListener},
     sync::{broadcast, mpsc, Mutex},
     task::JoinSet,
 };
@@ -276,6 +280,26 @@ struct Session {
     hold_task: Option<tokio::task::JoinHandle<()>>,
     recommendation_id: u64,
     current_recommendation: Option<RouteOutcome>,
+    /// Principal that created this session (01-transporte-e-sessao.md §4). Attach and every
+    /// other session-scoped operation are vetoed for any other principal, even if they know
+    /// the `SessionId` — mere possession of the handle confers no authorization.
+    owner: PrincipalId,
+}
+
+/// Pending destructive confirmation for `MergeRequest` over a network-authenticated connection
+/// (ADR §2.3 nível 3). Distinct from the plain UDS "repeat to confirm" flow: here confirmation
+/// is a fresh signed envelope over a one-time nonce, delivered as a second `Hello.credential`
+/// on the same connection, never a bare repeat of `MergeRequest` itself.
+#[derive(Clone)]
+struct MergeConfirm {
+    session_id: SessionId,
+    strategy: MergeStrategy,
+    diff: String,
+    nonce: Vec<u8>,
+    path: PathBuf,
+    base: String,
+    branch: String,
+    origin: PathBuf,
 }
 
 struct HoldDispatchPlan {
@@ -290,6 +314,12 @@ struct Client {
     attached: HashSet<SessionId>,
     // Contract has no separate preview message: repeat a matching request to confirm.
     merge: Option<(SessionId, MergeStrategy, String)>,
+    /// Identity established at handshake (ADR §2.3): `PrincipalId::local()` for every Unix
+    /// socket connection, a key fingerprint for a network connection that proved possession.
+    principal: PrincipalId,
+    /// Set while a network principal's destructive `MergeRequest` awaits its signed envelope
+    /// (see `MergeConfirm`). Always `None` for local connections.
+    merge_confirm: Option<MergeConfirm>,
 }
 #[derive(Default)]
 struct State {
@@ -397,6 +427,11 @@ pub struct Daemon {
     catalog_paths: Arc<CatalogPath>,
     drain: Arc<Drain>,
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// Owner-approved public keys (ADR §2.3). Default empty: loaded once at construction via
+    /// `Allowlist::load()`, never re-read per connection.
+    allowlist: Arc<Allowlist>,
+    /// Durable audit log path (`~/.local/share/aihub/log/audit.jsonl` by default, ADR §2.3 §6).
+    audit_path: PathBuf,
 }
 
 impl Daemon {
@@ -510,7 +545,22 @@ impl Daemon {
             // No-op by default: tests must never poll a real ai-memory on 127.0.0.1:49374.
             // main.rs opts in explicitly via `with_drain`.
             drain: Arc::new(|| Box::pin(async { Ok(0) })),
+            allowlist: Arc::new(Allowlist::load()),
+            audit_path: auth::audit_log_path(),
         }
+    }
+
+    /// Overrides the owner-approved public key allowlist (default: `Allowlist::load()`, empty
+    /// unless the owner configured one via env/file — ADR §2.3).
+    pub fn with_allowlist(mut self, allowlist: Allowlist) -> Self {
+        self.allowlist = Arc::new(allowlist);
+        self
+    }
+
+    /// Overrides the durable audit log path (default: `~/.local/share/aihub/log/audit.jsonl`).
+    pub fn with_audit_log_path(mut self, path: PathBuf) -> Self {
+        self.audit_path = path;
+        self
     }
 
     pub fn with_catalog_paths<C>(mut self, resolver: C) -> Self
@@ -644,7 +694,22 @@ impl Daemon {
         prompt: Option<String>,
     ) -> Result<SessionId> {
         let mut state = self.state.lock().await;
-        self.add_locked(&mut state, repo, wt, harness, prompt)
+        self.add_locked(&mut state, repo, wt, harness, prompt, PrincipalId::local())
+    }
+
+    /// Same as `add_session`, but bound to an explicit owner (ADR §2.3, §4) instead of the
+    /// local pseudo-principal. Lets tests exercise cross-principal attach without a real
+    /// network handshake for the session-creation step.
+    pub async fn add_session_owned(
+        &self,
+        repo: PathBuf,
+        wt: aihub_git::SessionWorktree,
+        harness: HarnessId,
+        prompt: Option<String>,
+        owner: PrincipalId,
+    ) -> Result<SessionId> {
+        let mut state = self.state.lock().await;
+        self.add_locked(&mut state, repo, wt, harness, prompt, owner)
     }
 
     /// Explicitly switches a session to a target harness, returning the handoff destination.
@@ -745,6 +810,56 @@ impl Daemon {
         }
     }
 
+    /// Quiesces the session and finalizes the git merge/discard (shared by the local
+    /// "repeat MergeRequest to confirm" flow and the network signed-envelope flow above).
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_merge(
+        &self,
+        state: &mut State,
+        client: u64,
+        session_id: SessionId,
+        strategy: MergeStrategy,
+        diff: String,
+        path: PathBuf,
+        base: String,
+        branch: String,
+        origin: PathBuf,
+    ) -> Result<()> {
+        // F4: an unconfirmed stop refuses to finalize Git; never launch a
+        // replacement and never reach the final diff below.
+        self.quiesce(state, &session_id).await?;
+        // Only after the child group is reaped do they take the final diff
+        let stopped_diff = (self.git_diff)(&path, &base, true).await?;
+        if stopped_diff != diff {
+            if let Some(c) = state.clients.get_mut(&client) {
+                c.merge = Some((session_id.clone(), strategy, stopped_diff.clone()));
+            }
+            state.send(client, DaemonMessage::MergeResult {
+                session_id,
+                success: false,
+                diff: stopped_diff,
+                message: "Agent stopped; final diff changed. Review and repeat MergeRequest to confirm.".into(),
+            });
+            return Ok(());
+        }
+        let outcome = (self.git_finish)(&path, strategy, &base, &branch, &origin).await?;
+        log_lifecycle(
+            "INFO",
+            "session merge",
+            &format!(
+                "session_id={} strategy={} success={}",
+                session_id, strategy, outcome.success
+            ),
+        );
+        state.broadcast(DaemonMessage::MergeResult {
+            session_id,
+            success: outcome.success,
+            diff: outcome.diff,
+            message: outcome.message,
+        });
+        Ok(())
+    }
+
     /// Waits for an autonomous recommendation's hold to pass, then dispatches it if the
     /// session is still eligible (R10). Tracked in `session.hold_task` separately from `session.tasks`
     /// so that quiescence does not cancel the in-flight switch timer.
@@ -810,6 +925,7 @@ impl Daemon {
         wt: aihub_git::SessionWorktree,
         harness: HarnessId,
         prompt: Option<String>,
+        owner: PrincipalId,
     ) -> Result<SessionId> {
         if state
             .sessions
@@ -842,6 +958,7 @@ impl Daemon {
             hold_task: None,
             recommendation_id: 0,
             current_recommendation: None,
+            owner,
         };
         self.watch(&mut session);
         log_lifecycle(
@@ -952,7 +1069,7 @@ impl Daemon {
             tokio::select! {
                 _ = &mut shutdown => break Ok(()),
                 accepted = listener.accept() => match accepted {
-                    Ok((stream, _)) => { let daemon = self.clone(); tasks.spawn(async move { let _ = daemon.client(stream).await; }); },
+                    Ok((stream, _)) => { let daemon = self.clone(); tasks.spawn(async move { let _ = daemon.client(stream, true).await; }); },
                     Err(error) => {
                         if error.kind() == std::io::ErrorKind::ConnectionAborted
                             || error.kind() == std::io::ErrorKind::Interrupted
@@ -1005,6 +1122,39 @@ impl Daemon {
         }
         log_lifecycle("INFO", "shutdown", "daemon shutdown complete");
         result
+    }
+
+    /// Network listener: every connection must prove possession of an allowlisted key before
+    /// admission (ADR §2.3, §6) — the opposite trust model of `run()`'s Unix socket, and never
+    /// shared with it (ADR §6, "O que isso quebra"). Loopback-only in this slice; a deployable
+    /// remote transport (WebSocket, tunnel wiring) is session 04's scope.
+    pub async fn run_tcp(
+        &self,
+        addr: SocketAddr,
+        shutdown: impl Future<Output = ()>,
+    ) -> Result<()> {
+        log_lifecycle("INFO", "start_tcp", &format!("daemon listening on {addr}"));
+        let listener = TcpListener::bind(addr).await?;
+        let mut tasks = JoinSet::new();
+        tokio::pin!(shutdown);
+        loop {
+            tokio::select! {
+                _ = &mut shutdown => break,
+                accepted = listener.accept() => match accepted {
+                    Ok((stream, _)) => {
+                        let _ = stream.set_nodelay(true);
+                        let daemon = self.clone();
+                        tasks.spawn(async move { let _ = daemon.client(stream, false).await; });
+                    }
+                    Err(_) => continue,
+                },
+                Some(_) = tasks.join_next() => {},
+            }
+        }
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        log_lifecycle("INFO", "shutdown_tcp", "network listener shutdown complete");
+        Ok(())
     }
 
     async fn quota_loop(&self) {
@@ -1071,32 +1221,218 @@ impl Daemon {
             }
         }
     }
-    async fn client(&self, stream: UnixStream) -> Result<()> {
-        let (mut reader, mut writer) = stream.into_split();
-        let hello =
-            tokio::time::timeout(Duration::from_secs(10), read_message(&mut reader)).await??;
+    /// Negotiates the handshake for one connection and returns the principal it authenticates
+    /// as, or `None` if the connection was already rejected (`DaemonMessage::Unauthorized`
+    /// written, caller closes). `is_local` decides which trust model applies (ADR §6):
+    /// the Unix socket listener admits v2/uncredentialed clients unconditionally, the network
+    /// listener fails closed on anything short of verified proof of possession.
+    async fn authenticate<R, W>(
+        &self,
+        reader: &mut R,
+        writer: &mut W,
+        is_local: bool,
+    ) -> Result<Option<PrincipalId>>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        let hello = tokio::time::timeout(Duration::from_secs(10), read_message(reader)).await??;
+        let version = match &hello {
+            ClientMessage::Hello { version, .. } => *version,
+            _ => {
+                writer
+                    .write_all(&encode_frame(
+                        &error("protocol", "expected Hello at connection start").into(),
+                    )?)
+                    .await?;
+                return Ok(None);
+            }
+        };
+        if is_local {
+            if version != 2 && version != PROTOCOL_VERSION {
+                writer
+                    .write_all(&encode_frame(
+                        &error("protocol", "unsupported protocol version").into(),
+                    )?)
+                    .await?;
+                return Ok(None);
+            }
+            writer
+                .write_all(&encode_frame(
+                    &DaemonMessage::Hello {
+                        version: PROTOCOL_VERSION,
+                    }
+                    .into(),
+                )?)
+                .await?;
+            return Ok(Some(PrincipalId::local()));
+        }
+        if version != PROTOCOL_VERSION {
+            auth::audit_log(
+                &self.audit_path,
+                "handshake_rejected",
+                None,
+                &auth::AuthReject::UnsupportedVersion.to_string(),
+            );
+            writer
+                .write_all(&encode_frame(&DaemonMessage::Unauthorized.into())?)
+                .await?;
+            return Ok(None);
+        }
+        let mut nonce = [0u8; 32];
+        rand::rng().fill_bytes(&mut nonce);
         writer
             .write_all(&encode_frame(
-                &DaemonMessage::Hello {
-                    version: PROTOCOL_VERSION,
+                &DaemonMessage::Challenge {
+                    nonce: nonce.to_vec().into(),
                 }
                 .into(),
             )?)
             .await?;
-        if !matches!(
-            hello,
+        let proof = tokio::time::timeout(Duration::from_secs(10), read_message(reader)).await??;
+        let credential = match proof {
             ClientMessage::Hello {
-                version: PROTOCOL_VERSION,
+                credential: Some(c),
                 ..
+            } => c,
+            _ => {
+                auth::audit_log(
+                    &self.audit_path,
+                    "handshake_rejected",
+                    None,
+                    &auth::AuthReject::MissingCredential.to_string(),
+                );
+                writer
+                    .write_all(&encode_frame(&DaemonMessage::Unauthorized.into())?)
+                    .await?;
+                return Ok(None);
             }
-        ) {
-            writer
-                .write_all(&encode_frame(
-                    &error("protocol", "expected Hello with protocol version 1").into(),
-                )?)
-                .await?;
-            return Ok(());
+        };
+        match auth::verify_credential(&credential, &nonce, (self.clock)(), &self.allowlist) {
+            Ok(principal) => {
+                auth::audit_log(
+                    &self.audit_path,
+                    "handshake_accepted",
+                    Some(&principal),
+                    "proof of possession verified",
+                );
+                writer
+                    .write_all(&encode_frame(
+                        &DaemonMessage::Hello {
+                            version: PROTOCOL_VERSION,
+                        }
+                        .into(),
+                    )?)
+                    .await?;
+                Ok(Some(principal))
+            }
+            Err(reason) => {
+                auth::audit_log(
+                    &self.audit_path,
+                    "handshake_rejected",
+                    None,
+                    &reason.to_string(),
+                );
+                writer
+                    .write_all(&encode_frame(&DaemonMessage::Unauthorized.into())?)
+                    .await?;
+                Ok(None)
+            }
         }
+    }
+
+    /// Sends the opaque `Unauthorized` response and records the real reason internally
+    /// (ADR §2.3, §6: fail closed, no oracle — the caller never sees `reason`).
+    fn reject_unauthorized(
+        &self,
+        state: &mut State,
+        client: u64,
+        event: &str,
+        principal: Option<&PrincipalId>,
+        reason: &str,
+    ) {
+        auth::audit_log(&self.audit_path, event, principal, reason);
+        state.send(client, DaemonMessage::Unauthorized);
+    }
+
+    /// Verifies the signed envelope for a pending destructive `MergeRequest` confirmation
+    /// (ADR §2.3 nível 3) and finalizes the merge on success. The nonce is one-time use: it was
+    /// already removed from `Client::merge_confirm` by the caller before this runs, so a replay
+    /// of the same signature never matches a still-pending confirmation again.
+    async fn confirm_merge_envelope(
+        &self,
+        client: u64,
+        pending: MergeConfirm,
+        credential: &ClientCredential,
+    ) {
+        let now = (self.clock)();
+        let verified = auth::verify_credential(credential, &pending.nonce, now, &self.allowlist);
+        let mut state = self.state.lock().await;
+        let connection_principal = state.clients.get(&client).map(|c| c.principal.clone());
+        let principal = match verified {
+            Ok(p) if Some(&p) == connection_principal.as_ref() => p,
+            Ok(_) => {
+                auth::audit_log(
+                    &self.audit_path,
+                    "merge_envelope_rejected",
+                    None,
+                    "envelope key does not match this connection's own principal",
+                );
+                state.send(client, DaemonMessage::Unauthorized);
+                return;
+            }
+            Err(reason) => {
+                auth::audit_log(
+                    &self.audit_path,
+                    "merge_envelope_rejected",
+                    None,
+                    &reason.to_string(),
+                );
+                state.send(client, DaemonMessage::Unauthorized);
+                return;
+            }
+        };
+        auth::audit_log(
+            &self.audit_path,
+            "merge_envelope_verified",
+            Some(&principal),
+            "one-time nonce consumed, finalizing merge",
+        );
+        if let Err(e) = self
+            .finish_merge(
+                &mut state,
+                client,
+                pending.session_id,
+                pending.strategy,
+                pending.diff,
+                pending.path,
+                pending.base,
+                pending.branch,
+                pending.origin,
+            )
+            .await
+        {
+            let response = if e.downcast_ref::<StopUnconfirmed>().is_some() {
+                error("stop_unconfirmed", &e.to_string())
+            } else {
+                error("request_failed", "request could not be completed")
+            };
+            state.send(client, response);
+        }
+    }
+
+    async fn client<S>(&self, stream: S, is_local: bool) -> Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (mut reader, mut writer) = tokio::io::split(stream);
+        let principal = match self
+            .authenticate(&mut reader, &mut writer, is_local)
+            .await?
+        {
+            Some(p) => p,
+            None => return Ok(()),
+        };
         let (tx, mut rx) = mpsc::channel(128);
         let id;
         {
@@ -1112,6 +1448,8 @@ impl Daemon {
                     sender: tx,
                     attached: HashSet::new(),
                     merge: None,
+                    principal: principal.clone(),
+                    merge_confirm: None,
                 },
             );
         }
@@ -1127,6 +1465,47 @@ impl Daemon {
                 _ = writing.join_next() => break,
                 message = read_message(&mut reader) => match message { Ok(m) => m, Err(_) => break },
             };
+            // A mid-connection Hello only means something while a destructive MergeRequest
+            // envelope is pending (ADR §2.3 nível 3); otherwise it falls through to `handle()`'s
+            // ordinary "Hello is only valid at connection start" rejection, unchanged.
+            if let ClientMessage::Hello {
+                credential: Some(ref cred),
+                ..
+            } = message
+            {
+                let pending = self
+                    .state
+                    .lock()
+                    .await
+                    .clients
+                    .get_mut(&id)
+                    .and_then(|c| c.merge_confirm.take());
+                if let Some(pending) = pending {
+                    self.confirm_merge_envelope(id, pending, cred).await;
+                    continue;
+                }
+            }
+            if let Some(sid) = message_session_id(&message) {
+                let owned_by_caller = {
+                    let state = self.state.lock().await;
+                    match state.sessions.iter().find(|s| &s.summary.session_id == sid) {
+                        Some(s) => s.owner == principal,
+                        // Let the ordinary "session not found" error report through `handle()`.
+                        None => true,
+                    }
+                };
+                if !owned_by_caller {
+                    let mut state = self.state.lock().await;
+                    self.reject_unauthorized(
+                        &mut state,
+                        id,
+                        "session_wrong_owner",
+                        Some(&principal),
+                        &format!("touched session {sid} it does not own"),
+                    );
+                    continue;
+                }
+            }
             // A disconnect must not cancel a switch after the incoming PTY starts.
             if let Err(e) = self.handle(id, message).await {
                 let response = if e.downcast_ref::<StopUnconfirmed>().is_some() {
@@ -1161,16 +1540,16 @@ impl Daemon {
                 initial_prompt,
             } => {
                 state.next_id += 1;
-                let id = SessionId::new(format!(
-                    "{}-{}-{}",
-                    std::process::id(),
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)?
-                        .as_nanos(),
-                    state.next_id
-                ));
+                // CSPRNG, not the old pid-nanos-counter scheme: predictable session ids are
+                // enumerable and therefore unsafe as bearer-equivalent handles (ADR §2.2, §4).
+                let id = SessionId::generate();
+                let owner = state
+                    .clients
+                    .get(&client)
+                    .map(|c| c.principal.clone())
+                    .unwrap_or_else(PrincipalId::local);
                 let wt = aihub_git::create_session_worktree(&repo_path, &id, None).await?;
-                self.add_locked(&mut state, repo_path, wt, harness, initial_prompt)?;
+                self.add_locked(&mut state, repo_path, wt, harness, initial_prompt, owner)?;
             }
             ClientMessage::Attach { target, .. } => {
                 let s = state
@@ -1182,6 +1561,24 @@ impl Daemon {
                         SessionTarget::LatestForRepo(repo) => &s.summary.repo_path == repo,
                     })
                     .ok_or_else(|| anyhow!("session not found"))?;
+                let caller = state
+                    .clients
+                    .get(&client)
+                    .map(|c| c.principal.clone())
+                    .unwrap_or_else(PrincipalId::local);
+                if s.owner != caller {
+                    // 01-transporte-e-sessao.md §4: mere possession of `SessionId` confers no
+                    // authorization. The caller never learns whose session this is.
+                    let owner = s.owner.clone();
+                    self.reject_unauthorized(
+                        &mut state,
+                        client,
+                        "attach_wrong_owner",
+                        Some(&caller),
+                        &format!("tried to attach session owned by {owner}"),
+                    );
+                    return Ok(());
+                }
                 let (id, scrollback, summary) = (
                     s.summary.session_id.clone(),
                     s.pty.scrollback.clone(),
@@ -1403,54 +1800,65 @@ impl Daemon {
                     )
                 };
                 let diff = (self.git_diff)(&path, &base, true).await?;
-                let c = state
+                let is_local = state
                     .clients
-                    .get_mut(&client)
-                    .ok_or_else(|| anyhow!("client disconnected"))?;
-                let confirmation = (session_id.clone(), strategy, diff.clone());
-                if c.merge.as_ref() != Some(&confirmation) {
-                    c.merge = Some(confirmation);
+                    .get(&client)
+                    .map(|c| c.principal == PrincipalId::local())
+                    .unwrap_or(true);
+                if is_local {
+                    let c = state
+                        .clients
+                        .get_mut(&client)
+                        .ok_or_else(|| anyhow!("client disconnected"))?;
+                    let confirmation = (session_id.clone(), strategy, diff.clone());
+                    if c.merge.as_ref() != Some(&confirmation) {
+                        c.merge = Some(confirmation);
+                        state.send(client, DaemonMessage::MergeResult {
+                            session_id,
+                            success: false,
+                            diff,
+                            message: "Review diff; repeat MergeRequest with the same strategy to confirm. A changed diff requires review again.".into()
+                        });
+                    } else {
+                        c.merge = None;
+                        self.finish_merge(
+                            &mut state, client, session_id, strategy, diff, path, base, branch,
+                            origin,
+                        )
+                        .await?;
+                    }
+                } else {
+                    // ADR §2.3 nível 3: destrutiva sobre rede exige envelope assinado
+                    // independente com nonce de uso único — nunca a mera repetição do
+                    // MergeRequest anterior (isso seria só um segundo uso da mesma prova de
+                    // posse feita no handshake). O envelope chega como um `Hello.credential`
+                    // subsequente na mesma conexão, assinando o nonce abaixo.
+                    let mut nonce = [0u8; 32];
+                    rand::rng().fill_bytes(&mut nonce);
+                    if let Some(c) = state.clients.get_mut(&client) {
+                        c.merge_confirm = Some(MergeConfirm {
+                            session_id: session_id.clone(),
+                            strategy,
+                            diff: diff.clone(),
+                            nonce: nonce.to_vec(),
+                            path,
+                            base,
+                            branch,
+                            origin,
+                        });
+                    }
                     state.send(client, DaemonMessage::MergeResult {
                         session_id,
                         success: false,
                         diff,
-                        message: "Review diff; repeat MergeRequest with the same strategy to confirm. A changed diff requires review again.".into()
+                        message: "Destructive confirmation requires proof of possession: sign the issued nonce and resend Hello to confirm.".into(),
                     });
-                } else {
-                    c.merge = None;
-                    // F4: an unconfirmed stop refuses to finalize Git; never launch a
-                    // replacement and never reach the final diff below.
-                    self.quiesce(&mut state, &session_id).await?;
-                    // Only after the child group is reaped do they take the final diff
-                    let stopped_diff = (self.git_diff)(&path, &base, true).await?;
-                    if stopped_diff != diff {
-                        if let Some(c) = state.clients.get_mut(&client) {
-                            c.merge = Some((session_id.clone(), strategy, stopped_diff.clone()));
-                        }
-                        state.send(client, DaemonMessage::MergeResult {
-                            session_id,
-                            success: false,
-                            diff: stopped_diff,
-                            message: "Agent stopped; final diff changed. Review and repeat MergeRequest to confirm.".into(),
-                        });
-                        return Ok(());
-                    }
-                    let outcome =
-                        (self.git_finish)(&path, strategy, &base, &branch, &origin).await?;
-                    log_lifecycle(
-                        "INFO",
-                        "session merge",
-                        &format!(
-                            "session_id={} strategy={} success={}",
-                            session_id, strategy, outcome.success
-                        ),
+                    state.send(
+                        client,
+                        DaemonMessage::Challenge {
+                            nonce: nonce.to_vec().into(),
+                        },
                     );
-                    state.broadcast(DaemonMessage::MergeResult {
-                        session_id,
-                        success: outcome.success,
-                        diff: outcome.diff,
-                        message: outcome.message,
-                    });
                 }
             }
             ClientMessage::SubmitTask { session_id, task } => {
@@ -1726,6 +2134,22 @@ fn options(cwd: PathBuf, initial_prompt: Option<String>) -> PtySpawnOptions {
         size: PtySize::default(),
     }
 }
+/// Session a `ClientMessage` already addresses, for the ownership pre-check in `client()`
+/// (01-transporte-e-sessao.md §4). `Attach` is checked separately inside `handle()` itself,
+/// since `SessionTarget::LatestForRepo` has no `session_id` to inspect up front.
+fn message_session_id(message: &ClientMessage) -> Option<&SessionId> {
+    match message {
+        ClientMessage::Detach { session_id }
+        | ClientMessage::PtyInput { session_id, .. }
+        | ClientMessage::PtyResize { session_id, .. }
+        | ClientMessage::SetMode { session_id, .. }
+        | ClientMessage::SwitchHarness { session_id, .. }
+        | ClientMessage::MergeRequest { session_id, .. }
+        | ClientMessage::SubmitTask { session_id, .. }
+        | ClientMessage::AcceptRecommendation { session_id, .. } => Some(session_id),
+        _ => None,
+    }
+}
 fn error(code: &str, message: &str) -> DaemonMessage {
     DaemonMessage::Error {
         code: code.into(),
@@ -1771,6 +2195,7 @@ pub async fn shutdown_signal() {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::UnixStream;
 
     #[tokio::test]
     async fn connected_clients_get_hello_cache_and_broadcast() {
@@ -1790,7 +2215,7 @@ mod tests {
             let (mut client, server) = UnixStream::pair().unwrap();
             let d = daemon.clone();
             workers.spawn(async move {
-                d.client(server).await.unwrap();
+                d.client(server, true).await.unwrap();
             });
             client
                 .write_all(
@@ -1989,6 +2414,8 @@ mod tests {
                 sender: tx,
                 attached: HashSet::new(),
                 merge: None,
+                principal: PrincipalId::local(),
+                merge_confirm: None,
             },
         );
         let d = daemon.clone();
