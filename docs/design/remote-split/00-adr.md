@@ -1,7 +1,7 @@
 # ADR 00: Arquitetura da Separação Remota (`aihub Remote Split`)
 
-- **Status:** **PROPOSTO / NO-GO PARA IMPLEMENTAÇÃO IMEDIATA**
-- **Data:** 2026-09-17
+- **Status:** **GO CONDICIONAL** (desenho fechado para Fatias 0–2 em código; spawn de harnesses e Fatia 3 de rede ainda gated)
+- **Data:** 2026-09-17 (rev. inventário box Ailla)
 - **Princípios base:**
   - `wiki/principles/architecture-decision-records`
   - `wiki/principles/explicit-handles-over-transport-sessions`
@@ -12,16 +12,24 @@
   - [02-fronteira-de-confianca.md](02-fronteira-de-confianca.md)
   - [03-credenciais-e-quota.md](03-credenciais-e-quota.md)
   - [04-operacao-na-box.md](04-operacao-na-box.md)
+  - [05-alvo-box-ailla.md](05-alvo-box-ailla.md)
 
 ---
 
 ## Veredito
 
-**NO-GO**: A implementação está formalmente suspensa até que o dono resolva quatro pré-condições bloqueantes:
-1. **Validação jurídica dos Termos de Uso dos provedores:** A sessão 03 condicionou a execução dos harnesses no servidor Linux headless à aprovação pelo dono dos termos de serviço (Anthropic, OpenAI, Cursor, Google) para operação em nuvem/VPS com contas individuais/OAuth, sem a qual a premissa de mover a execução para a box torna-se inviável.
-2. **Resolução da contradição de segurança na junta de transporte (Sessões 01 e 02):** A sessão 01 estipulou duas conexões físicas independentes no transporte remoto (Controle e PTY), enquanto a sessão 02 desenhou autenticação de aplicação assumindo que uma única conexão autenticada serve a todo o tráfego IPC. Sem um mecanismo formal de vinculação criptográfica da segunda conexão (ex.: `channel_ticket`), o canal de PTY fica vulnerável a sequestro de terminal.
-3. **Inoperância do probe do Antigravity no Linux:** O código atual em [`aihub-probe/src/antigravity.rs:356-359`](../../../aihub-probe/src/antigravity.rs#L356) retorna incondicionalmente `None` fora do macOS, forçando o status `QuotaStatus::Unknown` e bloqueando o roteador de despachar tarefas para `agy` na box Linux até que um fallback seja implementado.
-4. **Indefinição de capacidade da box e toolchain C para compilação:** O workspace depende de `rusqlite` com a feature `bundled` ([`Cargo.toml:53`](../../../Cargo.toml#L53)), exigindo um compilador C funcional do alvo tanto para compilação direta na box quanto para compilação cruzada. Sem a definição do ambiente da box (distro, CPU, RAM), a estratégia de entrega de binários permanece aberta.
+**GO CONDICIONAL** para implementar o Remote Split como **day-2** na **box Ailla** (ver [05-alvo-box-ailla.md](05-alvo-box-ailla.md)). O day-1 operacional (overlay + SSH + tmux, MAT-223/224) permanece válido até Fatia 3 smoke-testada.
+
+Pré-condições do NO-GO original — reclassificadas:
+
+| # | Pré-condição | Estado | Gate |
+|---|---|---|---|
+| 1 | ToS dos provedores (headless / VPS) | **HITL dono / pesquisa** | Bloqueia **spawn real** de harnesses; **não** bloqueia Fatias 0–2 (protocolo, auth, transporte em loopback) |
+| 2 | Junta 01×02 (2 conexões vs 1 auth) | **FECHADA no desenho** | Adotar **channel_ticket** (Opção B, §3): PTY secundário só com ticket da conexão de controle autenticada |
+| 3 | Probe Antigravity = `None` fora de macOS | **Work item Fatia 0** | Fallback Linux; até lá router trata `QuotaStatus::Unknown` sem assumir agy |
+| 4 | Capacidade box / toolchain C | **FECHADA o suficiente** | Box Ailla: `cc`/`gcc` + `build-essential` presentes; `rustc` distro **1.85** < pin **1.98.1** → instalar `rustup` toolchain do pin; default = **compilar na box**; porta sugerida `127.0.0.1:9920` (livre de 8787/9900/9910) |
+
+**Fora do GO imediato:** instalar sshd / hostname CF / spawn de harness sem OK escrito do dono.
 
 ---
 
@@ -38,7 +46,7 @@ A evolução arquitetural ("Remote Split") tem como objetivo apartar o daemon pa
 
 ## 2. Decisão Arquitetural Sintetizada
 
-Caso as decisões do dono sejam respondidas favoravelmente, a arquitetura alvo consolida os quatro desenhos nas seguintes diretrizes:
+A arquitetura alvo (box Ailla, day-2) consolida os cinco documentos de suporte nas seguintes diretrizes. Itens ainda gated pelo dono estão marcados em §8:
 
 ### 2.1 Topologia e Posicionamento (Sustentado por 03 e 04)
 - **Desenho 1 ("Tudo na Box"):** O daemon `aihubd`, os processos supervisionados de harnesses PTY, o repositório git canônico e as worktrees temporárias residem integralmente na box Linux ([`03-credenciais-e-quota.md` §2](03-credenciais-e-quota.md)).
@@ -69,7 +77,7 @@ Caso as decisões do dono sejam respondidas favoravelmente, a arquitetura alvo c
 - **Desacoplamento do `ai-memory`:** O serviço é tratado como opcional via `AI_MEMORY_SERVER_URL`. Se ausente, o daemon acumula handoffs no spool local `handoffs.jsonl` sem travar trocas de harness ([`03-credenciais-e-quota.md` §8](03-credenciais-e-quota.md)).
 
 ### 2.5 Operação e Supervisão Linux (Sustentado por 04)
-- **Estrutura de Diretórios:** Binário em `~/.local/bin/aihubd`, dados/socket em `~/.local/share/aihub`, logs em `~/.local/share/aihub/log/aihubd.log`, e worktrees em `/tmp/aihub/worktrees` ([`04-operacao-na-box.md` §3](04-operacao-na-box.md)).
+- **Estrutura de Diretórios:** Binário em `~/.local/bin/aihubd`, dados/socket em `~/.local/share/aihub`, logs em `~/.local/share/aihub/log/aihubd.log`, e worktrees em `~/.local/share/aihub/worktrees` (não `/tmp` tmpfs — lacuna de junta §4.4) ([`04-operacao-na-box.md` §3](04-operacao-na-box.md), [05](05-alvo-box-ailla.md)).
 - **Supervisão:** Baseline pragmático com script de lançamento e `nohup` (com rotação de log obrigatória), com trilha documentada para migração a supervisor de user-space (`runit` ou `supervisord`) quando necessário ([`04-operacao-na-box.md` §3, §4](04-operacao-na-box.md)).
 - **Repositório Canônico:** O repositório git principal fica permanentemente clonado na box. A entrega de alterações para o GitHub ocorre preferencialmente via push acionado pelo Mac (após fetch da branch mesclada) ou deploy key de escopo restrito na box ([`04-operacao-na-box.md` §6](04-operacao-na-box.md)).
 
@@ -80,7 +88,7 @@ Caso as decisões do dono sejam respondidas favoravelmente, a arquitetura alvo c
 | Contradição | Posição A | Posição B | Custo das Opções | Recomendação do Sintetizador |
 |---|---|---|---|---|
 | **1. Segurança de Canal Duplo vs. Conexão Única** | **Sessão 01:** Duas conexões físicas separadas (Controle e PTY) para evitar Head-of-Line blocking. | **Sessão 02:** Handshake autentica uma vez por conexão e assume que todo o IPC corre sobre ela. | **A (Duplo handshake):** Duplo custo de crypto a cada reconexão.<br>**B (Channel Ticket):** Conexão primária gera ticket efêmero assinado para o PTY.<br>**C (QUIC):** Multiplexa streams na mesma conexão, mas sofre bloqueio UDP em middleboxes. | **Opção B:** Se mantido WebSocket/TCP, a conexão de PTY deve apresentar obrigatoriamente um `channel_ticket` de uso único emitido pela conexão de controle autenticada. |
-| **2. Local dos Harnesses vs. Termos de Uso** | **Sessão 03 / 04:** Executar tudo na box Linux headless para manter supervisão PTY e persistência. | **Sessão 03 (aberta):** Termos de uso de contas pessoais podem vetar servidores remotos. | **A (Tudo na box):** Risco contratual com fornecedores de IA.<br>**B (Harness no Mac):** Destrói persistência ao fechar laptop e exige RPC remoto de filesystem/worktrees. | **Opção A condicionada:** Recomendar "Tudo na box", porém mantendo o projeto em **NO-GO** até aval formal do dono. |
+| **2. Local dos Harnesses vs. Termos de Uso** | **Sessão 03 / 04:** Executar tudo na box Linux headless para manter supervisão PTY e persistência. | **Sessão 03 (aberta):** Termos de uso de contas pessoais podem vetar servidores remotos. | **A (Tudo na box):** Risco contratual com fornecedores de IA.<br>**B (Harness no Mac):** Destrói persistência ao fechar laptop e exige RPC remoto de filesystem/worktrees. | **Opção A condicionada:** "Tudo na box" como alvo; **código Fatia 0–2 liberado**; **spawn de harness** só após OK escrito ToS (gate distinto do desenho). |
 | **3. Ciclo de Vida de Sessões Órfãs em Crash** | **Sessão 01:** Retenção de 24h da sessão com ring-buffer de 2 MiB em RAM. | **Sessão 04:** Processos sob `setsid` sobrevivem ao crash do daemon e ficam órfãos inalcançáveis. | **A (Manual):** `pkill` manual no script de boot; perde sessões vivas.<br>**B (Persistência em disco):** Daemon grava PIDs e estado em disco para reatrelamento ou encerramento gracioso no arranque. | **Opção B:** O daemon deve persistir um catálogo mínimo (`sessions.json`) em disco para auditar e limpar ou reanexar PIDs órfãos ao reiniciar. |
 | **4. Credencial de Git Push** | **Sessão 04:** Sugere que o broker de 02 emita credencial temporária de push. | **Sessão 02:** Rejeitou categoricamente a existência de um broker de rede separado. | **A (Deploy key na box):** Segredo de longa duração na box.<br>**B (Push via Mac):** Mac faz fetch da branch na box e dá push no GitHub com sua credencial.<br>**C (SSH agent forward):** Encaminhamento de credencial pelo IPC. | **Opção B na fase 1**, evoluindo para **Opção A** (chave restrita de deploy) para automação completa. |
 | **5. Instalação do `ai-memory`** | **Sessão 03:** Sugere manter apenas spooling local permanente em `handoffs.jsonl` sem o serviço. | **Sessão 04:** Propõe implantar o binário `ai-memory` como serviço sob `nohup` na box. | **A (Subir serviço):** Mais um processo sem supervisão nativa.<br>**B (Apenas spool):** Zero overhead operacional na box, acumulando registros para sincronização futura. | **Opção B como default:** `ai-memory` roda via spool em disco; se a variável `AI_MEMORY_SERVER_URL` for apontada para um servidor real, ele drena. |
@@ -216,8 +224,17 @@ flowchart TD
 
 ## 8. Decisões em Aberto Submetidas ao Dono
 
-1. **Aprovação Jurídica dos Termos de Uso:** Confirmar conformidade para execução de Claude Code, Codex CLI, Cursor Agent e Antigravity CLI em servidor Linux headless.
-2. **Topologia Física de Rede e Transporte:** Homologar a Saída B da Contradição 1 (WebSocket TLS com `channel_ticket` para o canal PTY secundário) ou direcionar para QUIC (`quinn`).
-3. **Especificações da Box:** Fornecer capacidade de CPU, memória RAM, espaço em disco e arquitetura/distro da box para fechar a estratégia de compilação (compilação nativa na box vs. `cross` com Docker).
-4. **IdP e Mecanismo de Pareamento:** Indicar qual provedor de identidade existente hospedará a aprovação dos novos clientes Mac para emissão de credenciais curtas.
-5. **Credencial de Git Push:** Escolher entre (A) deploy key permanente com restrição de repositório na box ou (B) fluxo de push exclusivo a partir do Mac após fetch.
+Fechadas pelo inventário / desenho (ver [05](05-alvo-box-ailla.md)):
+- Box alvo = Ailla; build default = nativo com rustup **1.98.1** + `cc` já presente.
+- Canal duplo = **channel_ticket** (Opção B).
+- Porta TCP sugerida = `127.0.0.1:9920`; **não** reusar `a2a` / `:9910` / `:9900` / `:8787`.
+- V1 harnesses na box = **3** (`claude`, `codex`, `agy`); `cursor-agent` ausente até install.
+- Day-1 tmux permanece até Fatia 3.
+
+Ainda precisam do dono:
+1. **ToS headless** (Anthropic / OpenAI / Google; Cursor se/quando instalado) — gate de spawn.
+2. **Homologar transporte:** WebSocket/TLS + `channel_ticket` (recomendado) vs QUIC.
+3. **Caminho Mac→loopback:** CF hostname novo (ex. `aihub.mathai.com.br` + Access) **ou** openssh-server / Tailscale SSH (hoje sem `:22`).
+4. **IdP de pareamento** Mac↔`aihubd` (audience `aihubd`, sem misturar MCP/`a2a`).
+5. **Git push:** (B) via Mac na fase 1 vs (A) deploy key na box.
+6. **OK para instalar rustup 1.98.1** (e, se quiser Fatia 3 remota, sshd ou hostname CF).

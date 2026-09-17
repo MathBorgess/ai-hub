@@ -15,7 +15,7 @@
 
 ## 2. Build: cross-compile ou compilar na box
 
-**A capacidade real da box (CPU, RAM, disco, distro) é desconhecida — pergunta em aberto.** A resposta muda a decisão inteira: se a box tem toolchain de build (gcc, espaço para `target/`, RAM para `rustc` + LTO), compilar lá é o caminho mais simples e o que menos infraestrutura nova exige no Mac. Se a box é magra (poucos MB de disco, sem `cc`), cross-compile é obrigatório.
+**Inventário box Ailla (2026-09-17):** Linux amd64, user `box`, PID 1 `tini` (sem systemd), `cc`/`gcc` e `build-essential` **presentes**, `rustc`/`cargo` do sistema **1.85.0** (abaixo do pin `rust-toolchain.toml` **1.98.1**), `tmux` 3.5a, sem `sshd`/:22. Detalhe em [05-alvo-box-ailla.md](05-alvo-box-ailla.md). Com `cc` OK, o bloqueio de build passa a ser **só** instalar rustup/toolchain 1.98.1 (e espaço para `target/`). Se OOM/disco falhar, `cross` no Mac permanece fallback.
 
 O workspace usa `rusqlite` com `features = ["bundled"]` (`Cargo.toml:57`), o que compila SQLite em C — **isso exige um compilador C para o alvo, tanto no caminho "compilar na box" (a box precisa de `cc`) quanto no caminho "cross-compile" (o Mac precisa de um cross-toolchain C, não só Rust)**. Esse é o maior custo real de qualquer dos dois caminhos, não o probe.
 
@@ -30,7 +30,7 @@ Alvo, se cross: **glibc por padrão** (`x86_64-unknown-linux-gnu` ou `aarch64-un
 | **`cargo-zigbuild`** (zig como linker/cross-toolchain, sem Docker) | Quer cross sem Docker | Zig vira nova dependência instalada no Mac; menos testado neste workspace que `cross`; ainda depende do zig saber linkar `rusqlite bundled` para o alvo. |
 | **`cargo install --git ... --target ...` direto do Mac com toolchain Linux baixado via `rustup target add`** | Nunca funciona sozinho aqui | **Rejeitado**: falta o compilador C do alvo para `rusqlite bundled`; o Mac não tem `cc` para Linux por padrão. Citado só para descartar — `rustup target add` resolve o Rust, não o C. |
 
-**Recomendação de desenho:** tratar "compilar na box" como default se a pergunta em aberto (capacidade da box) responder "sim" — zero infraestrutura nova no Mac, o toolchain pinado (`rust-toolchain.toml`) já garante reprodutibilidade. `cross` fica como fallback documentado se a box não aguentar. Isso é uma proposta, não uma decisão travada: quem fecha é o dono, depois de checar a box.
+**Recomendação de desenho (travada pelo inventário Ailla):** **compilar na box** como default após `rustup toolchain install 1.98.1`. `cross` fica como fallback se build nativo falhar por recurso. OK do dono ainda necessário só para *instalar* rustup (ação na máquina), não para a escolha de estratégia.
 
 ## 3. Artefato, layout e supervisão sem systemd
 
@@ -91,6 +91,8 @@ O transporte de hoje é **Unix Domain Socket local**: `~/.local/share/aihub/aihu
 
 **Como o Mac alcança essa porta loopback:** o padrão já validado na box do dono é **túnel nomeado apontando para a porta em loopback**, com a regra dura de que túnel e zona DNS precisam estar na mesma conta do provedor — quando não estão, a borda recusa e o sintoma não é óbvio (confirmado operacionalmente na wiki privada; aqui citado como princípio, não como implantação). Esse túnel é a fronteira que a sessão 02 protege com autenticação; este documento só garante que, sem o túnel, a porta não é alcançável de fora da box.
 
+**Colisão de portas na box Ailla (2026-09-17):** `:8787` reports, `:9900` Hermes, `:9910` auth-broker/MCP já em uso. Sugestão de desenho para `aihubd` TCP: **`127.0.0.1:9920`**. Hostname CF, se houver, deve ser **novo** (ex. `aihub.mathai.com.br`) — **nunca** reusar `a2a.mathai.com.br` nem grants MCP. SSH `-L` está bloqueado hoje (sem sshd). Ver [05](05-alvo-box-ailla.md) §6.
+
 **O que autorizaria bind além de loopback:** nada, por padrão. Um cenário hipotético — a box já estar numa rede privada confiável (ex. mesma VPC/WireGuard) sem precisar de túnel público — mudaria isso, mas é uma pergunta em aberto sobre a topologia real da box que este desenho não assume.
 
 ## 6. Onde fica o código
@@ -144,8 +146,14 @@ O caminho Linux precisa preservar exatamente essas três garantias:
 
 ## 10. Decisões que precisam do dono
 
-1. **Capacidade real da box (CPU/RAM/disco/distro).** Sem essa resposta, a escolha entre "compilar na box" e "cross-compile" (§2) não fecha — e ela muda a lista inteira de ferramentas candidatas.
-2. **Quem tem credencial git de push na box, e com que escopo** (§6) — nenhuma das três opções é neutra; a mais alinhada ao resto do sistema depende do que a sessão 02 decidir sobre brokers de credencial.
-3. **Baseline de supervisão: aceitar "à mão" (nohup) ou pagar o custo de instalar um supervisor de user-space agora** (§3) — troca custo operacional recorrente por custo de manutenção de mais uma peça.
-4. **Se a box tem alguma rede privada confiável além de loopback+túnel** (§5) — muda se "só loopback + túnel" é a única topologia válida ou se existe uma alternativa mais direta.
-5. **Ferramenta de rotação de log disponível na box** (`logrotate` ou não) — decide entre reaproveitar ferramenta do sistema ou escrever rotação própria.
+Fechadas / reduzidas pelo inventário Ailla ([05](05-alvo-box-ailla.md)):
+- Capacidade mínima para build: `cc` OK; falta rustup 1.98.1 → default = compilar na box.
+- Rede: só loopback + túnel (ou SSH futuro); sem rede privada tipo Tailscale hoje.
+- Supervisão baseline = `nohup` + script (já é o padrão da box).
+
+Ainda abertas:
+1. **OK para instalar rustup 1.98.1** (e medir se `cargo build --release -p aihubd` cabe em disco/RAM).
+2. **Quem tem credencial git de push** (§6) — fase 1 recomenda push via Mac.
+3. **Upgrade de supervisão** (`supervisord`/`runit`) agora vs depois.
+4. **Caminho remoto Mac→9920:** CF hostname novo vs openssh-server / Tailscale.
+5. **Rotação de log** (`logrotate` vs truncamento no script) — checar pacote na install.

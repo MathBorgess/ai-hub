@@ -2,8 +2,15 @@
 
 Índice dos documentos de decisão arquitetural para a separação remota entre o daemon `aihubd` e o cliente TUI `aihub`:
 
-- [00-adr.md](00-adr.md): Síntese decisória executiva com veredito (NO-GO), mapa de contradições, lacunas de junta e caminho de migração em 5 fatias preservando o modo local.
-- [01-transporte-e-sessao.md](01-transporte-e-sessao.md): Desenho do transporte remoto desacoplado (controle vs. PTY binário), retomada resiliente por offset com ring-buffer de 2 MiB e handles seguros amarrados ao principal autenticado.
-- [02-fronteira-de-confianca.md](02-fronteira-de-confianca.md): Fronteira de confiança do daemon na rede, autenticação assimétrica por prova de posse aprovada via IdP, autorização por operação em três níveis e regra de não-encaminhamento de credenciais.
-- [03-credenciais-e-quota.md](03-credenciais-e-quota.md): Arquitetura de posicionamento de execução ("Tudo na Box"), fontes de credenciais headless, supressão de estimativa por transcrições e governança de quota autoritativa na box.
-- [04-operacao-na-box.md](04-operacao-na-box.md): Engenharia operacional na box Linux (estratégia de build para rusqlite bundled, supervisão baseline sob nohup, bind loopback restrito com túnel e repositório canônico permanente na box).
+- [00-adr.md](00-adr.md): Síntese decisória — **GO condicional** para implementação na box Ailla; mapa de contradições; migração em 5 fatias; UDS local preservado.
+- [01-transporte-e-sessao.md](01-transporte-e-sessao.md): Transporte remoto (controle vs PTY), retomada por offset, ring-buffer 2 MiB, handles amarrados ao principal.
+- [02-fronteira-de-confianca.md](02-fronteira-de-confianca.md): Autenticação por prova de posse, autorização em três níveis, falha fechada, não-encaminhamento de credencial.
+- [03-credenciais-e-quota.md](03-credenciais-e-quota.md): Execução na box, credenciais headless, autoridade de quota.
+- [04-operacao-na-box.md](04-operacao-na-box.md): Build, layout, supervisão sem systemd, bind loopback, repositório canónico.
+- [05-alvo-box-ailla.md](05-alvo-box-ailla.md): **Inventário vivo da box Ailla**, day-1 tmux vs day-2 aihubd, pré-condições reclassificadas, lacunas de desenvolvimento e pesquisa.
+
+## Leitura rápida
+
+1. Ler [05](05-alvo-box-ailla.md) se o alvo é a box da Ailla (runtime real).
+2. Ler [00](00-adr.md) para o veredito e as fatias.
+3. Day-1 operacional (sem aihubd) continua MAT-223/224 no vault: overlay + SSH + tmux.
