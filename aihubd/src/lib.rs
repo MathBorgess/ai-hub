@@ -1,19 +1,30 @@
 //! Foreground Unix socket supervisor. Client lifetimes never own child PTYs.
+pub mod auth;
+mod ring_buffer;
+pub mod sessions_catalog;
+mod ticket;
+mod ws;
+pub mod ws_proto;
+use crate::auth::{Allowlist, PrincipalId};
+use crate::ring_buffer::{RingBuffer, RING_BUFFER_CAP};
+use crate::ticket::TicketRegistry;
 use aihub_core::*;
 use aihub_pty::{PtySize, PtySpawnOptions};
 use anyhow::{anyhow, bail, Result};
+use rand::Rng;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
+    net::SocketAddr,
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
     time::Duration,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{UnixListener, UnixStream},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::{TcpListener, UnixListener},
     sync::{broadcast, mpsc, Mutex},
     task::JoinSet,
 };
@@ -276,6 +287,33 @@ struct Session {
     hold_task: Option<tokio::task::JoinHandle<()>>,
     recommendation_id: u64,
     current_recommendation: Option<RouteOutcome>,
+    /// Principal that created this session (01-transporte-e-sessao.md §4). Attach and every
+    /// other session-scoped operation are vetoed for any other principal, even if they know
+    /// the `SessionId` — mere possession of the handle confers no authorization.
+    owner: PrincipalId,
+    /// Ring buffer de retomada por offset (2 MiB, ADR §2.2/§3): persiste através de troca de
+    /// harness (`switch()` nunca o substitui, só `push`a o banner do PTY entrante nele).
+    ring: RingBuffer,
+    /// Espelha os mesmos bytes de `ring.push` para a conexão de PTY dedicada (canal duplo,
+    /// ADR contradição 1). Distinto do broadcast JSON em `state.clients`: este carrega
+    /// `(stream_offset, data)` cru, consumido pelo canal binário sem overhead de Base64/JSON.
+    pty_channel_tx: broadcast::Sender<(u64, Vec<u8>)>,
+}
+
+/// Pending destructive confirmation for `MergeRequest` over a network-authenticated connection
+/// (ADR §2.3 nível 3). Distinct from the plain UDS "repeat to confirm" flow: here confirmation
+/// is a fresh signed envelope over a one-time nonce, delivered as a second `Hello.credential`
+/// on the same connection, never a bare repeat of `MergeRequest` itself.
+#[derive(Clone)]
+struct MergeConfirm {
+    session_id: SessionId,
+    strategy: MergeStrategy,
+    diff: String,
+    nonce: Vec<u8>,
+    path: PathBuf,
+    base: String,
+    branch: String,
+    origin: PathBuf,
 }
 
 struct HoldDispatchPlan {
@@ -290,12 +328,20 @@ struct Client {
     attached: HashSet<SessionId>,
     // Contract has no separate preview message: repeat a matching request to confirm.
     merge: Option<(SessionId, MergeStrategy, String)>,
+    /// Identity established at handshake (ADR §2.3): `PrincipalId::local()` for every Unix
+    /// socket connection, a key fingerprint for a network connection that proved possession.
+    principal: PrincipalId,
+    /// Set while a network principal's destructive `MergeRequest` awaits its signed envelope
+    /// (see `MergeConfirm`). Always `None` for local connections.
+    merge_confirm: Option<MergeConfirm>,
 }
 #[derive(Default)]
 struct State {
     sessions: Vec<Session>,
     clients: HashMap<u64, Client>,
     next_id: u64,
+    /// `channel_ticket`s emitidos e ainda não redimidos (ADR contradição 1, Opção B).
+    tickets: TicketRegistry,
 }
 impl State {
     fn send(&mut self, client: u64, message: DaemonMessage) {
@@ -397,6 +443,15 @@ pub struct Daemon {
     catalog_paths: Arc<CatalogPath>,
     drain: Arc<Drain>,
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// Owner-approved public keys (ADR §2.3). Default empty: loaded once at construction via
+    /// `Allowlist::load()`, never re-read per connection.
+    allowlist: Arc<Allowlist>,
+    /// Durable audit log path (`~/.local/share/aihub/log/audit.jsonl` by default, ADR §2.3 §6).
+    audit_path: PathBuf,
+    /// Path to `sessions.json` (ADR contradição 3, Opção B). `None` by default (`Daemon::new`)
+    /// so tests never touch a real `~/.local/share/aihub` — only `with_sessions_catalog_path`
+    /// (and `main.rs`, which always sets it) enables persistence/reconciliation.
+    catalog_path: Option<PathBuf>,
 }
 
 impl Daemon {
@@ -510,7 +565,31 @@ impl Daemon {
             // No-op by default: tests must never poll a real ai-memory on 127.0.0.1:49374.
             // main.rs opts in explicitly via `with_drain`.
             drain: Arc::new(|| Box::pin(async { Ok(0) })),
+            allowlist: Arc::new(Allowlist::load()),
+            audit_path: auth::audit_log_path(),
+            catalog_path: None,
         }
+    }
+
+    /// Enables `sessions.json` persistence and startup orphan reconciliation at `path`
+    /// (ADR contradição 3, Opção B). Production (`main.rs`) always sets this; tests only set
+    /// it when they specifically exercise the catalog, so ordinary tests never touch disk.
+    pub fn with_sessions_catalog_path(mut self, path: PathBuf) -> Self {
+        self.catalog_path = Some(path);
+        self
+    }
+
+    /// Overrides the owner-approved public key allowlist (default: `Allowlist::load()`, empty
+    /// unless the owner configured one via env/file — ADR §2.3).
+    pub fn with_allowlist(mut self, allowlist: Allowlist) -> Self {
+        self.allowlist = Arc::new(allowlist);
+        self
+    }
+
+    /// Overrides the durable audit log path (default: `~/.local/share/aihub/log/audit.jsonl`).
+    pub fn with_audit_log_path(mut self, path: PathBuf) -> Self {
+        self.audit_path = path;
+        self
     }
 
     pub fn with_catalog_paths<C>(mut self, resolver: C) -> Self
@@ -644,7 +723,22 @@ impl Daemon {
         prompt: Option<String>,
     ) -> Result<SessionId> {
         let mut state = self.state.lock().await;
-        self.add_locked(&mut state, repo, wt, harness, prompt)
+        self.add_locked(&mut state, repo, wt, harness, prompt, PrincipalId::local())
+    }
+
+    /// Same as `add_session`, but bound to an explicit owner (ADR §2.3, §4) instead of the
+    /// local pseudo-principal. Lets tests exercise cross-principal attach without a real
+    /// network handshake for the session-creation step.
+    pub async fn add_session_owned(
+        &self,
+        repo: PathBuf,
+        wt: aihub_git::SessionWorktree,
+        harness: HarnessId,
+        prompt: Option<String>,
+        owner: PrincipalId,
+    ) -> Result<SessionId> {
+        let mut state = self.state.lock().await;
+        self.add_locked(&mut state, repo, wt, harness, prompt, owner)
     }
 
     /// Explicitly switches a session to a target harness, returning the handoff destination.
@@ -745,6 +839,56 @@ impl Daemon {
         }
     }
 
+    /// Quiesces the session and finalizes the git merge/discard (shared by the local
+    /// "repeat MergeRequest to confirm" flow and the network signed-envelope flow above).
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_merge(
+        &self,
+        state: &mut State,
+        client: u64,
+        session_id: SessionId,
+        strategy: MergeStrategy,
+        diff: String,
+        path: PathBuf,
+        base: String,
+        branch: String,
+        origin: PathBuf,
+    ) -> Result<()> {
+        // F4: an unconfirmed stop refuses to finalize Git; never launch a
+        // replacement and never reach the final diff below.
+        self.quiesce(state, &session_id).await?;
+        // Only after the child group is reaped do they take the final diff
+        let stopped_diff = (self.git_diff)(&path, &base, true).await?;
+        if stopped_diff != diff {
+            if let Some(c) = state.clients.get_mut(&client) {
+                c.merge = Some((session_id.clone(), strategy, stopped_diff.clone()));
+            }
+            state.send(client, DaemonMessage::MergeResult {
+                session_id,
+                success: false,
+                diff: stopped_diff,
+                message: "Agent stopped; final diff changed. Review and repeat MergeRequest to confirm.".into(),
+            });
+            return Ok(());
+        }
+        let outcome = (self.git_finish)(&path, strategy, &base, &branch, &origin).await?;
+        log_lifecycle(
+            "INFO",
+            "session merge",
+            &format!(
+                "session_id={} strategy={} success={}",
+                session_id, strategy, outcome.success
+            ),
+        );
+        state.broadcast(DaemonMessage::MergeResult {
+            session_id,
+            success: outcome.success,
+            diff: outcome.diff,
+            message: outcome.message,
+        });
+        Ok(())
+    }
+
     /// Waits for an autonomous recommendation's hold to pass, then dispatches it if the
     /// session is still eligible (R10). Tracked in `session.hold_task` separately from `session.tasks`
     /// so that quiescence does not cancel the in-flight switch timer.
@@ -810,6 +954,7 @@ impl Daemon {
         wt: aihub_git::SessionWorktree,
         harness: HarnessId,
         prompt: Option<String>,
+        owner: PrincipalId,
     ) -> Result<SessionId> {
         if state
             .sessions
@@ -820,6 +965,9 @@ impl Daemon {
         }
         let pty = (self.spawner)(harness, options(wt.path.clone(), prompt.clone()), None)?;
         let id = wt.session_id.clone();
+        let mut ring = RingBuffer::new(RING_BUFFER_CAP);
+        ring.push(&pty.scrollback);
+        let (pty_channel_tx, _) = broadcast::channel(256);
         let mut session = Session {
             summary: SessionSummary {
                 session_id: id.clone(),
@@ -842,6 +990,9 @@ impl Daemon {
             hold_task: None,
             recommendation_id: 0,
             current_recommendation: None,
+            owner,
+            ring,
+            pty_channel_tx,
         };
         self.watch(&mut session);
         log_lifecycle(
@@ -862,7 +1013,55 @@ impl Daemon {
             channel_ticket: None,
         });
         state.sessions.push(session);
+        self.persist_catalog(state);
         Ok(id)
+    }
+
+    /// Rewrites `sessions.json` from the current registry (ADR contradição 3, Opção B).
+    /// No-op unless `with_sessions_catalog_path` was set. `pid` is always `None`: `aihub-pty`
+    /// exposes no PID getter today (see this session's `remaining` in result.md) — the schema
+    /// and the startup reconciliation path are real, only the real-PID plumbing is deferred.
+    fn persist_catalog(&self, state: &State) {
+        let Some(path) = &self.catalog_path else {
+            return;
+        };
+        let mut catalog = sessions_catalog::SessionsCatalog::default();
+        for s in &state.sessions {
+            catalog.upsert(sessions_catalog::SessionRecord {
+                session_id: s.summary.session_id.clone(),
+                pid: None,
+                owner: s.owner.to_string(),
+                repo_path: s.summary.repo_path.clone(),
+                worktree_path: s.summary.worktree_path.clone(),
+                branch: s.summary.branch.clone(),
+                harness: s.summary.harness,
+            });
+        }
+        if let Err(e) = catalog.save(path) {
+            log_lifecycle("ERROR", "sessions_catalog_save", &e.to_string());
+        }
+    }
+
+    /// Bootstrap state for a newly-ticketed PTY channel (`ws.rs`): the live broadcast
+    /// subscription, the ring buffer's current head offset and full snapshot, and the
+    /// session's input writer — all read under one lock acquisition, so no byte pushed by
+    /// `watch()` between reading the snapshot and subscribing can be silently missed. `None`
+    /// if the session no longer exists (raced with a purge; §3 "Teste 4" territory).
+    pub(crate) async fn pty_channel_bootstrap(
+        &self,
+        session_id: &SessionId,
+    ) -> Option<crate::ws::PtyChannelBootstrap> {
+        let state = self.state.lock().await;
+        let s = state
+            .sessions
+            .iter()
+            .find(|s| &s.summary.session_id == session_id)?;
+        Some(crate::ws::PtyChannelBootstrap {
+            rx: s.pty_channel_tx.subscribe(),
+            head_offset: s.ring.head_offset(),
+            snapshot: s.ring.snapshot(),
+            try_write: s.pty.try_write.clone(),
+        })
     }
 
     fn watch(&self, session: &mut Session) {
@@ -896,14 +1095,17 @@ impl Daemon {
                 if s.generation != generation {
                     break;
                 }
-                s.pty.scrollback.extend_from_slice(&data);
-                // Daemon retains only the most recent 1 MiB per session.
-                let excess = s.pty.scrollback.len().saturating_sub(1024 * 1024);
-                s.pty.scrollback.drain(..excess);
+                // Ring buffer de 2 MiB indexado por offset monotônico (ADR §2.2, §3),
+                // substitui o antigo scrollback de 1 MiB sem numeração de sequência.
+                let offset = s.ring.push(&data);
+                // Canal de PTY dedicado (ADR contradição 1): mesmos bytes, sem overhead de
+                // JSON/Base64. Ignora `SendError` — sem assinante no momento é normal (nenhum
+                // cliente de rede anexado ainda).
+                let _ = s.pty_channel_tx.send((offset, data.clone()));
                 let message = DaemonMessage::PtyOutput {
                     session_id: output_session_id.clone(),
                     data: data.into(),
-                    stream_offset: 0,
+                    stream_offset: offset,
                 };
                 state.clients.retain(|_, c| {
                     !c.attached.contains(&output_session_id)
@@ -952,7 +1154,7 @@ impl Daemon {
             tokio::select! {
                 _ = &mut shutdown => break Ok(()),
                 accepted = listener.accept() => match accepted {
-                    Ok((stream, _)) => { let daemon = self.clone(); tasks.spawn(async move { let _ = daemon.client(stream).await; }); },
+                    Ok((stream, _)) => { let daemon = self.clone(); tasks.spawn(async move { let _ = daemon.client(stream, true).await; }); },
                     Err(error) => {
                         if error.kind() == std::io::ErrorKind::ConnectionAborted
                             || error.kind() == std::io::ErrorKind::Interrupted
@@ -1005,6 +1207,39 @@ impl Daemon {
         }
         log_lifecycle("INFO", "shutdown", "daemon shutdown complete");
         result
+    }
+
+    /// Network listener: every connection must prove possession of an allowlisted key before
+    /// admission (ADR §2.3, §6) — the opposite trust model of `run()`'s Unix socket, and never
+    /// shared with it (ADR §6, "O que isso quebra"). Loopback-only in this slice; a deployable
+    /// remote transport (WebSocket, tunnel wiring) is session 04's scope.
+    pub async fn run_tcp(
+        &self,
+        addr: SocketAddr,
+        shutdown: impl Future<Output = ()>,
+    ) -> Result<()> {
+        log_lifecycle("INFO", "start_tcp", &format!("daemon listening on {addr}"));
+        let listener = TcpListener::bind(addr).await?;
+        let mut tasks = JoinSet::new();
+        tokio::pin!(shutdown);
+        loop {
+            tokio::select! {
+                _ = &mut shutdown => break,
+                accepted = listener.accept() => match accepted {
+                    Ok((stream, _)) => {
+                        let _ = stream.set_nodelay(true);
+                        let daemon = self.clone();
+                        tasks.spawn(async move { let _ = daemon.client(stream, false).await; });
+                    }
+                    Err(_) => continue,
+                },
+                Some(_) = tasks.join_next() => {},
+            }
+        }
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        log_lifecycle("INFO", "shutdown_tcp", "network listener shutdown complete");
+        Ok(())
     }
 
     async fn quota_loop(&self) {
@@ -1071,50 +1306,219 @@ impl Daemon {
             }
         }
     }
-    async fn client(&self, stream: UnixStream) -> Result<()> {
-        let (mut reader, mut writer) = stream.into_split();
-        let hello =
-            tokio::time::timeout(Duration::from_secs(10), read_message(&mut reader)).await??;
+    /// Negotiates the handshake for one connection and returns the principal it authenticates
+    /// as, or `None` if the connection was already rejected (`DaemonMessage::Unauthorized`
+    /// written, caller closes). `is_local` decides which trust model applies (ADR §6):
+    /// the Unix socket listener admits v2/uncredentialed clients unconditionally, the network
+    /// listener fails closed on anything short of verified proof of possession.
+    async fn authenticate<R, W>(
+        &self,
+        reader: &mut R,
+        writer: &mut W,
+        is_local: bool,
+    ) -> Result<Option<PrincipalId>>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        let hello = tokio::time::timeout(Duration::from_secs(10), read_message(reader)).await??;
+        let version = match &hello {
+            ClientMessage::Hello { version, .. } => *version,
+            _ => {
+                writer
+                    .write_all(&encode_frame(
+                        &error("protocol", "expected Hello at connection start").into(),
+                    )?)
+                    .await?;
+                return Ok(None);
+            }
+        };
+        if is_local {
+            if version != 2 && version != PROTOCOL_VERSION {
+                writer
+                    .write_all(&encode_frame(
+                        &error("protocol", "unsupported protocol version").into(),
+                    )?)
+                    .await?;
+                return Ok(None);
+            }
+            writer
+                .write_all(&encode_frame(
+                    &DaemonMessage::Hello {
+                        version: PROTOCOL_VERSION,
+                    }
+                    .into(),
+                )?)
+                .await?;
+            return Ok(Some(PrincipalId::local()));
+        }
+        if version != PROTOCOL_VERSION {
+            auth::audit_log(
+                &self.audit_path,
+                "handshake_rejected",
+                None,
+                &auth::AuthReject::UnsupportedVersion.to_string(),
+            );
+            writer
+                .write_all(&encode_frame(&DaemonMessage::Unauthorized.into())?)
+                .await?;
+            return Ok(None);
+        }
+        let mut nonce = [0u8; 32];
+        rand::rng().fill_bytes(&mut nonce);
         writer
             .write_all(&encode_frame(
-                &DaemonMessage::Hello {
-                    version: PROTOCOL_VERSION,
+                &DaemonMessage::Challenge {
+                    nonce: nonce.to_vec().into(),
                 }
                 .into(),
             )?)
             .await?;
-        if !matches!(
-            hello,
+        let proof = tokio::time::timeout(Duration::from_secs(10), read_message(reader)).await??;
+        let credential = match proof {
             ClientMessage::Hello {
-                version: PROTOCOL_VERSION,
+                credential: Some(c),
                 ..
+            } => c,
+            _ => {
+                auth::audit_log(
+                    &self.audit_path,
+                    "handshake_rejected",
+                    None,
+                    &auth::AuthReject::MissingCredential.to_string(),
+                );
+                writer
+                    .write_all(&encode_frame(&DaemonMessage::Unauthorized.into())?)
+                    .await?;
+                return Ok(None);
             }
-        ) {
-            writer
-                .write_all(&encode_frame(
-                    &error("protocol", "expected Hello with protocol version 1").into(),
-                )?)
-                .await?;
-            return Ok(());
+        };
+        match auth::verify_credential(&credential, &nonce, (self.clock)(), &self.allowlist) {
+            Ok(principal) => {
+                auth::audit_log(
+                    &self.audit_path,
+                    "handshake_accepted",
+                    Some(&principal),
+                    "proof of possession verified",
+                );
+                writer
+                    .write_all(&encode_frame(
+                        &DaemonMessage::Hello {
+                            version: PROTOCOL_VERSION,
+                        }
+                        .into(),
+                    )?)
+                    .await?;
+                Ok(Some(principal))
+            }
+            Err(reason) => {
+                auth::audit_log(
+                    &self.audit_path,
+                    "handshake_rejected",
+                    None,
+                    &reason.to_string(),
+                );
+                writer
+                    .write_all(&encode_frame(&DaemonMessage::Unauthorized.into())?)
+                    .await?;
+                Ok(None)
+            }
         }
-        let (tx, mut rx) = mpsc::channel(128);
-        let id;
+    }
+
+    /// Sends the opaque `Unauthorized` response and records the real reason internally
+    /// (ADR §2.3, §6: fail closed, no oracle — the caller never sees `reason`).
+    fn reject_unauthorized(
+        &self,
+        state: &mut State,
+        client: u64,
+        event: &str,
+        principal: Option<&PrincipalId>,
+        reason: &str,
+    ) {
+        auth::audit_log(&self.audit_path, event, principal, reason);
+        state.send(client, DaemonMessage::Unauthorized);
+    }
+
+    /// Verifies the signed envelope for a pending destructive `MergeRequest` confirmation
+    /// (ADR §2.3 nível 3) and finalizes the merge on success. The nonce is one-time use: it was
+    /// already removed from `Client::merge_confirm` by the caller before this runs, so a replay
+    /// of the same signature never matches a still-pending confirmation again.
+    async fn confirm_merge_envelope(
+        &self,
+        client: u64,
+        pending: MergeConfirm,
+        credential: &ClientCredential,
+    ) {
+        let now = (self.clock)();
+        let verified = auth::verify_credential(credential, &pending.nonce, now, &self.allowlist);
+        let mut state = self.state.lock().await;
+        let connection_principal = state.clients.get(&client).map(|c| c.principal.clone());
+        let principal = match verified {
+            Ok(p) if Some(&p) == connection_principal.as_ref() => p,
+            Ok(_) => {
+                auth::audit_log(
+                    &self.audit_path,
+                    "merge_envelope_rejected",
+                    None,
+                    "envelope key does not match this connection's own principal",
+                );
+                state.send(client, DaemonMessage::Unauthorized);
+                return;
+            }
+            Err(reason) => {
+                auth::audit_log(
+                    &self.audit_path,
+                    "merge_envelope_rejected",
+                    None,
+                    &reason.to_string(),
+                );
+                state.send(client, DaemonMessage::Unauthorized);
+                return;
+            }
+        };
+        auth::audit_log(
+            &self.audit_path,
+            "merge_envelope_verified",
+            Some(&principal),
+            "one-time nonce consumed, finalizing merge",
+        );
+        if let Err(e) = self
+            .finish_merge(
+                &mut state,
+                client,
+                pending.session_id,
+                pending.strategy,
+                pending.diff,
+                pending.path,
+                pending.base,
+                pending.branch,
+                pending.origin,
+            )
+            .await
         {
-            let mut state = self.state.lock().await;
-            state.next_id += 1;
-            id = state.next_id;
-            tx.try_send(DaemonMessage::QuotaPush {
-                snapshots: self.cache.lock().await.clone(),
-            })?;
-            state.clients.insert(
-                id,
-                Client {
-                    sender: tx,
-                    attached: HashSet::new(),
-                    merge: None,
-                },
-            );
+            let response = if e.downcast_ref::<StopUnconfirmed>().is_some() {
+                error("stop_unconfirmed", &e.to_string())
+            } else {
+                error("request_failed", "request could not be completed")
+            };
+            state.send(client, response);
         }
+    }
+
+    async fn client<S>(&self, stream: S, is_local: bool) -> Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (mut reader, mut writer) = tokio::io::split(stream);
+        let principal = match self
+            .authenticate(&mut reader, &mut writer, is_local)
+            .await?
+        {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let (id, mut rx) = self.register_client(principal.clone()).await?;
         let mut writing = JoinSet::new();
         writing.spawn(async move {
             while let Some(msg) = rx.recv().await {
@@ -1127,18 +1531,95 @@ impl Daemon {
                 _ = writing.join_next() => break,
                 message = read_message(&mut reader) => match message { Ok(m) => m, Err(_) => break },
             };
-            // A disconnect must not cancel a switch after the incoming PTY starts.
-            if let Err(e) = self.handle(id, message).await {
-                let response = if e.downcast_ref::<StopUnconfirmed>().is_some() {
-                    error("stop_unconfirmed", &e.to_string())
-                } else {
-                    error("request_failed", "request could not be completed")
-                };
-                self.state.lock().await.send(id, response);
-            }
+            self.dispatch(id, &principal, message).await;
         }
         self.state.lock().await.clients.remove(&id);
         Ok(())
+    }
+
+    /// Registers a new connection in `state.clients` and returns its id plus the receiving
+    /// half of its outbound message channel — shared by the local Unix socket path (`client`)
+    /// and the WebSocket control channel (`ws.rs`), which otherwise duplicate nothing else
+    /// about connection bookkeeping.
+    pub(crate) async fn register_client(
+        &self,
+        principal: PrincipalId,
+    ) -> Result<(u64, mpsc::Receiver<DaemonMessage>)> {
+        let (tx, rx) = mpsc::channel(128);
+        let mut state = self.state.lock().await;
+        state.next_id += 1;
+        let id = state.next_id;
+        tx.try_send(DaemonMessage::QuotaPush {
+            snapshots: self.cache.lock().await.clone(),
+        })?;
+        state.clients.insert(
+            id,
+            Client {
+                sender: tx,
+                attached: HashSet::new(),
+                merge: None,
+                principal,
+                merge_confirm: None,
+            },
+        );
+        Ok((id, rx))
+    }
+
+    /// Dispatches one already-decoded `ClientMessage` for connection `id`/`principal`: the
+    /// mid-connection-`Hello`-as-merge-confirmation special case, the session-ownership
+    /// pre-check (01-transporte-e-sessao.md §4), and the ordinary `handle()` call — shared by
+    /// every transport (`client()` here, and the WebSocket control channel in `ws.rs`).
+    pub(crate) async fn dispatch(&self, id: u64, principal: &PrincipalId, message: ClientMessage) {
+        // A mid-connection Hello only means something while a destructive MergeRequest
+        // envelope is pending (ADR §2.3 nível 3); otherwise it falls through to `handle()`'s
+        // ordinary "Hello is only valid at connection start" rejection, unchanged.
+        if let ClientMessage::Hello {
+            credential: Some(ref cred),
+            ..
+        } = message
+        {
+            let pending = self
+                .state
+                .lock()
+                .await
+                .clients
+                .get_mut(&id)
+                .and_then(|c| c.merge_confirm.take());
+            if let Some(pending) = pending {
+                self.confirm_merge_envelope(id, pending, cred).await;
+                return;
+            }
+        }
+        if let Some(sid) = message_session_id(&message) {
+            let owned_by_caller = {
+                let state = self.state.lock().await;
+                match state.sessions.iter().find(|s| &s.summary.session_id == sid) {
+                    Some(s) => &s.owner == principal,
+                    // Let the ordinary "session not found" error report through `handle()`.
+                    None => true,
+                }
+            };
+            if !owned_by_caller {
+                let mut state = self.state.lock().await;
+                self.reject_unauthorized(
+                    &mut state,
+                    id,
+                    "session_wrong_owner",
+                    Some(principal),
+                    &format!("touched session {sid} it does not own"),
+                );
+                return;
+            }
+        }
+        // A disconnect must not cancel a switch after the incoming PTY starts.
+        if let Err(e) = self.handle(id, message).await {
+            let response = if e.downcast_ref::<StopUnconfirmed>().is_some() {
+                error("stop_unconfirmed", &e.to_string())
+            } else {
+                error("request_failed", "request could not be completed")
+            };
+            self.state.lock().await.send(id, response);
+        }
     }
     async fn handle(&self, client: u64, message: ClientMessage) -> Result<()> {
         if matches!(message, ClientMessage::RequestQuota) {
@@ -1161,18 +1642,21 @@ impl Daemon {
                 initial_prompt,
             } => {
                 state.next_id += 1;
-                let id = SessionId::new(format!(
-                    "{}-{}-{}",
-                    std::process::id(),
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)?
-                        .as_nanos(),
-                    state.next_id
-                ));
+                // CSPRNG, not the old pid-nanos-counter scheme: predictable session ids are
+                // enumerable and therefore unsafe as bearer-equivalent handles (ADR §2.2, §4).
+                let id = SessionId::generate();
+                let owner = state
+                    .clients
+                    .get(&client)
+                    .map(|c| c.principal.clone())
+                    .unwrap_or_else(PrincipalId::local);
                 let wt = aihub_git::create_session_worktree(&repo_path, &id, None).await?;
-                self.add_locked(&mut state, repo_path, wt, harness, initial_prompt)?;
+                self.add_locked(&mut state, repo_path, wt, harness, initial_prompt, owner)?;
             }
-            ClientMessage::Attach { target, .. } => {
+            ClientMessage::Attach {
+                target,
+                last_seen_offset,
+            } => {
                 let s = state
                     .sessions
                     .iter()
@@ -1182,23 +1666,54 @@ impl Daemon {
                         SessionTarget::LatestForRepo(repo) => &s.summary.repo_path == repo,
                     })
                     .ok_or_else(|| anyhow!("session not found"))?;
-                let (id, scrollback, summary) = (
-                    s.summary.session_id.clone(),
-                    s.pty.scrollback.clone(),
-                    s.summary.clone(),
-                );
+                let caller = state
+                    .clients
+                    .get(&client)
+                    .map(|c| c.principal.clone())
+                    .unwrap_or_else(PrincipalId::local);
+                if s.owner != caller {
+                    // 01-transporte-e-sessao.md §4: mere possession of `SessionId` confers no
+                    // authorization. The caller never learns whose session this is.
+                    let owner = s.owner.clone();
+                    self.reject_unauthorized(
+                        &mut state,
+                        client,
+                        "attach_wrong_owner",
+                        Some(&caller),
+                        &format!("tried to attach session owned by {owner}"),
+                    );
+                    return Ok(());
+                }
+                let id = s.summary.session_id.clone();
+                let summary = s.summary.clone();
+                let tail_offset = s.ring.tail_offset();
+                // Delta catch-up if the offset is still retained (01-transporte-e-sessao.md
+                // §2.2 Caso A); full snapshot + gap flag otherwise, including the `None` a v2
+                // client always sends — it has no offset to resume from (Caso B).
+                let (scrollback, gap_detected) =
+                    match last_seen_offset.and_then(|off| s.ring.delta_since(off)) {
+                        Some(delta) => (delta, false),
+                        None => (s.ring.snapshot(), true),
+                    };
                 if let Some(c) = state.clients.get_mut(&client) {
                     c.attached.insert(id.clone());
                 }
+                // Only network principals need a `channel_ticket`: the local Unix socket keeps
+                // carrying both channels over the same connection (ADR §6, contradição 1).
+                let channel_ticket = if caller != PrincipalId::local() {
+                    Some(state.tickets.issue(id.clone(), caller))
+                } else {
+                    None
+                };
                 state.send(
                     client,
                     DaemonMessage::Attached {
                         session_id: id,
                         scrollback: scrollback.into(),
                         summary,
-                        stream_offset: 0,
-                        gap_detected: false,
-                        channel_ticket: None,
+                        stream_offset: tail_offset,
+                        gap_detected,
+                        channel_ticket,
                     },
                 );
             }
@@ -1403,54 +1918,65 @@ impl Daemon {
                     )
                 };
                 let diff = (self.git_diff)(&path, &base, true).await?;
-                let c = state
+                let is_local = state
                     .clients
-                    .get_mut(&client)
-                    .ok_or_else(|| anyhow!("client disconnected"))?;
-                let confirmation = (session_id.clone(), strategy, diff.clone());
-                if c.merge.as_ref() != Some(&confirmation) {
-                    c.merge = Some(confirmation);
+                    .get(&client)
+                    .map(|c| c.principal == PrincipalId::local())
+                    .unwrap_or(true);
+                if is_local {
+                    let c = state
+                        .clients
+                        .get_mut(&client)
+                        .ok_or_else(|| anyhow!("client disconnected"))?;
+                    let confirmation = (session_id.clone(), strategy, diff.clone());
+                    if c.merge.as_ref() != Some(&confirmation) {
+                        c.merge = Some(confirmation);
+                        state.send(client, DaemonMessage::MergeResult {
+                            session_id,
+                            success: false,
+                            diff,
+                            message: "Review diff; repeat MergeRequest with the same strategy to confirm. A changed diff requires review again.".into()
+                        });
+                    } else {
+                        c.merge = None;
+                        self.finish_merge(
+                            &mut state, client, session_id, strategy, diff, path, base, branch,
+                            origin,
+                        )
+                        .await?;
+                    }
+                } else {
+                    // ADR §2.3 nível 3: destrutiva sobre rede exige envelope assinado
+                    // independente com nonce de uso único — nunca a mera repetição do
+                    // MergeRequest anterior (isso seria só um segundo uso da mesma prova de
+                    // posse feita no handshake). O envelope chega como um `Hello.credential`
+                    // subsequente na mesma conexão, assinando o nonce abaixo.
+                    let mut nonce = [0u8; 32];
+                    rand::rng().fill_bytes(&mut nonce);
+                    if let Some(c) = state.clients.get_mut(&client) {
+                        c.merge_confirm = Some(MergeConfirm {
+                            session_id: session_id.clone(),
+                            strategy,
+                            diff: diff.clone(),
+                            nonce: nonce.to_vec(),
+                            path,
+                            base,
+                            branch,
+                            origin,
+                        });
+                    }
                     state.send(client, DaemonMessage::MergeResult {
                         session_id,
                         success: false,
                         diff,
-                        message: "Review diff; repeat MergeRequest with the same strategy to confirm. A changed diff requires review again.".into()
+                        message: "Destructive confirmation requires proof of possession: sign the issued nonce and resend Hello to confirm.".into(),
                     });
-                } else {
-                    c.merge = None;
-                    // F4: an unconfirmed stop refuses to finalize Git; never launch a
-                    // replacement and never reach the final diff below.
-                    self.quiesce(&mut state, &session_id).await?;
-                    // Only after the child group is reaped do they take the final diff
-                    let stopped_diff = (self.git_diff)(&path, &base, true).await?;
-                    if stopped_diff != diff {
-                        if let Some(c) = state.clients.get_mut(&client) {
-                            c.merge = Some((session_id.clone(), strategy, stopped_diff.clone()));
-                        }
-                        state.send(client, DaemonMessage::MergeResult {
-                            session_id,
-                            success: false,
-                            diff: stopped_diff,
-                            message: "Agent stopped; final diff changed. Review and repeat MergeRequest to confirm.".into(),
-                        });
-                        return Ok(());
-                    }
-                    let outcome =
-                        (self.git_finish)(&path, strategy, &base, &branch, &origin).await?;
-                    log_lifecycle(
-                        "INFO",
-                        "session merge",
-                        &format!(
-                            "session_id={} strategy={} success={}",
-                            session_id, strategy, outcome.success
-                        ),
+                    state.send(
+                        client,
+                        DaemonMessage::Challenge {
+                            nonce: nonce.to_vec().into(),
+                        },
                     );
-                    state.broadcast(DaemonMessage::MergeResult {
-                        session_id,
-                        success: outcome.success,
-                        diff: outcome.diff,
-                        message: outcome.message,
-                    });
                 }
             }
             ClientMessage::SubmitTask { session_id, task } => {
@@ -1682,9 +2208,10 @@ impl Daemon {
         };
 
         let s = state.session(id)?;
-        let old_scrollback = std::mem::take(&mut s.pty.scrollback);
         s.pty = incoming;
-        s.pty.scrollback.splice(..0, old_scrollback);
+        // The ring buffer (and its offset counter) lives on `Session`, not `Pty`: it survives
+        // the swap untouched. Only the new harness's initial banner needs pushing into it.
+        s.ring.push(&s.pty.scrollback);
         s.generation += 1;
         s.group_stop = GroupStopState::Pending;
         s.summary.harness = target;
@@ -1701,6 +2228,7 @@ impl Daemon {
             handoff_path,
             model: switched_model,
         });
+        self.persist_catalog(state);
 
         match brief {
             Some(b) => Ok(Some((old, b, project))),
@@ -1724,6 +2252,22 @@ fn options(cwd: PathBuf, initial_prompt: Option<String>) -> PtySpawnOptions {
         initial_prompt,
         env: HashMap::new(),
         size: PtySize::default(),
+    }
+}
+/// Session a `ClientMessage` already addresses, for the ownership pre-check in `client()`
+/// (01-transporte-e-sessao.md §4). `Attach` is checked separately inside `handle()` itself,
+/// since `SessionTarget::LatestForRepo` has no `session_id` to inspect up front.
+fn message_session_id(message: &ClientMessage) -> Option<&SessionId> {
+    match message {
+        ClientMessage::Detach { session_id }
+        | ClientMessage::PtyInput { session_id, .. }
+        | ClientMessage::PtyResize { session_id, .. }
+        | ClientMessage::SetMode { session_id, .. }
+        | ClientMessage::SwitchHarness { session_id, .. }
+        | ClientMessage::MergeRequest { session_id, .. }
+        | ClientMessage::SubmitTask { session_id, .. }
+        | ClientMessage::AcceptRecommendation { session_id, .. } => Some(session_id),
+        _ => None,
     }
 }
 fn error(code: &str, message: &str) -> DaemonMessage {
@@ -1771,6 +2315,7 @@ pub async fn shutdown_signal() {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::UnixStream;
 
     #[tokio::test]
     async fn connected_clients_get_hello_cache_and_broadcast() {
@@ -1790,7 +2335,7 @@ mod tests {
             let (mut client, server) = UnixStream::pair().unwrap();
             let d = daemon.clone();
             workers.spawn(async move {
-                d.client(server).await.unwrap();
+                d.client(server, true).await.unwrap();
             });
             client
                 .write_all(
@@ -1989,6 +2534,8 @@ mod tests {
                 sender: tx,
                 attached: HashSet::new(),
                 merge: None,
+                principal: PrincipalId::local(),
+                merge_confirm: None,
             },
         );
         let d = daemon.clone();
