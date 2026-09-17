@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
+use tokio_tungstenite::tungstenite::Message;
 
 /// Connects to the daemon socket, automatically launching `aihubd` detached if not running.
 pub async fn connect_or_start_daemon(socket_path: &Path) -> Result<UnixStream> {
@@ -32,6 +33,39 @@ pub async fn connect_or_start_daemon(socket_path: &Path) -> Result<UnixStream> {
             );
         }
         Err(e) => Err(e).context(format!("Failed to connect to socket at {:?}", socket_path)),
+    }
+}
+
+/// Connects to the local daemon socket. With `autostart` false (`--no-autostart`),
+/// never spawns a local `aihubd`: a missing socket is a plain connect error.
+pub async fn connect_local(socket_path: &Path, autostart: bool) -> Result<UnixStream> {
+    if autostart {
+        connect_or_start_daemon(socket_path).await
+    } else {
+        UnixStream::connect(socket_path)
+            .await
+            .context(format!("Failed to connect to socket at {:?}", socket_path))
+    }
+}
+
+/// Outbound half of the active daemon connection, local or remote (design doc
+/// §2.7): local writes go through the existing framed Unix socket; remote
+/// writes hand a WebSocket text frame to the connection's dedicated I/O thread
+/// (see `crate::remote`, which explains why that thread exists instead of an
+/// async `WebSocketStream`).
+pub enum DaemonWriter {
+    Uds(OwnedWriteHalf),
+    Ws(std::sync::mpsc::Sender<Message>),
+}
+
+impl DaemonWriter {
+    pub async fn send(&mut self, msg: &ClientMessage) -> Result<()> {
+        match self {
+            DaemonWriter::Uds(w) => send_msg(w, msg).await,
+            DaemonWriter::Ws(tx) => tx
+                .send(crate::remote::encode_client_message(msg))
+                .map_err(|_| anyhow!("Canal de saída do daemon remoto encerrado")),
+        }
     }
 }
 

@@ -3,180 +3,101 @@
 pub mod cli;
 pub mod colors;
 pub mod connection;
+pub mod doctor;
+pub mod identity;
 pub mod keys;
+pub mod remote;
 pub mod state;
 pub mod terminal;
 pub mod ui;
 
 use aihub_core::{
-    ClientMessage, DaemonMessage, HarnessId, MergeStrategy, SessionId, SessionTarget,
+    ChannelTicket, ClientMessage, DaemonMessage, HarnessId, MergeStrategy, SessionId,
+    SessionSummary, SessionTarget,
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use crossterm::event::Event;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Position;
 use ratatui::Terminal;
 use std::io::stdout;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::cli::{detect_repo_path, Cli, Commands};
-use crate::connection::{
-    connect_or_start_daemon, perform_handshake, recv_msg, send_msg, spawn_daemon_reader,
-};
+use crate::connection::{connect_local, perform_handshake, spawn_daemon_reader, DaemonWriter};
+use crate::identity::{default_identity_path, Identity};
 use crate::keys::{handle_key, AppAction};
-use crate::state::{App, RecommendationState, UiMode};
+use crate::remote::{Backoff, FailureClass, RemoteError, RemoteTarget};
+use crate::state::{App, ConnectionState, RecommendationState, UiMode};
 use crate::terminal::{setup_panic_hook, shutdown_signal, TerminalGuard};
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Outcome of one connection attempt against the daemon, local or remote.
+enum ConnEvent {
+    Connected {
+        writer: DaemonWriter,
+        daemon_rx: mpsc::UnboundedReceiver<Result<DaemonMessage>>,
+    },
+    PairingRequired {
+        code: String,
+    },
+    Failed {
+        text: String,
+        attempt: u32,
+    },
+}
+
+/// PTY dual-channel connection becoming available (ADR contradiction 1, Option B).
+enum PtyEvent {
+    Ready {
+        tx: std::sync::mpsc::Sender<WsMessage>,
+        rx: mpsc::UnboundedReceiver<std::result::Result<WsMessage, RemoteError>>,
+    },
+}
 
 /// Main application runner.
 pub async fn run(cli: Cli) -> Result<()> {
     setup_panic_hook();
 
-    let socket_path = cli.socket.unwrap_or_else(aihub_core::default_socket_path);
+    if let Some(Commands::Doctor {
+        remote: remote_flag,
+    }) = &cli.command
+    {
+        return run_doctor_command(&cli, *remote_flag).await;
+    }
+
+    let target = match cli.daemon_target() {
+        Some(raw) => remote::parse_daemon_target(&raw),
+        None => RemoteTarget::Local(
+            cli.socket
+                .clone()
+                .unwrap_or_else(aihub_core::default_socket_path),
+        ),
+    };
+    let autostart = !cli.no_autostart;
+    let identity_path = default_identity_path();
     let repo_path = detect_repo_path();
-
-    // 1. Connect or start daemon
-    let stream = connect_or_start_daemon(&socket_path)
-        .await
-        .context("Could not connect to aihubd")?;
-    let (mut reader, mut writer) = stream.into_split();
-
-    // 2. Perform protocol handshake
-    perform_handshake(&mut writer, &mut reader).await?;
 
     let mut app = App::new(repo_path.clone());
 
-    // 3. Attach or create session based on command
-    match cli.command {
-        Some(Commands::Attach { session_id }) => {
-            let target = match session_id {
-                Some(id) => SessionTarget::Id(SessionId::new(id)),
-                None => SessionTarget::LatestForRepo(repo_path),
-            };
-            send_msg(
-                &mut writer,
-                &ClientMessage::Attach {
-                    target,
-                    last_seen_offset: None,
-                },
-            )
-            .await?;
-
-            // Read daemon response for attach
-            if let Ok(Ok(msg)) =
-                tokio::time::timeout(Duration::from_secs(3), recv_msg(&mut reader)).await
-            {
-                handle_daemon_msg(&mut app, msg);
-            }
-        }
-        None => {
-            // Bare `aihub`: attach to latest for repo, or create new session
-            send_msg(
-                &mut writer,
-                &ClientMessage::Attach {
-                    target: SessionTarget::LatestForRepo(repo_path.clone()),
-                    last_seen_offset: None,
-                },
-            )
-            .await?;
-
-            // Read next daemon response
-            let resp = tokio::time::timeout(Duration::from_secs(3), recv_msg(&mut reader)).await;
-            match resp {
-                Ok(Ok(DaemonMessage::Attached {
-                    session_id,
-                    scrollback,
-                    summary,
-                    ..
-                })) => {
-                    app.session_id = Some(session_id);
-                    app.harness = summary.harness;
-                    app.branch = summary.branch;
-                    app.mode = summary.mode;
-                    app.active = summary.active;
-                    app.worktree_path = summary.worktree_path;
-                    app.repo_path = summary.repo_path;
-                    app.vt_parser.process(scrollback.as_slice());
-                }
-                Ok(Ok(DaemonMessage::QuotaPush { snapshots })) => {
-                    app.snapshots = snapshots;
-                    // Try waiting for next message (Attached or Error)
-                    if let Ok(Ok(next)) =
-                        tokio::time::timeout(Duration::from_secs(2), recv_msg(&mut reader)).await
-                    {
-                        match next {
-                            DaemonMessage::Attached {
-                                session_id,
-                                scrollback,
-                                summary,
-                                ..
-                            } => {
-                                app.session_id = Some(session_id);
-                                app.harness = summary.harness;
-                                app.branch = summary.branch;
-                                app.mode = summary.mode;
-                                app.active = summary.active;
-                                app.worktree_path = summary.worktree_path;
-                                app.repo_path = summary.repo_path;
-                                app.vt_parser.process(scrollback.as_slice());
-                            }
-                            DaemonMessage::Error { .. } => {
-                                // No existing session; create new session
-                                create_new_session(
-                                    &mut writer,
-                                    &mut reader,
-                                    &mut app,
-                                    &repo_path,
-                                    cli.task.clone(),
-                                )
-                                .await?;
-                            }
-                            other => handle_daemon_msg(&mut app, other),
-                        }
-                    }
-                }
-                Ok(Ok(DaemonMessage::Error { .. })) | Err(_) => {
-                    // Create new session
-                    create_new_session(
-                        &mut writer,
-                        &mut reader,
-                        &mut app,
-                        &repo_path,
-                        cli.task.clone(),
-                    )
-                    .await?;
-                }
-                Ok(Ok(other)) => {
-                    handle_daemon_msg(&mut app, other);
-                }
-                Ok(Err(e)) => return Err(e),
-            }
-        }
-    }
-
-    // 4. Set up terminal raw mode & alternate screen
+    // Terminal comes up immediately, before any connection attempt: the
+    // connection banner (Connecting / PairingRequired / Reconnecting) is just
+    // another `app.connection` state rendered by the normal draw loop, so
+    // nothing here blocks on the network before the TUI is interactive
+    // (design doc §2.5 — replaces the old synchronous connect-then-draw order).
     let mut term_guard = TerminalGuard::new()?;
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
-
-    // Sync initial terminal size to PTY
     let term_size = terminal.size()?;
     app.last_terminal_size = (term_size.width, term_size.height);
     app.vt_parser.set_size(term_size.height, term_size.width);
-    if let Some(session_id) = &app.session_id {
-        let _ = send_msg(
-            &mut writer,
-            &ClientMessage::PtyResize {
-                session_id: session_id.clone(),
-                cols: term_size.width,
-                rows: term_size.height,
-            },
-        )
-        .await;
-    }
 
-    // 5. Input event channel (blocking read in separate thread)
+    // Input event channel (blocking read in separate thread)
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let _input_thread = std::thread::spawn(move || {
         while let Ok(event) = crossterm::event::read() {
@@ -186,51 +107,42 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
     });
 
-    // Spawn dedicated daemon reader task (F8)
-    let mut daemon_rx = spawn_daemon_reader(reader);
+    let (conn_tx, mut conn_rx) = mpsc::unbounded_channel::<ConnEvent>();
+    tokio::spawn(reconnect_task(
+        target.clone(),
+        autostart,
+        identity_path.clone(),
+        conn_tx.clone(),
+    ));
 
-    // Request fresh quotas from daemon
-    let _ = send_msg(&mut writer, &ClientMessage::RequestQuota).await;
+    let (pty_tx_events, mut pty_rx_events) = mpsc::unbounded_channel::<PtyEvent>();
 
-    // Submit initial task if provided via CLI argument (F9)
-    if let Some(task_text) = &cli.task {
-        app.task = Some(task_text.clone());
-        if let Some(session_id) = &app.session_id {
-            let _ = send_msg(
-                &mut writer,
-                &ClientMessage::SubmitTask {
-                    session_id: session_id.clone(),
-                    task: task_text.clone(),
-                },
-            )
-            .await;
-        }
-    }
+    let mut writer: Option<DaemonWriter> = None;
+    let mut daemon_rx: Option<mpsc::UnboundedReceiver<Result<DaemonMessage>>> = None;
+    let mut pty_out: Option<std::sync::mpsc::Sender<WsMessage>> = None;
+    let mut pty_in: Option<mpsc::UnboundedReceiver<std::result::Result<WsMessage, RemoteError>>> =
+        None;
+    let mut bootstrapped = false;
 
-    // 6. Main event loop
     loop {
         app.clear_expired_status(Duration::from_secs(5));
 
-        // Check if resize needed
         let current_size = terminal.size()?;
         if (current_size.width, current_size.height) != app.last_terminal_size {
             app.last_terminal_size = (current_size.width, current_size.height);
             let body_rows = current_size.height.saturating_sub(3).max(1);
             app.vt_parser.set_size(body_rows, current_size.width);
-            if let Some(session_id) = &app.session_id {
-                let _ = send_msg(
-                    &mut writer,
-                    &ClientMessage::PtyResize {
-                        session_id: session_id.clone(),
+            if let (Some(w), Some(session_id)) = (writer.as_mut(), app.session_id.clone()) {
+                let _ = w
+                    .send(&ClientMessage::PtyResize {
+                        session_id,
                         cols: current_size.width,
                         rows: body_rows,
-                    },
-                )
-                .await;
+                    })
+                    .await;
             }
         }
 
-        // Draw UI frame
         let mut cursor_pos = None;
         terminal.draw(|frame| {
             let area = frame.area();
@@ -257,23 +169,27 @@ pub async fn run(cli: Cli) -> Result<()> {
                         let action = handle_key(&mut app, key);
                         match action {
                             AppAction::SendPtyInput(bytes) => {
-                                if let Some(session_id) = &app.session_id {
-                                    let _ = send_msg(
-                                        &mut writer,
-                                        &ClientMessage::PtyInput {
-                                            session_id: session_id.clone(),
-                                            data: bytes.into(),
-                                        },
-                                    )
-                                    .await;
+                                if let Some(session_id) = app.session_id.clone() {
+                                    if let Some(tx) = pty_out.as_ref() {
+                                        let frame = aihub_core::PtyBinaryFrame::new(0, bytes).encode();
+                                        let _ = tx.send(WsMessage::Binary(frame));
+                                    } else if let Some(w) = writer.as_mut() {
+                                        let _ = w
+                                            .send(&ClientMessage::PtyInput { session_id, data: bytes.into() })
+                                            .await;
+                                    }
                                 }
                             }
                             AppAction::SendMessage(msg) => {
-                                let _ = send_msg(&mut writer, &msg).await;
+                                if let Some(w) = writer.as_mut() {
+                                    let _ = w.send(&msg).await;
+                                }
                             }
                             AppAction::SendMessages(msgs) => {
-                                for msg in msgs {
-                                    let _ = send_msg(&mut writer, &msg).await;
+                                if let Some(w) = writer.as_mut() {
+                                    for msg in msgs {
+                                        let _ = w.send(&msg).await;
+                                    }
                                 }
                             }
                             AppAction::SetUiMode(mode) => {
@@ -289,61 +205,107 @@ pub async fn run(cli: Cli) -> Result<()> {
                         let body_rows = rows.saturating_sub(3).max(1);
                         app.vt_parser.set_size(body_rows, cols);
                         app.last_terminal_size = (cols, rows);
-                        if let Some(session_id) = &app.session_id {
-                            let _ = send_msg(
-                                &mut writer,
-                                &ClientMessage::PtyResize {
-                                    session_id: session_id.clone(),
-                                    cols,
-                                    rows: body_rows,
-                                },
-                            )
-                            .await;
+                        if let (Some(w), Some(session_id)) = (writer.as_mut(), app.session_id.clone()) {
+                            let _ = w
+                                .send(&ClientMessage::PtyResize { session_id, cols, rows: body_rows })
+                                .await;
                         }
                     }
                     _ => {}
                 }
             }
 
-            // Message from daemon via dedicated reader task (F8)
-            msg_opt = daemon_rx.recv() => {
+            // Message from the active daemon connection, local or remote.
+            msg_opt = async {
+                match daemon_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
                 match msg_opt {
                     Some(Ok(msg)) => {
                         handle_daemon_msg(&mut app, msg);
                     }
                     Some(Err(_)) | None => {
-                        // Connection lost: attempt reconnection
-                        app.set_status("Conexão perdida. Tentando reconectar...");
-                        let mut reconnected = false;
-                        for _ in 0..10 {
-                            tokio::time::sleep(Duration::from_millis(500)).await;
-                            if let Ok(new_stream) = connect_or_start_daemon(&socket_path).await {
-                                let (mut new_reader, mut new_writer) = new_stream.into_split();
-                                if perform_handshake(&mut new_writer, &mut new_reader).await.is_ok() {
-                                    if let Some(session_id) = &app.session_id {
-                                        let _ = send_msg(
-                                            &mut new_writer,
-                                            &ClientMessage::Attach {
-                                                target: SessionTarget::Id(session_id.clone()),
-                                                last_seen_offset: None,
-                                            },
-                                        )
-                                        .await;
-                                    }
-                                    daemon_rx = spawn_daemon_reader(new_reader);
-                                    writer = new_writer;
-                                    reconnected = true;
-                                    app.set_status("Reconectado ao daemon com sucesso.");
-                                    break;
-                                }
-                            }
-                        }
-                        if !reconnected {
-                            app.set_status("Falha ao reconectar ao aihubd.");
-                            break;
-                        }
+                        // Connection lost: hand off to a fresh background reconnect task
+                        // (design doc §2.5). Its backoff sleep runs in that spawned task,
+                        // never here, so this select loop keeps drawing every frame.
+                        writer = None;
+                        daemon_rx = None;
+                        pty_out = None;
+                        pty_in = None;
+                        app.connection = ConnectionState::Reconnecting {
+                            class_text: "Conexão perdida".to_string(),
+                            attempt: 1,
+                        };
+                        tokio::spawn(reconnect_task(
+                            target.clone(),
+                            autostart,
+                            identity_path.clone(),
+                            conn_tx.clone(),
+                        ));
                     }
                 }
+            }
+
+            // Connection lifecycle event from the background reconnect task.
+            Some(event) = conn_rx.recv() => {
+                match event {
+                    ConnEvent::Connected { writer: mut new_writer, daemon_rx: mut new_rx } => {
+                        app.connection = ConnectionState::Connected;
+                        if !bootstrapped {
+                            bootstrapped = true;
+                            bootstrap_session(&mut new_writer, &mut new_rx, &mut app, &cli, &repo_path).await?;
+
+                            if let RemoteTarget::Remote(url) = &target {
+                                if let (Some(ticket), Some(session_id)) =
+                                    (app.channel_ticket.clone(), app.session_id.clone())
+                                {
+                                    spawn_pty_connect(url.clone(), session_id, ticket, pty_tx_events.clone());
+                                }
+                            }
+                        } else if let Some(session_id) = app.session_id.clone() {
+                            let _ = new_writer
+                                .send(&ClientMessage::Attach { target: SessionTarget::Id(session_id), last_seen_offset: None })
+                                .await;
+                        }
+                        writer = Some(new_writer);
+                        daemon_rx = Some(new_rx);
+                    }
+                    ConnEvent::PairingRequired { code } => {
+                        app.connection = ConnectionState::PairingRequired { code };
+                    }
+                    ConnEvent::Failed { text, attempt } => {
+                        app.connection = ConnectionState::Reconnecting { class_text: text, attempt };
+                    }
+                }
+            }
+
+            // Inbound frame on the dedicated PTY binary channel, once open.
+            pty_msg = async {
+                match pty_in.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match pty_msg {
+                    Some(Ok(WsMessage::Binary(bytes))) => {
+                        if let Some((frame, _consumed)) = aihub_core::PtyBinaryFrame::decode(&bytes) {
+                            app.vt_parser.process(&frame.data);
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) | None => {
+                        pty_out = None;
+                        pty_in = None;
+                    }
+                }
+            }
+
+            // The dedicated PTY channel finished connecting.
+            Some(PtyEvent::Ready { tx, rx }) = pty_rx_events.recv() => {
+                pty_out = Some(tx);
+                pty_in = Some(rx);
             }
         }
     }
@@ -353,71 +315,325 @@ pub async fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-async fn create_new_session(
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
-    reader: &mut tokio::net::unix::OwnedReadHalf,
+/// Handles `aihub doctor [--remote]` and returns without ever touching the terminal.
+async fn run_doctor_command(cli: &Cli, remote_flag: bool) -> Result<()> {
+    if !remote_flag {
+        println!("aihub doctor: apenas --remote é suportado nesta versão.");
+        return Ok(());
+    }
+    let url = match cli.daemon_target() {
+        Some(raw) => match remote::parse_daemon_target(&raw) {
+            RemoteTarget::Remote(u) => u,
+            RemoteTarget::Local(_) => {
+                println!("aihub doctor --remote requer um --daemon <URL> remoto (wss://...).");
+                return Ok(());
+            }
+        },
+        None => {
+            println!("aihub doctor --remote requer --daemon <URL> (ou AIHUB_DAEMON).");
+            return Ok(());
+        }
+    };
+    let report = doctor::run_remote_doctor(&url, &default_identity_path()).await?;
+    println!("{}", report.render());
+    Ok(())
+}
+
+/// Drives one connection attempt against `target`, retrying forever with
+/// backoff until it succeeds. The `sleep` between attempts runs in this
+/// spawned task, never on the caller's draw loop (design doc §2.5).
+async fn reconnect_task(
+    target: RemoteTarget,
+    autostart: bool,
+    identity_path: PathBuf,
+    events: mpsc::UnboundedSender<ConnEvent>,
+) {
+    let mut backoff = Backoff::new();
+    loop {
+        match &target {
+            RemoteTarget::Local(socket_path) => match connect_local(socket_path, autostart).await {
+                Ok(stream) => {
+                    let (mut reader, mut writer) = stream.into_split();
+                    if perform_handshake(&mut writer, &mut reader).await.is_ok() {
+                        let daemon_rx = spawn_daemon_reader(reader);
+                        let _ = events.send(ConnEvent::Connected {
+                            writer: DaemonWriter::Uds(writer),
+                            daemon_rx,
+                        });
+                        return;
+                    }
+                    let _ = events.send(ConnEvent::Failed {
+                        text: "Conexão perdida. Tentando reconectar...".to_string(),
+                        attempt: backoff.attempt() + 1,
+                    });
+                }
+                Err(_) => {
+                    let _ = events.send(ConnEvent::Failed {
+                        text: "Conexão perdida. Tentando reconectar...".to_string(),
+                        attempt: backoff.attempt() + 1,
+                    });
+                }
+            },
+            RemoteTarget::Remote(url) => {
+                let identity = match Identity::load_or_create(&identity_path) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        let _ = events.send(ConnEvent::Failed {
+                            text: format!("Falha ao carregar identidade local: {e}"),
+                            attempt: backoff.attempt() + 1,
+                        });
+                        tokio::time::sleep(backoff.next_delay()).await;
+                        continue;
+                    }
+                };
+                match remote::connect(url, CONNECT_TIMEOUT).await {
+                    Ok(socket) => {
+                        let mut io = remote::spawn_io(socket);
+                        match remote::perform_remote_handshake(&mut io, &identity, CONNECT_TIMEOUT)
+                            .await
+                        {
+                            Ok(()) => {
+                                let daemon_rx = remote::spawn_daemon_reader(io.inbound);
+                                let _ = events.send(ConnEvent::Connected {
+                                    writer: DaemonWriter::Ws(io.outbound),
+                                    daemon_rx,
+                                });
+                                return;
+                            }
+                            Err(e) if e.class == FailureClass::Unauthorized => {
+                                let _ = events.send(ConnEvent::PairingRequired {
+                                    code: identity.pairing_code(),
+                                });
+                            }
+                            Err(e) => {
+                                let _ = events.send(ConnEvent::Failed {
+                                    text: e.class.banner_text().to_string(),
+                                    attempt: backoff.attempt() + 1,
+                                });
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = events.send(ConnEvent::Failed {
+                            text: e.class.banner_text().to_string(),
+                            attempt: backoff.attempt() + 1,
+                        });
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(backoff.next_delay()).await;
+    }
+}
+
+/// Opens the dedicated PTY channel in the background so it never blocks the draw loop.
+fn spawn_pty_connect(
+    control_url: String,
+    session_id: SessionId,
+    ticket: ChannelTicket,
+    events: mpsc::UnboundedSender<PtyEvent>,
+) {
+    tokio::spawn(async move {
+        let pty_url = remote::pty_channel_url(&control_url);
+        if let Ok(io) =
+            remote::connect_pty_channel(&pty_url, &session_id, ticket, CONNECT_TIMEOUT).await
+        {
+            let _ = events.send(PtyEvent::Ready {
+                tx: io.outbound,
+                rx: io.inbound,
+            });
+        }
+    });
+}
+
+/// Performs the initial attach-or-create bootstrap once the first connection
+/// succeeds: reattaches to the latest session for the repo (or a named
+/// session for `aihub attach <id>`), creating a new session if none exists.
+async fn bootstrap_session(
+    writer: &mut DaemonWriter,
+    daemon_rx: &mut mpsc::UnboundedReceiver<Result<DaemonMessage>>,
     app: &mut App,
-    repo_path: &std::path::Path,
+    cli: &Cli,
+    repo_path: &Path,
+) -> Result<()> {
+    match &cli.command {
+        Some(Commands::Attach { session_id }) => {
+            let target = match session_id {
+                Some(id) => SessionTarget::Id(SessionId::new(id.clone())),
+                None => SessionTarget::LatestForRepo(repo_path.to_path_buf()),
+            };
+            writer
+                .send(&ClientMessage::Attach {
+                    target,
+                    last_seen_offset: None,
+                })
+                .await?;
+            if let Ok(Some(Ok(msg))) =
+                tokio::time::timeout(Duration::from_secs(3), daemon_rx.recv()).await
+            {
+                handle_daemon_msg(app, msg);
+            }
+        }
+        Some(Commands::Doctor { .. }) => unreachable!("doctor is handled before bootstrap"),
+        None => {
+            writer
+                .send(&ClientMessage::Attach {
+                    target: SessionTarget::LatestForRepo(repo_path.to_path_buf()),
+                    last_seen_offset: None,
+                })
+                .await?;
+
+            match tokio::time::timeout(Duration::from_secs(3), daemon_rx.recv()).await {
+                Ok(Some(Ok(DaemonMessage::Attached {
+                    session_id,
+                    scrollback,
+                    summary,
+                    channel_ticket,
+                    ..
+                }))) => {
+                    apply_attached(app, session_id, scrollback, summary, channel_ticket);
+                }
+                Ok(Some(Ok(DaemonMessage::QuotaPush { snapshots }))) => {
+                    app.snapshots = snapshots;
+                    if let Ok(Some(Ok(next))) =
+                        tokio::time::timeout(Duration::from_secs(2), daemon_rx.recv()).await
+                    {
+                        match next {
+                            DaemonMessage::Attached {
+                                session_id,
+                                scrollback,
+                                summary,
+                                channel_ticket,
+                                ..
+                            } => {
+                                apply_attached(
+                                    app,
+                                    session_id,
+                                    scrollback,
+                                    summary,
+                                    channel_ticket,
+                                );
+                            }
+                            DaemonMessage::Error { .. } => {
+                                create_new_session(
+                                    writer,
+                                    daemon_rx,
+                                    app,
+                                    repo_path,
+                                    cli.task.clone(),
+                                )
+                                .await?;
+                            }
+                            other => handle_daemon_msg(app, other),
+                        }
+                    }
+                }
+                Ok(Some(Ok(other))) => {
+                    handle_daemon_msg(app, other);
+                }
+                Ok(Some(Err(e))) => return Err(e),
+                Ok(None) | Err(_) => {
+                    create_new_session(writer, daemon_rx, app, repo_path, cli.task.clone()).await?;
+                }
+            }
+        }
+    }
+
+    let _ = writer.send(&ClientMessage::RequestQuota).await;
+
+    if let Some(task_text) = &cli.task {
+        app.task = Some(task_text.clone());
+        if let Some(session_id) = &app.session_id {
+            let _ = writer
+                .send(&ClientMessage::SubmitTask {
+                    session_id: session_id.clone(),
+                    task: task_text.clone(),
+                })
+                .await;
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_attached(
+    app: &mut App,
+    session_id: SessionId,
+    scrollback: aihub_core::Base64Bytes,
+    summary: SessionSummary,
+    channel_ticket: Option<ChannelTicket>,
+) {
+    app.session_id = Some(session_id);
+    app.harness = summary.harness;
+    app.branch = summary.branch;
+    app.mode = summary.mode;
+    app.active = summary.active;
+    app.worktree_path = summary.worktree_path;
+    app.repo_path = summary.repo_path;
+    app.vt_parser.process(scrollback.as_slice());
+    if channel_ticket.is_some() {
+        app.channel_ticket = channel_ticket;
+    }
+}
+
+async fn create_new_session(
+    writer: &mut DaemonWriter,
+    daemon_rx: &mut mpsc::UnboundedReceiver<Result<DaemonMessage>>,
+    app: &mut App,
+    repo_path: &Path,
     initial_prompt: Option<String>,
 ) -> Result<()> {
     app.task = initial_prompt.clone();
-    send_msg(
-        writer,
-        &ClientMessage::NewSession {
+    writer
+        .send(&ClientMessage::NewSession {
             harness: HarnessId::ClaudeCode,
             repo_path: repo_path.to_path_buf(),
             initial_prompt,
-        },
-    )
-    .await?;
+        })
+        .await?;
 
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(10) {
-        match tokio::time::timeout(Duration::from_secs(3), recv_msg(reader)).await {
-            Ok(Ok(DaemonMessage::SessionCreated {
+        match tokio::time::timeout(Duration::from_secs(3), daemon_rx.recv()).await {
+            Ok(Some(Ok(DaemonMessage::SessionCreated {
                 session_id,
                 harness,
                 worktree_path,
                 branch,
+                channel_ticket,
                 ..
-            })) => {
+            }))) => {
                 app.session_id = Some(session_id.clone());
                 app.harness = harness;
                 app.worktree_path = worktree_path;
                 app.branch = branch;
+                if channel_ticket.is_some() {
+                    app.channel_ticket = channel_ticket;
+                }
 
-                // Now attach to it
-                send_msg(
-                    writer,
-                    &ClientMessage::Attach {
+                writer
+                    .send(&ClientMessage::Attach {
                         target: SessionTarget::Id(session_id),
                         last_seen_offset: None,
-                    },
-                )
-                .await?;
+                    })
+                    .await?;
                 break;
             }
-            Ok(Ok(DaemonMessage::Attached {
+            Ok(Some(Ok(DaemonMessage::Attached {
                 session_id,
                 scrollback,
                 summary,
+                channel_ticket,
                 ..
-            })) => {
-                app.session_id = Some(session_id);
-                app.harness = summary.harness;
-                app.branch = summary.branch;
-                app.mode = summary.mode;
-                app.active = summary.active;
-                app.worktree_path = summary.worktree_path;
-                app.repo_path = summary.repo_path;
-                app.vt_parser.process(scrollback.as_slice());
+            }))) => {
+                apply_attached(app, session_id, scrollback, summary, channel_ticket);
                 break;
             }
-            Ok(Ok(other)) => {
+            Ok(Some(Ok(other))) => {
                 handle_daemon_msg(app, other);
             }
-            Ok(Err(e)) => return Err(e),
-            Err(_) => break,
+            Ok(Some(Err(e))) => return Err(e),
+            Ok(None) | Err(_) => break,
         }
     }
     Ok(())
@@ -431,16 +647,15 @@ pub fn handle_daemon_msg(app: &mut App, msg: DaemonMessage) {
             session_id,
             scrollback,
             summary,
+            channel_ticket,
             ..
         } => {
-            app.session_id = Some(session_id);
-            app.harness = summary.harness;
-            app.branch = summary.branch;
-            app.mode = summary.mode;
-            app.active = summary.active;
-            app.worktree_path = summary.worktree_path;
-            app.repo_path = summary.repo_path;
-            app.vt_parser.process(scrollback.as_slice());
+            apply_attached(app, session_id, scrollback, summary, channel_ticket);
+        }
+        DaemonMessage::SessionCreated { channel_ticket, .. } => {
+            if channel_ticket.is_some() {
+                app.channel_ticket = channel_ticket;
+            }
         }
         DaemonMessage::Detached { session_id } => {
             if let Some(curr) = &app.session_id {
@@ -573,7 +788,6 @@ pub fn handle_daemon_msg(app: &mut App, msg: DaemonMessage) {
             app.set_status("Não autorizado");
         }
         DaemonMessage::SessionList { .. }
-        | DaemonMessage::SessionCreated { .. }
         | DaemonMessage::Hello { .. }
         | DaemonMessage::Challenge { .. } => {}
     }
