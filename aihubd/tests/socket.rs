@@ -209,12 +209,15 @@ async fn cached_quota_broadcast_attach_and_disconnect() {
         other => panic!("expected Attached, got {other:?}"),
     }
     output.send(b"live".to_vec()).unwrap();
+    // "before attach" (13 bytes) was already pushed into the ring at session creation, so
+    // this chunk's offset is 13 (ADR §2.2: offsets count every byte ever emitted by the PTY,
+    // continuous, starting at 0 for the very first byte).
     assert_eq!(
         recv(&mut b).await,
         DaemonMessage::PtyOutput {
             session_id: id.clone(),
             data: b"live".to_vec().into(),
-            stream_offset: 0,
+            stream_offset: 13,
         }
     );
     drop(b);

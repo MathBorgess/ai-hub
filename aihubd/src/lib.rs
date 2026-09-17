@@ -1,6 +1,13 @@
 //! Foreground Unix socket supervisor. Client lifetimes never own child PTYs.
 pub mod auth;
+mod ring_buffer;
+pub mod sessions_catalog;
+mod ticket;
+mod ws;
+pub mod ws_proto;
 use crate::auth::{Allowlist, PrincipalId};
+use crate::ring_buffer::{RingBuffer, RING_BUFFER_CAP};
+use crate::ticket::TicketRegistry;
 use aihub_core::*;
 use aihub_pty::{PtySize, PtySpawnOptions};
 use anyhow::{anyhow, bail, Result};
@@ -284,6 +291,13 @@ struct Session {
     /// other session-scoped operation are vetoed for any other principal, even if they know
     /// the `SessionId` — mere possession of the handle confers no authorization.
     owner: PrincipalId,
+    /// Ring buffer de retomada por offset (2 MiB, ADR §2.2/§3): persiste através de troca de
+    /// harness (`switch()` nunca o substitui, só `push`a o banner do PTY entrante nele).
+    ring: RingBuffer,
+    /// Espelha os mesmos bytes de `ring.push` para a conexão de PTY dedicada (canal duplo,
+    /// ADR contradição 1). Distinto do broadcast JSON em `state.clients`: este carrega
+    /// `(stream_offset, data)` cru, consumido pelo canal binário sem overhead de Base64/JSON.
+    pty_channel_tx: broadcast::Sender<(u64, Vec<u8>)>,
 }
 
 /// Pending destructive confirmation for `MergeRequest` over a network-authenticated connection
@@ -326,6 +340,8 @@ struct State {
     sessions: Vec<Session>,
     clients: HashMap<u64, Client>,
     next_id: u64,
+    /// `channel_ticket`s emitidos e ainda não redimidos (ADR contradição 1, Opção B).
+    tickets: TicketRegistry,
 }
 impl State {
     fn send(&mut self, client: u64, message: DaemonMessage) {
@@ -432,6 +448,10 @@ pub struct Daemon {
     allowlist: Arc<Allowlist>,
     /// Durable audit log path (`~/.local/share/aihub/log/audit.jsonl` by default, ADR §2.3 §6).
     audit_path: PathBuf,
+    /// Path to `sessions.json` (ADR contradição 3, Opção B). `None` by default (`Daemon::new`)
+    /// so tests never touch a real `~/.local/share/aihub` — only `with_sessions_catalog_path`
+    /// (and `main.rs`, which always sets it) enables persistence/reconciliation.
+    catalog_path: Option<PathBuf>,
 }
 
 impl Daemon {
@@ -547,7 +567,16 @@ impl Daemon {
             drain: Arc::new(|| Box::pin(async { Ok(0) })),
             allowlist: Arc::new(Allowlist::load()),
             audit_path: auth::audit_log_path(),
+            catalog_path: None,
         }
+    }
+
+    /// Enables `sessions.json` persistence and startup orphan reconciliation at `path`
+    /// (ADR contradição 3, Opção B). Production (`main.rs`) always sets this; tests only set
+    /// it when they specifically exercise the catalog, so ordinary tests never touch disk.
+    pub fn with_sessions_catalog_path(mut self, path: PathBuf) -> Self {
+        self.catalog_path = Some(path);
+        self
     }
 
     /// Overrides the owner-approved public key allowlist (default: `Allowlist::load()`, empty
@@ -936,6 +965,9 @@ impl Daemon {
         }
         let pty = (self.spawner)(harness, options(wt.path.clone(), prompt.clone()), None)?;
         let id = wt.session_id.clone();
+        let mut ring = RingBuffer::new(RING_BUFFER_CAP);
+        ring.push(&pty.scrollback);
+        let (pty_channel_tx, _) = broadcast::channel(256);
         let mut session = Session {
             summary: SessionSummary {
                 session_id: id.clone(),
@@ -959,6 +991,8 @@ impl Daemon {
             recommendation_id: 0,
             current_recommendation: None,
             owner,
+            ring,
+            pty_channel_tx,
         };
         self.watch(&mut session);
         log_lifecycle(
@@ -979,7 +1013,55 @@ impl Daemon {
             channel_ticket: None,
         });
         state.sessions.push(session);
+        self.persist_catalog(state);
         Ok(id)
+    }
+
+    /// Rewrites `sessions.json` from the current registry (ADR contradição 3, Opção B).
+    /// No-op unless `with_sessions_catalog_path` was set. `pid` is always `None`: `aihub-pty`
+    /// exposes no PID getter today (see this session's `remaining` in result.md) — the schema
+    /// and the startup reconciliation path are real, only the real-PID plumbing is deferred.
+    fn persist_catalog(&self, state: &State) {
+        let Some(path) = &self.catalog_path else {
+            return;
+        };
+        let mut catalog = sessions_catalog::SessionsCatalog::default();
+        for s in &state.sessions {
+            catalog.upsert(sessions_catalog::SessionRecord {
+                session_id: s.summary.session_id.clone(),
+                pid: None,
+                owner: s.owner.to_string(),
+                repo_path: s.summary.repo_path.clone(),
+                worktree_path: s.summary.worktree_path.clone(),
+                branch: s.summary.branch.clone(),
+                harness: s.summary.harness,
+            });
+        }
+        if let Err(e) = catalog.save(path) {
+            log_lifecycle("ERROR", "sessions_catalog_save", &e.to_string());
+        }
+    }
+
+    /// Bootstrap state for a newly-ticketed PTY channel (`ws.rs`): the live broadcast
+    /// subscription, the ring buffer's current head offset and full snapshot, and the
+    /// session's input writer — all read under one lock acquisition, so no byte pushed by
+    /// `watch()` between reading the snapshot and subscribing can be silently missed. `None`
+    /// if the session no longer exists (raced with a purge; §3 "Teste 4" territory).
+    pub(crate) async fn pty_channel_bootstrap(
+        &self,
+        session_id: &SessionId,
+    ) -> Option<crate::ws::PtyChannelBootstrap> {
+        let state = self.state.lock().await;
+        let s = state
+            .sessions
+            .iter()
+            .find(|s| &s.summary.session_id == session_id)?;
+        Some(crate::ws::PtyChannelBootstrap {
+            rx: s.pty_channel_tx.subscribe(),
+            head_offset: s.ring.head_offset(),
+            snapshot: s.ring.snapshot(),
+            try_write: s.pty.try_write.clone(),
+        })
     }
 
     fn watch(&self, session: &mut Session) {
@@ -1013,14 +1095,17 @@ impl Daemon {
                 if s.generation != generation {
                     break;
                 }
-                s.pty.scrollback.extend_from_slice(&data);
-                // Daemon retains only the most recent 1 MiB per session.
-                let excess = s.pty.scrollback.len().saturating_sub(1024 * 1024);
-                s.pty.scrollback.drain(..excess);
+                // Ring buffer de 2 MiB indexado por offset monotônico (ADR §2.2, §3),
+                // substitui o antigo scrollback de 1 MiB sem numeração de sequência.
+                let offset = s.ring.push(&data);
+                // Canal de PTY dedicado (ADR contradição 1): mesmos bytes, sem overhead de
+                // JSON/Base64. Ignora `SendError` — sem assinante no momento é normal (nenhum
+                // cliente de rede anexado ainda).
+                let _ = s.pty_channel_tx.send((offset, data.clone()));
                 let message = DaemonMessage::PtyOutput {
                     session_id: output_session_id.clone(),
                     data: data.into(),
-                    stream_offset: 0,
+                    stream_offset: offset,
                 };
                 state.clients.retain(|_, c| {
                     !c.attached.contains(&output_session_id)
@@ -1433,26 +1518,7 @@ impl Daemon {
             Some(p) => p,
             None => return Ok(()),
         };
-        let (tx, mut rx) = mpsc::channel(128);
-        let id;
-        {
-            let mut state = self.state.lock().await;
-            state.next_id += 1;
-            id = state.next_id;
-            tx.try_send(DaemonMessage::QuotaPush {
-                snapshots: self.cache.lock().await.clone(),
-            })?;
-            state.clients.insert(
-                id,
-                Client {
-                    sender: tx,
-                    attached: HashSet::new(),
-                    merge: None,
-                    principal: principal.clone(),
-                    merge_confirm: None,
-                },
-            );
-        }
+        let (id, mut rx) = self.register_client(principal.clone()).await?;
         let mut writing = JoinSet::new();
         writing.spawn(async move {
             while let Some(msg) = rx.recv().await {
@@ -1465,59 +1531,95 @@ impl Daemon {
                 _ = writing.join_next() => break,
                 message = read_message(&mut reader) => match message { Ok(m) => m, Err(_) => break },
             };
-            // A mid-connection Hello only means something while a destructive MergeRequest
-            // envelope is pending (ADR §2.3 nível 3); otherwise it falls through to `handle()`'s
-            // ordinary "Hello is only valid at connection start" rejection, unchanged.
-            if let ClientMessage::Hello {
-                credential: Some(ref cred),
-                ..
-            } = message
-            {
-                let pending = self
-                    .state
-                    .lock()
-                    .await
-                    .clients
-                    .get_mut(&id)
-                    .and_then(|c| c.merge_confirm.take());
-                if let Some(pending) = pending {
-                    self.confirm_merge_envelope(id, pending, cred).await;
-                    continue;
-                }
-            }
-            if let Some(sid) = message_session_id(&message) {
-                let owned_by_caller = {
-                    let state = self.state.lock().await;
-                    match state.sessions.iter().find(|s| &s.summary.session_id == sid) {
-                        Some(s) => s.owner == principal,
-                        // Let the ordinary "session not found" error report through `handle()`.
-                        None => true,
-                    }
-                };
-                if !owned_by_caller {
-                    let mut state = self.state.lock().await;
-                    self.reject_unauthorized(
-                        &mut state,
-                        id,
-                        "session_wrong_owner",
-                        Some(&principal),
-                        &format!("touched session {sid} it does not own"),
-                    );
-                    continue;
-                }
-            }
-            // A disconnect must not cancel a switch after the incoming PTY starts.
-            if let Err(e) = self.handle(id, message).await {
-                let response = if e.downcast_ref::<StopUnconfirmed>().is_some() {
-                    error("stop_unconfirmed", &e.to_string())
-                } else {
-                    error("request_failed", "request could not be completed")
-                };
-                self.state.lock().await.send(id, response);
-            }
+            self.dispatch(id, &principal, message).await;
         }
         self.state.lock().await.clients.remove(&id);
         Ok(())
+    }
+
+    /// Registers a new connection in `state.clients` and returns its id plus the receiving
+    /// half of its outbound message channel — shared by the local Unix socket path (`client`)
+    /// and the WebSocket control channel (`ws.rs`), which otherwise duplicate nothing else
+    /// about connection bookkeeping.
+    pub(crate) async fn register_client(
+        &self,
+        principal: PrincipalId,
+    ) -> Result<(u64, mpsc::Receiver<DaemonMessage>)> {
+        let (tx, rx) = mpsc::channel(128);
+        let mut state = self.state.lock().await;
+        state.next_id += 1;
+        let id = state.next_id;
+        tx.try_send(DaemonMessage::QuotaPush {
+            snapshots: self.cache.lock().await.clone(),
+        })?;
+        state.clients.insert(
+            id,
+            Client {
+                sender: tx,
+                attached: HashSet::new(),
+                merge: None,
+                principal,
+                merge_confirm: None,
+            },
+        );
+        Ok((id, rx))
+    }
+
+    /// Dispatches one already-decoded `ClientMessage` for connection `id`/`principal`: the
+    /// mid-connection-`Hello`-as-merge-confirmation special case, the session-ownership
+    /// pre-check (01-transporte-e-sessao.md §4), and the ordinary `handle()` call — shared by
+    /// every transport (`client()` here, and the WebSocket control channel in `ws.rs`).
+    pub(crate) async fn dispatch(&self, id: u64, principal: &PrincipalId, message: ClientMessage) {
+        // A mid-connection Hello only means something while a destructive MergeRequest
+        // envelope is pending (ADR §2.3 nível 3); otherwise it falls through to `handle()`'s
+        // ordinary "Hello is only valid at connection start" rejection, unchanged.
+        if let ClientMessage::Hello {
+            credential: Some(ref cred),
+            ..
+        } = message
+        {
+            let pending = self
+                .state
+                .lock()
+                .await
+                .clients
+                .get_mut(&id)
+                .and_then(|c| c.merge_confirm.take());
+            if let Some(pending) = pending {
+                self.confirm_merge_envelope(id, pending, cred).await;
+                return;
+            }
+        }
+        if let Some(sid) = message_session_id(&message) {
+            let owned_by_caller = {
+                let state = self.state.lock().await;
+                match state.sessions.iter().find(|s| &s.summary.session_id == sid) {
+                    Some(s) => &s.owner == principal,
+                    // Let the ordinary "session not found" error report through `handle()`.
+                    None => true,
+                }
+            };
+            if !owned_by_caller {
+                let mut state = self.state.lock().await;
+                self.reject_unauthorized(
+                    &mut state,
+                    id,
+                    "session_wrong_owner",
+                    Some(principal),
+                    &format!("touched session {sid} it does not own"),
+                );
+                return;
+            }
+        }
+        // A disconnect must not cancel a switch after the incoming PTY starts.
+        if let Err(e) = self.handle(id, message).await {
+            let response = if e.downcast_ref::<StopUnconfirmed>().is_some() {
+                error("stop_unconfirmed", &e.to_string())
+            } else {
+                error("request_failed", "request could not be completed")
+            };
+            self.state.lock().await.send(id, response);
+        }
     }
     async fn handle(&self, client: u64, message: ClientMessage) -> Result<()> {
         if matches!(message, ClientMessage::RequestQuota) {
@@ -1551,7 +1653,10 @@ impl Daemon {
                 let wt = aihub_git::create_session_worktree(&repo_path, &id, None).await?;
                 self.add_locked(&mut state, repo_path, wt, harness, initial_prompt, owner)?;
             }
-            ClientMessage::Attach { target, .. } => {
+            ClientMessage::Attach {
+                target,
+                last_seen_offset,
+            } => {
                 let s = state
                     .sessions
                     .iter()
@@ -1579,23 +1684,36 @@ impl Daemon {
                     );
                     return Ok(());
                 }
-                let (id, scrollback, summary) = (
-                    s.summary.session_id.clone(),
-                    s.pty.scrollback.clone(),
-                    s.summary.clone(),
-                );
+                let id = s.summary.session_id.clone();
+                let summary = s.summary.clone();
+                let tail_offset = s.ring.tail_offset();
+                // Delta catch-up if the offset is still retained (01-transporte-e-sessao.md
+                // §2.2 Caso A); full snapshot + gap flag otherwise, including the `None` a v2
+                // client always sends — it has no offset to resume from (Caso B).
+                let (scrollback, gap_detected) =
+                    match last_seen_offset.and_then(|off| s.ring.delta_since(off)) {
+                        Some(delta) => (delta, false),
+                        None => (s.ring.snapshot(), true),
+                    };
                 if let Some(c) = state.clients.get_mut(&client) {
                     c.attached.insert(id.clone());
                 }
+                // Only network principals need a `channel_ticket`: the local Unix socket keeps
+                // carrying both channels over the same connection (ADR §6, contradição 1).
+                let channel_ticket = if caller != PrincipalId::local() {
+                    Some(state.tickets.issue(id.clone(), caller))
+                } else {
+                    None
+                };
                 state.send(
                     client,
                     DaemonMessage::Attached {
                         session_id: id,
                         scrollback: scrollback.into(),
                         summary,
-                        stream_offset: 0,
-                        gap_detected: false,
-                        channel_ticket: None,
+                        stream_offset: tail_offset,
+                        gap_detected,
+                        channel_ticket,
                     },
                 );
             }
@@ -2090,9 +2208,10 @@ impl Daemon {
         };
 
         let s = state.session(id)?;
-        let old_scrollback = std::mem::take(&mut s.pty.scrollback);
         s.pty = incoming;
-        s.pty.scrollback.splice(..0, old_scrollback);
+        // The ring buffer (and its offset counter) lives on `Session`, not `Pty`: it survives
+        // the swap untouched. Only the new harness's initial banner needs pushing into it.
+        s.ring.push(&s.pty.scrollback);
         s.generation += 1;
         s.group_stop = GroupStopState::Pending;
         s.summary.harness = target;
@@ -2109,6 +2228,7 @@ impl Daemon {
             handoff_path,
             model: switched_model,
         });
+        self.persist_catalog(state);
 
         match brief {
             Some(b) => Ok(Some((old, b, project))),
