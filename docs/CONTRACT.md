@@ -90,6 +90,10 @@ pub enum RouteOutcome {
         harness: HarnessId,
         lane: Option<String>,
         model: Option<String>,
+        /// Absolute Unix-epoch seconds after which the hold expires (session 13 / R3), not a
+        /// duration. Router computes it as `now_s + hold_duration_s` at recommendation time
+        /// (`aihub-router/src/lib.rs:219`); consumers compare it directly against the current
+        /// epoch time, never against 0.
         holds_until_s: Option<u64>,
     },
     NoCapacity {
@@ -173,6 +177,30 @@ impl QuotaSnapshot {
 ```
 
 #### Module `aihub_core::ipc`
+
+**PROTOCOL_VERSION stays 2 (session 13 decision, not a bump).** Sessions 09–12 added three
+wire fields — `ClientMessage::AcceptRecommendation`, `DaemonMessage::RouteRecommendation
+.recommendation_id`, `DaemonMessage::HarnessSwitched.model` — and changed what
+`RouteOutcome::Recommendation.holds_until_s` means (duration → absolute epoch deadline, R3).
+The three added fields carry `#[serde(default)]` and decode against an old peer. The
+`holds_until_s` semantic change has no such guard: a peer that still reads it as a duration
+would reproduce R3 (compares an epoch against `now`, decides the hold is already expired).
+That is not survivable via `#[serde(default)]` — it is a same-shape, different-meaning field.
+Bumping `PROTOCOL_VERSION` would not fix it either, since `perform_handshake`
+(`aihub/src/connection.rs:186`) refuses the connection outright on any mismatch rather than
+negotiating a compatibility mode; a bump only changes which exact version string must match,
+it does not let an old client interpret the new field correctly.
+The actual reason a mismatched pair cannot occur: `scripts/install.sh` always installs
+`aihub` and `aihubd` from the same build in one invocation (`--bin-dir` or
+`cargo install --path` against the same checkout, `install.sh:178-183`) — there is no
+supported path to upgrade one binary independently of the other. Given that constraint,
+`PROTOCOL_VERSION` correctly stays 2: the field is additive from a decode-compatibility
+standpoint, and the semantic change is safe only because — not despite — the daemon and TUI
+never ship or run at different versions against each other in this project's install model.
+If that install model ever changes (e.g. a daemon that outlives TUI upgrades, or a
+remote/detached daemon per `design/remote-split`), this decision must be revisited and
+`PROTOCOL_VERSION` bumped at that point.
+
 ```rust
 pub const PROTOCOL_VERSION: u32 = 2;
 
@@ -213,6 +241,14 @@ pub enum ClientMessage {
     SetMode { session_id: SessionId, mode: Mode },
     MergeRequest { session_id: SessionId, strategy: MergeStrategy },
     SubmitTask { session_id: SessionId, task: String },
+    /// Accept the current assisted recommendation for a session (session 12 / R3). New in this
+    /// round; TUI sends it from `aihub/src/keys.rs:191` instead of a manual `SwitchHarness` so
+    /// the daemon can validate acceptance against its own held recommendation and deadline.
+    AcceptRecommendation {
+        session_id: SessionId,
+        #[serde(default)]
+        recommendation_id: Option<u64>, // `#[serde(default)]` — absent on older clients
+    },
 }
 
 pub enum DaemonMessage {
@@ -236,12 +272,21 @@ pub enum DaemonMessage {
     RouteRecommendation {
         session_id: SessionId,
         outcome: RouteOutcome,
+        /// New in session 12 / R10: identifies which recommendation an `AcceptRecommendation`
+        /// or hold-expiry dispatch is acting on, so a stale hold timer can't act on newer
+        /// context. `#[serde(default)]` — 0 on older daemons/clients.
+        #[serde(default)]
+        recommendation_id: u64,
     },
     HarnessSwitched {
         session_id: SessionId,
         old_harness: HarnessId,
         new_harness: HarnessId,
         handoff_path: Option<PathBuf>,
+        /// New in session 12 / R8: the model that was actually passed to the spawned harness,
+        /// so lane/model enforcement is visible to the client. `#[serde(default)]`.
+        #[serde(default)]
+        model: Option<String>,
     },
     ModeSet { session_id: SessionId, mode: Mode },
     MergeResult {
@@ -733,4 +778,26 @@ Additive changes landed in this production round; session 07 wired the TUI to th
 
 - `ClientMessage::SwitchHarness.model: Option<String>` — threads recommendation model id to spawn; TUI sets it on Enter-to-accept after hold expiry.
 - `aihubd::spawn_pty(..., model: Option<String>)` and daemon seams `with_catalog_paths`, `with_drain`, extended `with_router` / `with_memory_recorder` closures (see session 04 result `api:` block).
+
+## 7. Handoff run 20260915T225713Z (sessions 09–12, integrated by session 13)
+
+Additive wire changes from the R1–R10 remediation round (`docs/reviews/2026-09-16-review-run3.md`).
+All four are additive/`#[serde(default)]`-guarded except the `holds_until_s` semantic change,
+whose safety rests on the install-pairing argument in §2.1 `aihub_core::ipc` above, not on a
+serde default. See that section for the full `PROTOCOL_VERSION` reasoning.
+
+- `ClientMessage::AcceptRecommendation { session_id, recommendation_id: Option<u64> }` — new
+  (`aihub-core/src/ipc.rs:144`). TUI sends it from `aihub/src/keys.rs:191` on Enter-to-accept or
+  hold-expiry auto-accept, instead of a manual `SwitchHarness`; daemon handles it at
+  `aihubd/src/lib.rs:1268` and validates it against its own held recommendation (R3).
+- `DaemonMessage::RouteRecommendation.recommendation_id: u64` — new (`ipc.rs:191`), `#[serde(default)]`.
+  Identifies the recommendation an `AcceptRecommendation` or hold-timer dispatch is acting on, so a
+  stale hold can't fire against newer context (R10).
+- `DaemonMessage::HarnessSwitched.model: Option<String>` — new (`ipc.rs:200`), `#[serde(default)]`.
+  Reports the model that was actually passed to `spawn_pty` for the new harness (R8).
+- `RouteOutcome::Recommendation.holds_until_s` — **semantic change, no wire-shape change**: was a
+  duration in seconds from the router; is now an absolute Unix-epoch deadline
+  (`aihub-router/src/lib.rs:219`, `hold.map(|h| now_s + h)`). Every consumer (`aihub/src/keys.rs:183`,
+  `aihub/src/ui/footer.rs:38`, `aihubd/src/lib.rs:1324,1495,1581`) compares it against "now" or
+  computes a remaining duration by subtracting "now" from it — never against 0 — closing R3.
 

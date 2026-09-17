@@ -98,6 +98,7 @@ fn test_prefix_actions() {
         holds_until_s: None,
         confidence: 0.9,
         reason: "mechanical task".to_string(),
+        recommendation_id: 0,
     });
 
     let ctrl_bracket = make_key(KeyCode::Char(']'), KeyModifiers::CONTROL);
@@ -123,11 +124,9 @@ fn test_prefix_actions() {
     let action = handle_key(&mut app, plain_key(KeyCode::Enter));
     assert_eq!(
         action,
-        AppAction::SendMessage(ClientMessage::SwitchHarness {
+        AppAction::SendMessage(ClientMessage::AcceptRecommendation {
             session_id: session.clone(),
-            target: HarnessId::Antigravity,
-            with_handoff: true,
-            model: None,
+            recommendation_id: Some(0),
         })
     );
 
@@ -659,6 +658,87 @@ fn f9_autonomous_after_task_submission_enables_mode() {
 }
 
 #[test]
+fn r3_router_hold_deadline_through_daemon_message_and_tui_accept() {
+    use aihub::handle_daemon_msg;
+    use aihub::keys::handle_key_at;
+    use aihub_core::DaemonMessage;
+    use aihub_core::TaskSize;
+    use aihub_router::route_outcome_at;
+
+    let now_s = 1_000_000u64;
+    let agy = aihub_core::QuotaSnapshot {
+        slot: aihub_core::SlotId::default_for(HarnessId::Antigravity),
+        status: aihub_core::QuotaStatus::Ok,
+        source: aihub_core::QuotaSource::Vendor,
+        estimated: false,
+        note: None,
+        windows: vec![],
+        lanes: vec![aihub_core::QuotaLane {
+            name: "gemini".into(),
+            kind: aihub_core::LaneKind::Own,
+            windows: vec![aihub_core::QuotaWindow::new(
+                aihub_core::WindowKind::FiveHour,
+                85.,
+                Some(30),
+                Some(18_000),
+            )],
+        }],
+    };
+    let catalog = aihub_router::ModelCatalog::from_models(vec![], vec!["gemini-test".into()]);
+    let outcome = route_outcome_at(
+        TaskTier::Mechanical,
+        TaskSize::S,
+        &[agy],
+        7200,
+        &catalog,
+        now_s,
+    )
+    .unwrap();
+    let holds_until = outcome
+        .holds_until_s()
+        .expect("router must emit hold deadline");
+    assert_eq!(
+        holds_until,
+        now_s + 30,
+        "wire hold must be epoch deadline, not duration"
+    );
+
+    let mut app = App::new(PathBuf::from("/test/repo"));
+    let session = SessionId::new("r3-hold");
+    app.session_id = Some(session.clone());
+    app.mode = Mode::Assisted;
+
+    handle_daemon_msg(
+        &mut app,
+        DaemonMessage::RouteRecommendation {
+            session_id: session.clone(),
+            outcome: outcome.clone(),
+            recommendation_id: 7,
+        },
+    );
+
+    let ctrl_bracket = make_key(KeyCode::Char(']'), KeyModifiers::CONTROL);
+    handle_key_at(&mut app, ctrl_bracket, now_s);
+    let blocked = handle_key_at(&mut app, plain_key(KeyCode::Enter), now_s);
+    assert_eq!(
+        blocked,
+        AppAction::None,
+        "TUI must treat holds_until_s as epoch seconds, not duration"
+    );
+
+    handle_key_at(&mut app, ctrl_bracket, holds_until);
+    let accept = handle_key_at(&mut app, plain_key(KeyCode::Enter), holds_until);
+    assert_eq!(
+        accept,
+        AppAction::SendMessage(ClientMessage::AcceptRecommendation {
+            session_id: session,
+            recommendation_id: Some(7),
+        }),
+        "after the router deadline, assisted accept must not send SwitchHarness"
+    );
+}
+
+#[test]
 fn hold_assisted_enter_refuses_until_hold_expires() {
     use aihub::keys::handle_key_at;
 
@@ -677,6 +757,7 @@ fn hold_assisted_enter_refuses_until_hold_expires() {
         holds_until_s: Some(hold_target_s),
         confidence: 0.95,
         reason: "Fast mechanical refactor".to_string(),
+        recommendation_id: 1,
     });
 
     let ctrl_bracket = make_key(KeyCode::Char(']'), KeyModifiers::CONTROL);
@@ -710,12 +791,10 @@ fn hold_assisted_enter_refuses_until_hold_expires() {
     let action_after = handle_key_at(&mut app, plain_key(KeyCode::Enter), hold_target_s);
     assert_eq!(
         action_after,
-        AppAction::SendMessage(ClientMessage::SwitchHarness {
+        AppAction::SendMessage(ClientMessage::AcceptRecommendation {
             session_id: session.clone(),
-            target: HarnessId::Antigravity,
-            with_handoff: true,
-            model: Some("gemini-recommended".to_string()),
+            recommendation_id: Some(1),
         }),
-        "Accepting recommendation once hold has expired must switch harness with the recommendation's model"
+        "Accepting recommendation once hold has expired must send AcceptRecommendation"
     );
 }

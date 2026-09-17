@@ -71,15 +71,26 @@ unregister_launchd() {
   local aihubd_plist="${LAUNCH_AGENTS}/io.mathborgess.aihubd.plist"
 
   if [[ "${DRY_RUN}" -eq 1 ]]; then
-    log "[dry-run] launchctl bootout ${domain}/${AI_MEMORY_LABEL}"
     log "[dry-run] launchctl bootout ${domain}/${AIHUBD_LABEL}"
-    log "[dry-run] rm -f ${memory_plist} ${aihubd_plist}"
+    log "[dry-run] rm -f ${aihubd_plist}"
+    if [[ -f "${INSTALL_AI_MEMORY_MARKER}" ]]; then
+      log "[dry-run] launchctl bootout ${domain}/${AI_MEMORY_LABEL}"
+      log "[dry-run] rm -f ${memory_plist}"
+    else
+      log "[dry-run] keeping ai-memory LaunchAgent (no install marker)"
+    fi
     return 0
   fi
 
-  launchctl bootout "${domain}/${AI_MEMORY_LABEL}" 2>/dev/null || true
   launchctl bootout "${domain}/${AIHUBD_LABEL}" 2>/dev/null || true
-  rm -f "${memory_plist}" "${aihubd_plist}"
+  rm -f "${aihubd_plist}"
+
+  if [[ -f "${INSTALL_AI_MEMORY_MARKER}" ]]; then
+    launchctl bootout "${domain}/${AI_MEMORY_LABEL}" 2>/dev/null || true
+    rm -f "${memory_plist}"
+  else
+    log "keeping ai-memory LaunchAgent (no install marker)"
+  fi
 }
 
 remove_binaries() {

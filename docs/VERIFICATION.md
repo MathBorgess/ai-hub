@@ -2,6 +2,8 @@
 
 Evidence from integration session 07: **198** workspace tests, gates `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --offline -- -D warnings`, `cargo test --workspace --offline --no-fail-fast` (0 failed across 3 consecutive runs), five consecutive green runs each of `cargo test -p aihubd --test regression --offline`, `cargo test -p aihub-pty --offline`, and `cargo test -p aihub-memory --offline`, plus `cargo build --release --locked --offline`, `scripts/e2e-ai-memory.sh`, `scripts/test-install.sh`, and `shellcheck scripts/*.sh` (all passed 2026-09-16). Earlier session-10 fixes (unscoped `QuotaPush`, TCP RST on fake server, stale-socket liveness) remain in place; see `docs/CONTRACT.md` §5.
 
+Evidence from integration session 13 (this round, assembling sessions 09–12 against the NO-GO review at `docs/reviews/2026-09-16-review-run3.md`): full workspace built from a clean `target/` (no seed available). `cargo fmt --all --check` clean; `cargo clippy --workspace --all-targets --offline -- -D warnings` clean; `cargo test --workspace --offline --no-fail-fast` 0 failed across 3 consecutive runs; five parallel runs each of `cargo test -p aihubd --test regression --offline`, `cargo test -p aihub-pty --offline`, `cargo test -p aihub-memory --offline` — 0 failed (a glue fix was required here, see below); the full `aihubd` regression suite 0 failed across 6 consecutive runs plus 2 more at `--test-threads=16` (8/8, matching session 12's claim); `f10_real_router_exhausted_autonomous_dispatches_nothing` 0 failed across 20 consecutive runs with 4 background `yes > /dev/null` workers on an 8-core machine; `cargo build --release --locked --offline` finished in 2m05s; `scripts/e2e-ai-memory.sh` exit 0; `scripts/test-install.sh` exit 0 (`all cases passed`); `shellcheck scripts/*.sh` clean. **Glue applied:** `aihub-memory/src/transcript/{claude,codex,antigravity}.rs` test fixtures used a fixed `std::env::temp_dir()` path shared across the crate's tests; under `cargo test -p aihub-memory` run as 5 concurrent processes (the required parallel-run proof), two of the five collided on the same path and failed with `FAILED`/panics from `.unwrap()` on a file another process had just deleted or truncated. Scoped each fixture dir with `std::process::id()`; re-ran 5x parallel afterward, 0 failed. This does not correspond to any R-finding — it is a pre-existing test-isolation gap exposed only by concurrent-process execution, not by the R1–R10 review.
+
 ## Findings F1–F14
 
 | ID | Regression test(s) | Status |
@@ -33,8 +35,25 @@ Evidence from integration session 07: **198** workspace tests, gates `cargo fmt 
 | N6 | `n6_hanging_list_command_times_out_and_reaps_child`, `n6_oversized_output_is_capped`, `n6_failed_refresh_keeps_last_snapshot`, `n6_route_uses_snapshot_without_io` (`aihub-router/tests/n6_catalog.rs`); `n6_hanging_model_list_does_not_block_sessions` (`aihubd/tests/regression.rs`); `antigravity_ls_address_override_prepended` (`aihub-probe/tests/cursor_agy.rs`, fixture `lsof` output) | pass |
 | N7 | `test_n7_harness_path_in_plist` (`scripts/test-install.sh`) | pass |
 | N8 | `lint_plists`, `assert_home_paths_rendered` (`scripts/test-install.sh`) | pass |
-| N9 | `test_n9_bind_and_no_start`, `wait_for_*_ready` exercised via `scripts/install.sh` (`scripts/test-install.sh`) | pass |
+| N9 | `test_n9_bind_and_no_start`, `test_r9_harness_executes_under_plist_path` (`scripts/test-install.sh`); `wait_for_sidecar_ready` / `wait_for_aihubd_socket_ready` in `scripts/install.sh` | partial — readiness polling loops are owner-manual (installer tests use `--no-start`, which skips bootstrap and both loops) |
 | N10 | `n10_real_session_path_layout_uses_passed_project_identity` (`aihub-memory/src/ai_memory.rs`); `n10_switch_passes_repository_identity_to_memory_recorder` (`aihubd/tests/regression.rs`) | pass |
+
+## Findings R1–R10 (review run 3, `docs/reviews/2026-09-16-review-run3.md`)
+
+| ID | Regression test(s) | Status |
+|----|-------------------|--------|
+| R1 | `r1_leader_exited_descendant_quiet_after_merge`, `r1_leader_exited_descendant_quiet_after_switch`, `r1_repeated_merge_after_stop_unconfirmed_never_finishes_git`, `r1_second_client_switch_after_stop_unconfirmed_still_refuses_spawn` (`aihubd/tests/regression.rs`); `f4_redirected_descendant_leader_exits_before_stop_returns` (`aihub-pty/tests/pty_integration.rs`) | pass |
+| R2 | `r2_eof_live_signal_ignoring_leader_stop_within_deadline` (`aihub-pty/tests/pty_integration.rs`) | pass |
+| R3 | `r3_router_hold_deadline_through_daemon_message_and_tui_accept` (`aihub/tests/key_routing.rs`); `r3_daemon_accept_recommendation_honors_router_hold_deadline` (`aihubd/tests/regression.rs`) | pass |
+| R4 | `r4_owned_drain_silent_peer_permits_simultaneous_appends_and_second_drain_with_responsive_timer` (`aihub-memory/src/ai_memory.rs`) | pass |
+| R5 | `r5_null_result_rejected_and_spooled`, `r5_scalar_result_rejected_and_spooled`, `r5_sse_notification_before_result_delivered`, `r5_sse_multiline_and_multiple_events_delivered`, `r5_chunked_response_delivered`, `r5_open_sse_stream_returns_immediately_after_result`, `r5_oversized_headers_rejected` (`aihub-memory/src/ai_memory.rs`) | pass |
+| R6 | `r6_partial_write_restart_and_recovery`, `r6_malformed_head_delivers_later_records_and_quarantines`, `r6_old_schema_record_migrates_and_delivers` (`aihub-memory/src/ai_memory.rs`) | pass |
+| R7 | `r7_first_oversized_record_rejected`, `r7_existing_permissive_file_corrected_or_refused`, `r7_denied_permission_propagates_error` (`aihub-memory/src/ai_memory.rs`) | pass |
+| R8 | `r8_lane_without_catalog_model_is_not_dispatchable` (`aihub-router/tests/routing.rs`); `r8_same_harness_model_change_passes_model_to_spawner` (`aihubd/tests/regression.rs`) | pass |
+| R9 | `test_r9_harness_executes_under_plist_path` (`scripts/test-install.sh`) | pass |
+| R10 | `r10_yielding_extractor_does_not_cancel_hold_dispatch`, `r10_stale_hold_timer_ignored_after_no_capacity` (`aihubd/tests/regression.rs`) | pass |
+
+All ten regression tests ran as part of `cargo test --workspace --offline --no-fail-fast` (session 13, 3/3 clean) and the `aihubd`-suite 8/8 clean runs above; `R9` also ran inside `scripts/test-install.sh`. `PROTOCOL_VERSION` stays `2` for this round — see `docs/CONTRACT.md` §2.1 (`aihub_core::ipc`) for why that is a decision, not an oversight: the three added fields are `#[serde(default)]`-safe, and the `holds_until_s` semantic change is safe only because `scripts/install.sh` always installs `aihub`+`aihubd` together from the same build, never independently.
 
 ## Deviations from PLAN
 
@@ -63,7 +82,8 @@ Evidence from integration session 07: **198** workspace tests, gates `cargo fmt 
 | Terminal detach/reattach in real terminal | owner-manual | Close terminal, `aihub attach`, confirm scrollback |
 | Live `/switch` handoff across providers | owner-manual | `/switch` with real harnesses and quota spend |
 | Live `/merge` squash on owner branch | owner-manual | `/merge` in TUI on a real repo |
-| Installer regression (isolated HOME, N7–N9) | automated | `scripts/test-install.sh` |
+| Installer regression (isolated HOME, N7–N9, R9) | automated | `scripts/test-install.sh` |
+| Installer readiness polling (`wait_for_*_ready`) | owner-manual | Install without `--no-start` on a machine with working sidecar + aihubd agents; confirm `scripts/install.sh` exits within the deadline |
 | Shell scripts static analysis | automated | `shellcheck scripts/*.sh` |
 
 Install path for owners: see [INSTALL.md](INSTALL.md) and `scripts/install.sh`.

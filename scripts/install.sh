@@ -318,13 +318,51 @@ path_unique_dirs() {
   echo "${out[*]}"
 }
 
+# Directories required to execute a harness script (interpreter for #! lines).
+harness_runtime_dirs_for_script() {
+  local script_path="$1"
+  local line interpreter env_bin prog interp_path
+  local -a parts=()
+
+  if [[ ! -f "${script_path}" ]]; then
+    return 0
+  fi
+  IFS= read -r line <"${script_path}" || return 0
+  if [[ "${line}" != '#!'* ]]; then
+    return 0
+  fi
+  interpreter="${line#\#!}"
+  interpreter="${interpreter#"${interpreter%%[![:space:]]*}"}"
+  read -r -a parts <<<"${interpreter}"
+  if [[ "${#parts[@]}" -eq 0 ]]; then
+    return 0
+  fi
+  env_bin="${parts[0]}"
+  if [[ "$(basename "${env_bin}")" == "env" ]]; then
+    prog="${parts[1]:-}"
+    if [[ -z "${prog}" ]]; then
+      return 0
+    fi
+    if interp_path="$(command -v "${prog}" 2>/dev/null)"; then
+      printf '%s\n' "$(dirname "${interp_path}")"
+    else
+      warn "harness interpreter not found in installing shell PATH: ${prog} (${script_path})"
+    fi
+  elif [[ "${env_bin}" == /* ]]; then
+    printf '%s\n' "$(dirname "${env_bin}")"
+  fi
+}
+
 resolve_launchd_harness_path() {
   local -a harness_names=(claude codex cursor-agent agy)
   local -a harness_dirs=()
-  local name path
+  local name path runtime_dir
   for name in "${harness_names[@]}"; do
     if path="$(command -v "${name}" 2>/dev/null)"; then
       harness_dirs+=("$(dirname "${path}")")
+      while IFS= read -r runtime_dir; do
+        [[ -n "${runtime_dir}" ]] && harness_dirs+=("${runtime_dir}")
+      done < <(harness_runtime_dirs_for_script "${path}")
     else
       warn "harness not found in installing shell PATH: ${name}"
     fi
@@ -346,8 +384,32 @@ resolve_launchd_harness_path() {
         echo "install.sh: PATH=${LAUNCHD_PATH}" >&2
         exit 1
       fi
+      local prog=""
+      if prog="$(harness_env_interpreter_name "${path}" 2>/dev/null)"; then
+        if ! env -i PATH="${LAUNCHD_PATH}" /bin/sh -c "command -v ${prog}" >/dev/null 2>&1; then
+          echo "install.sh: harness ${name} needs interpreter ${prog} on LaunchAgent PATH" >&2
+          echo "install.sh: PATH=${LAUNCHD_PATH}" >&2
+          exit 1
+        fi
+      fi
     fi
   done
+}
+
+harness_env_interpreter_name() {
+  local script_path="$1"
+  local line interpreter
+  local -a parts=()
+  IFS= read -r line <"${script_path}" || return 1
+  [[ "${line}" == '#!'* ]] || return 1
+  interpreter="${line#\#!}"
+  interpreter="${interpreter#"${interpreter%%[![:space:]]*}"}"
+  read -r -a parts <<<"${interpreter}"
+  if [[ "${#parts[@]}" -ge 2 ]] && [[ "$(basename "${parts[0]}")" == "env" ]]; then
+    printf '%s' "${parts[1]}"
+    return 0
+  fi
+  return 1
 }
 
 plist_replace_string() {

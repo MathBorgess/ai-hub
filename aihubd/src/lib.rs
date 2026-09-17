@@ -253,6 +253,17 @@ fn bind(path: &Path) -> Result<(UnixListener, SocketGuard)> {
     ))
 }
 
+/// Whether the process-group stop barrier has been confirmed for `generation`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GroupStopState {
+    /// Outgoing harness may still be running or a descendant may still be in the group.
+    Pending,
+    /// `stop` succeeded for this `generation`; merge/switch may finalize.
+    Confirmed,
+    /// `stop` failed; destructive work must retry the barrier instead of trusting `active`.
+    Unconfirmed,
+}
+
 struct Session {
     summary: SessionSummary,
     base: String,
@@ -260,7 +271,19 @@ struct Session {
     prompt: Option<String>,
     pty: Pty,
     generation: u64,
+    group_stop: GroupStopState,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    hold_task: Option<tokio::task::JoinHandle<()>>,
+    recommendation_id: u64,
+    current_recommendation: Option<RouteOutcome>,
+}
+
+struct HoldDispatchPlan {
+    harness: HarnessId,
+    hold_s: u64,
+    model: Option<String>,
+    lane: Option<String>,
+    rec_id: u64,
 }
 struct Client {
     sender: mpsc::Sender<DaemonMessage>,
@@ -373,6 +396,7 @@ pub struct Daemon {
     catalog: Arc<Mutex<aihub_router::ModelCatalog>>,
     catalog_paths: Arc<CatalogPath>,
     drain: Arc<Drain>,
+    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
 impl Daemon {
@@ -382,9 +406,17 @@ impl Daemon {
         F: Future<Output = Vec<QuotaSnapshot>> + Send + 'static,
         S: Fn(HarnessId, PtySpawnOptions, Option<String>) -> Result<Pty> + Send + Sync + 'static,
     {
+        let clock: Arc<dyn Fn() -> u64 + Send + Sync> = Arc::new(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        });
+        let clock_router = clock.clone();
         Self {
             state: Arc::new(Mutex::new(State::default())),
             cache: Arc::new(Mutex::new(vec![])),
+            clock,
             probe: Arc::new(move || Box::pin(probe())),
             spawner: Arc::new(spawner),
             classifier: Arc::new(|prompt: &str| {
@@ -401,9 +433,16 @@ impl Daemon {
                     }
                 })
             }),
-            router: Arc::new(|tier, size, snapshots, horizon, catalog| {
-                aihub_router::route_outcome(tier, size, snapshots, horizon, catalog)
-                    .map_err(Into::into)
+            router: Arc::new(move |tier, size, snapshots, horizon, catalog| {
+                aihub_router::route_outcome_at(
+                    tier,
+                    size,
+                    snapshots,
+                    horizon,
+                    catalog,
+                    clock_router(),
+                )
+                .map_err(Into::into)
             }),
             memory_recorder: Arc::new(|session_id, from, to, brief, project| {
                 let id = session_id.clone();
@@ -515,6 +554,52 @@ impl Daemon {
     {
         self.router = Arc::new(router);
         self
+    }
+
+    pub fn with_clock<C>(mut self, clock: C) -> Self
+    where
+        C: Fn() -> u64 + Send + Sync + 'static,
+    {
+        let clock = Arc::new(clock);
+        self.clock = clock.clone();
+        let clock_router = clock.clone();
+        self.router = Arc::new(move |tier, size, snapshots, horizon, catalog| {
+            aihub_router::route_outcome_at(tier, size, snapshots, horizon, catalog, clock_router())
+                .map_err(Into::into)
+        });
+        self
+    }
+
+    pub fn with_catalog(mut self, catalog: aihub_router::ModelCatalog) -> Self {
+        self.catalog = Arc::new(Mutex::new(catalog));
+        self
+    }
+
+    pub fn now(&self) -> u64 {
+        (self.clock)()
+    }
+
+    pub async fn check_capacity(&self, harness: HarnessId, lane: Option<&str>) -> bool {
+        let snapshots = self.cache.lock().await;
+        if snapshots.is_empty() {
+            return true;
+        }
+        for snap in snapshots.iter() {
+            if snap.slot.harness == harness {
+                if snap.status == QuotaStatus::Empty {
+                    return false;
+                }
+                if let Some(target_lane) = lane {
+                    if let Some(l) = snap.lanes.iter().find(|l| l.name == target_lane) {
+                        if l.windows.iter().any(|w| w.used_pct >= 100.0) {
+                            return false;
+                        }
+                    }
+                }
+                return true;
+            }
+        }
+        true
     }
 
     pub fn with_memory_recorder<M, F>(mut self, recorder: M) -> Self
@@ -631,15 +716,16 @@ impl Daemon {
     /// replacement harness.
     async fn quiesce(&self, state: &mut State, id: &SessionId) -> Result<()> {
         let s = state.session(id)?;
-        if !s.summary.active {
+        if s.group_stop == GroupStopState::Confirmed {
             return Ok(());
         }
         let stop_fn = s.pty.stop.clone();
         let result = stop_fn(Duration::from_secs(5)).await;
         let s = state.session(id)?;
-        s.summary.active = false;
         match result {
             Ok(_) => {
+                s.group_stop = GroupStopState::Confirmed;
+                s.summary.active = false;
                 for task in s.tasks.drain(..) {
                     task.abort();
                 }
@@ -647,6 +733,8 @@ impl Daemon {
                 Ok(())
             }
             Err(e) => {
+                s.group_stop = GroupStopState::Unconfirmed;
+                s.summary.active = false;
                 log_lifecycle(
                     "ERROR",
                     "stop_unconfirmed",
@@ -658,27 +746,51 @@ impl Daemon {
     }
 
     /// Waits for an autonomous recommendation's hold to pass, then dispatches it if the
-    /// session is still eligible (blocker 5). Tracked in `session.tasks` so shutdown cancels it.
-    fn schedule_hold_dispatch(
-        &self,
-        state: &mut State,
-        id: &SessionId,
-        harness: HarnessId,
-        hold_s: u64,
-        model: Option<String>,
-    ) {
+    /// session is still eligible (R10). Tracked in `session.hold_task` separately from `session.tasks`
+    /// so that quiescence does not cancel the in-flight switch timer.
+    fn schedule_hold_dispatch(&self, state: &mut State, id: &SessionId, plan: HoldDispatchPlan) {
+        let HoldDispatchPlan {
+            harness,
+            hold_s,
+            model,
+            lane,
+            rec_id,
+        } = plan;
+        let s = match state.session(id) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        if let Some(prev) = s.hold_task.take() {
+            prev.abort();
+        }
+
         let daemon = self.clone();
         let task_id = id.clone();
         let handle = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(hold_s)).await;
             let eligible = {
                 let mut state = daemon.state.lock().await;
-                matches!(
-                    state.session(&task_id),
-                    Ok(s) if s.summary.mode == Mode::Autonomous
-                        && s.summary.active
-                        && s.summary.harness != harness
-                )
+                match state.session(&task_id) {
+                    Ok(s) => {
+                        let target_differs = s.summary.harness != harness
+                            || s.summary.model.as_deref() != model.as_deref();
+                        let not_no_capacity = !matches!(
+                            s.current_recommendation,
+                            Some(RouteOutcome::NoCapacity { .. })
+                        );
+                        let valid = s.summary.mode == Mode::Autonomous
+                            && s.summary.active
+                            && s.recommendation_id == rec_id
+                            && target_differs
+                            && not_no_capacity;
+                        if valid {
+                            daemon.check_capacity(harness, lane.as_deref()).await
+                        } else {
+                            false
+                        }
+                    }
+                    Err(_) => false,
+                }
             };
             if eligible {
                 let _ = daemon
@@ -687,7 +799,7 @@ impl Daemon {
             }
         });
         if let Ok(s) = state.session(id) {
-            s.tasks.push(handle);
+            s.hold_task = Some(handle);
         }
     }
 
@@ -717,13 +829,19 @@ impl Daemon {
                 worktree_path: wt.path,
                 branch: wt.branch,
                 active: true,
+                model: None,
+                lane: None,
             },
             base: wt.base_branch,
             originating_checkout: wt.originating_checkout,
             prompt,
             pty,
             generation: 0,
+            group_stop: GroupStopState::Pending,
             tasks: vec![],
+            hold_task: None,
+            recommendation_id: 0,
+            current_recommendation: None,
         };
         self.watch(&mut session);
         log_lifecycle(
@@ -799,6 +917,7 @@ impl Daemon {
             let mut state = state.lock().await;
             if let Ok(s) = state.session(&exit_session_id) {
                 if s.generation == generation && s.summary.active {
+                    // Leader exit alone does not confirm group quiescence (R1).
                     s.summary.active = false;
                     log_lifecycle(
                         "INFO",
@@ -851,27 +970,31 @@ impl Daemon {
         state.clients.clear();
         let mut stop_failed = false;
         for s in &mut state.sessions {
+            if let Some(t) = s.hold_task.take() {
+                t.abort();
+            }
             for t in s.tasks.drain(..) {
                 t.abort();
             }
-            if s.summary.active {
+            if s.group_stop != GroupStopState::Confirmed {
                 let stop_fn = s.pty.stop.clone();
+                let id = s.summary.session_id.clone();
                 if let Err(e) = stop_fn(Duration::from_secs(5)).await {
                     stop_failed = true;
+                    s.group_stop = GroupStopState::Unconfirmed;
                     log_lifecycle(
                         "ERROR",
                         "shutdown_stop_failed",
-                        &format!(
-                            "session_id={} stop barrier failed: {e}",
-                            s.summary.session_id
-                        ),
+                        &format!("session_id={} stop barrier failed: {e}", id),
                     );
+                } else {
+                    s.group_stop = GroupStopState::Confirmed;
                 }
                 s.summary.active = false;
                 log_lifecycle(
                     "INFO",
                     "session stop",
-                    &format!("session_id={} stopped on shutdown", s.summary.session_id),
+                    &format!("session_id={} stopped on shutdown", id),
                 );
             }
         }
@@ -1118,7 +1241,15 @@ impl Daemon {
                 (state.session(&session_id)?.pty.resize)(PtySize { cols, rows })?;
             }
             ClientMessage::SetMode { session_id, mode } => {
-                state.session(&session_id)?.summary.mode = mode;
+                let s = state.session(&session_id)?;
+                let old_mode = s.summary.mode;
+                s.summary.mode = mode;
+                if old_mode == Mode::Autonomous && mode != Mode::Autonomous {
+                    s.recommendation_id += 1;
+                    if let Some(t) = s.hold_task.take() {
+                        t.abort();
+                    }
+                }
                 state.broadcast(DaemonMessage::ModeSet { session_id, mode });
             }
             ClientMessage::SwitchHarness {
@@ -1133,6 +1264,95 @@ impl Daemon {
                 drop(state);
                 self.switch_and_deliver(&session_id, target, with_handoff, model.as_deref())
                     .await?;
+            }
+            ClientMessage::AcceptRecommendation {
+                session_id,
+                recommendation_id,
+            } => {
+                let (outcome, current_rec_id) = {
+                    let s = state.session(&session_id)?;
+                    let outcome = match &s.current_recommendation {
+                        Some(o) => o.clone(),
+                        None => {
+                            state.send(
+                                client,
+                                error(
+                                    "no_recommendation",
+                                    &format!(
+                                        "session_id={} has no active recommendation",
+                                        session_id
+                                    ),
+                                ),
+                            );
+                            return Ok(());
+                        }
+                    };
+                    (outcome, s.recommendation_id)
+                };
+                if let Some(rec_id) = recommendation_id {
+                    if rec_id != current_rec_id {
+                        state.send(
+                            client,
+                            error(
+                                "stale_recommendation",
+                                &format!(
+                                    "session_id={} recommendation id {} is stale (current: {})",
+                                    session_id, rec_id, current_rec_id
+                                ),
+                            ),
+                        );
+                        return Ok(());
+                    }
+                }
+                match outcome {
+                    RouteOutcome::NoCapacity { reason } => {
+                        state.send(
+                            client,
+                            error(
+                                "no_capacity",
+                                &format!("session_id={} has no capacity: {}", session_id, reason),
+                            ),
+                        );
+                    }
+                    RouteOutcome::Recommendation {
+                        harness,
+                        lane,
+                        model,
+                        holds_until_s,
+                    } => {
+                        let now = (self.clock)();
+                        if holds_until_s.is_some_and(|h| h > now) {
+                            state.send(
+                                client,
+                                error(
+                                    "recommendation_held",
+                                    &format!(
+                                        "session_id={} recommendation is held until epoch {}",
+                                        session_id,
+                                        holds_until_s.unwrap_or(0)
+                                    ),
+                                ),
+                            );
+                            return Ok(());
+                        }
+                        if !self.check_capacity(harness, lane.as_deref()).await {
+                            state.send(
+                                client,
+                                error(
+                                    "no_capacity",
+                                    &format!(
+                                        "session_id={} target {} has no capacity",
+                                        session_id, harness
+                                    ),
+                                ),
+                            );
+                            return Ok(());
+                        }
+                        drop(state);
+                        self.switch_and_deliver(&session_id, harness, true, model.as_deref())
+                            .await?;
+                    }
+                }
             }
             ClientMessage::RouteRequest {
                 prompt,
@@ -1228,37 +1448,52 @@ impl Daemon {
                 }
             }
             ClientMessage::SubmitTask { session_id, task } => {
-                let (snapshots, mode, current_harness) = {
+                let (snapshots, mode, current_harness, current_model) = {
                     let s = state.session(&session_id)?;
                     s.prompt = Some(task.clone());
+                    s.recommendation_id += 1;
+                    if let Some(t) = s.hold_task.take() {
+                        t.abort();
+                    }
                     (
                         self.cache.lock().await.clone(),
                         s.summary.mode,
                         s.summary.harness,
+                        s.summary.model.clone(),
                     )
                 };
                 let classification = (self.classifier)(&task).await;
                 let catalog = self.catalog.lock().await.clone();
                 let outcome =
                     (self.router)(classification.tier, TaskSize::M, &snapshots, 120, &catalog)?;
+                let rec_id = {
+                    let s = state.session(&session_id)?;
+                    s.current_recommendation = Some(outcome.clone());
+                    s.recommendation_id
+                };
                 state.send(
                     client,
                     DaemonMessage::RouteRecommendation {
                         session_id: session_id.clone(),
                         outcome: outcome.clone(),
+                        recommendation_id: rec_id,
                     },
                 );
                 if mode == Mode::Autonomous {
                     if let RouteOutcome::Recommendation {
                         harness,
-                        holds_until_s,
+                        lane,
                         model,
-                        ..
+                        holds_until_s,
                     } = &outcome
                     {
-                        if *harness != current_harness {
-                            let hold = holds_until_s.unwrap_or(0);
-                            if hold == 0 {
+                        let target_differs = *harness != current_harness
+                            || current_model.as_deref() != model.as_deref();
+                        if target_differs {
+                            let now = (self.clock)();
+                            let hold_s =
+                                holds_until_s.map_or(0, |deadline| deadline.saturating_sub(now));
+                            if hold_s == 0 {
                                 drop(state);
                                 self.switch_and_deliver(
                                     &session_id,
@@ -1272,9 +1507,13 @@ impl Daemon {
                             self.schedule_hold_dispatch(
                                 &mut state,
                                 &session_id,
-                                *harness,
-                                hold,
-                                model.clone(),
+                                HoldDispatchPlan {
+                                    harness: *harness,
+                                    hold_s,
+                                    model: model.clone(),
+                                    lane: lane.clone(),
+                                    rec_id,
+                                },
                             );
                         }
                     }
@@ -1297,32 +1536,50 @@ impl Daemon {
         let catalog = self.catalog.lock().await.clone();
         let outcome = (self.router)(classification.tier, size, snapshots, 120, &catalog)?;
         let session_id = id.clone().unwrap_or_else(|| SessionId::new("unknown"));
-        {
+        let rec_id = {
             let mut state = self.state.lock().await;
+            let rec_id = if let Ok(s) = state.session(&session_id) {
+                s.recommendation_id += 1;
+                s.current_recommendation = Some(outcome.clone());
+                if let Some(t) = s.hold_task.take() {
+                    t.abort();
+                }
+                s.recommendation_id
+            } else {
+                0
+            };
             state.broadcast(DaemonMessage::RouteRecommendation {
                 session_id: session_id.clone(),
                 outcome: outcome.clone(),
+                recommendation_id: rec_id,
             });
-        }
+            rec_id
+        };
         if let Some(id) = id {
-            let current_harness = {
+            let (current_harness, current_model) = {
                 let mut state = self.state.lock().await;
                 match state.session(&id) {
-                    Ok(s) if s.summary.mode == Mode::Autonomous => Some(s.summary.harness),
-                    _ => None,
+                    Ok(s) if s.summary.mode == Mode::Autonomous => {
+                        (Some(s.summary.harness), s.summary.model.clone())
+                    }
+                    _ => (None, None),
                 }
             };
             if let Some(current_harness) = current_harness {
                 if let RouteOutcome::Recommendation {
                     harness,
-                    holds_until_s,
+                    lane,
                     model,
-                    ..
+                    holds_until_s,
                 } = &outcome
                 {
-                    if *harness != current_harness {
-                        let hold = holds_until_s.unwrap_or(0);
-                        if hold == 0 {
+                    let target_differs =
+                        *harness != current_harness || current_model.as_deref() != model.as_deref();
+                    if target_differs {
+                        let now = (self.clock)();
+                        let hold_s =
+                            holds_until_s.map_or(0, |deadline| deadline.saturating_sub(now));
+                        if hold_s == 0 {
                             self.switch_and_deliver(&id, *harness, true, model.as_deref())
                                 .await?;
                         } else {
@@ -1330,9 +1587,13 @@ impl Daemon {
                             self.schedule_hold_dispatch(
                                 &mut state,
                                 &id,
-                                *harness,
-                                hold,
-                                model.clone(),
+                                HoldDispatchPlan {
+                                    harness: *harness,
+                                    hold_s,
+                                    model: model.clone(),
+                                    lane: lane.clone(),
+                                    rec_id,
+                                },
                             );
                         }
                     }
@@ -1356,9 +1617,9 @@ impl Daemon {
         model: Option<&str>,
     ) -> Result<Option<(HarnessId, aihub_memory::BriefPair, String)>> {
         let s = state.session(id)?;
-        // F5: only same-harness *and already running* is a no-op. A same-harness switch on a
-        // stopped session (e.g. after a failed spawn) must relaunch it.
-        if s.summary.harness == target && s.summary.active {
+        // F5/R8: only same-harness AND same-model AND already running is a no-op. A same-harness
+        // switch on a stopped session or with a changed model must relaunch it.
+        if s.summary.harness == target && s.summary.model.as_deref() == model && s.summary.active {
             return Ok(None);
         }
         let old = s.summary.harness;
@@ -1419,7 +1680,10 @@ impl Daemon {
         s.pty = incoming;
         s.pty.scrollback.splice(..0, old_scrollback);
         s.generation += 1;
+        s.group_stop = GroupStopState::Pending;
         s.summary.harness = target;
+        let switched_model = model.map(str::to_string);
+        s.summary.model = switched_model.clone();
         s.summary.active = true;
         self.watch(s);
 
@@ -1429,6 +1693,7 @@ impl Daemon {
             old_harness: old,
             new_harness: target,
             handoff_path,
+            model: switched_model,
         });
 
         match brief {

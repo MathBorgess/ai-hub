@@ -140,6 +140,12 @@ pub enum ClientMessage {
         #[serde(alias = "prompt", alias = "text")]
         task: String,
     },
+    /// Accept the current assisted recommendation for a session (R3).
+    AcceptRecommendation {
+        session_id: SessionId,
+        #[serde(default)]
+        recommendation_id: Option<u64>,
+    },
 }
 
 /// Messages sent from Daemon (`aihubd`) to TUI Client (`aihub`).
@@ -182,6 +188,8 @@ pub enum DaemonMessage {
     RouteRecommendation {
         session_id: SessionId,
         outcome: RouteOutcome,
+        #[serde(default)]
+        recommendation_id: u64,
     },
     /// Confirmation that harness switch succeeded.
     HarnessSwitched {
@@ -189,6 +197,8 @@ pub enum DaemonMessage {
         old_harness: HarnessId,
         new_harness: HarnessId,
         handoff_path: Option<PathBuf>,
+        #[serde(default)]
+        model: Option<String>,
     },
     /// Confirmation of mode update.
     ModeSet { session_id: SessionId, mode: Mode },

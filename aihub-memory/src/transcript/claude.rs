@@ -135,7 +135,10 @@ mod tests {
 
     #[test]
     fn extracts_last_assistant_from_fixture() {
-        let dir = std::env::temp_dir().join("aihub-memory-claude-fixture");
+        let dir = std::env::temp_dir().join(format!(
+            "aihub-memory-claude-fixture-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("sess.jsonl");

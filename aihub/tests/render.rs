@@ -184,6 +184,7 @@ fn test_render_recommendation_banner_and_prefix_hint() {
         holds_until_s: None,
         confidence: 0.92,
         reason: "Refactor mecánico rápido".to_string(),
+        recommendation_id: 0,
     });
 
     terminal
@@ -229,6 +230,7 @@ fn test_render_recommendation_banner_held_until() {
         holds_until_s: Some(50400),
         confidence: 0.92,
         reason: "Refactor mecánico rápido".to_string(),
+        recommendation_id: 0,
     });
 
     terminal

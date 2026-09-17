@@ -58,10 +58,13 @@ async fn query_mcp_handoff_list(server_url: &str, project: &str) -> Vec<serde_js
     stream.flush().await.expect("flush");
 
     let mut resp_bytes = Vec::new();
-    stream
-        .read_to_end(&mut resp_bytes)
-        .await
-        .expect("read response");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.take(1024 * 1024).read_to_end(&mut resp_bytes),
+    )
+    .await
+    .expect("read timeout")
+    .expect("read response");
 
     let pos = resp_bytes
         .windows(4)
@@ -132,13 +135,18 @@ async fn session10_ai_memory_live_record_spool_and_drain() {
     let brief2 = write_brief_pair(&handoffs, 2, "session10 spooled goal", &turn2).unwrap();
     let session_id2 = SessionId::new("session10-spooled");
 
+    let offline_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let offline_port = offline_listener.local_addr().unwrap().port();
+    drop(offline_listener);
+    let offline_url = format!("http://127.0.0.1:{offline_port}");
+
     let dest2 = record_handoff_to(
         &session_id2,
         HarnessId::CursorAgent,
         HarnessId::Antigravity,
         &brief2,
         project,
-        "http://127.0.0.1:59999",
+        &offline_url,
         None,
         &aihub_data,
     )

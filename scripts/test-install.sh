@@ -131,6 +131,46 @@ EOF
   fi
 }
 
+# r9: LaunchAgent PATH must include the harness interpreter, not only the harness file.
+test_r9_harness_executes_under_plist_path() {
+  setup_isolated_home
+  local interp_dir="${ISOLATED_HOME}/fake-node-bin"
+  local harness_dir="${ISOLATED_HOME}/fake-claude-bin"
+  mkdir -p "${interp_dir}" "${harness_dir}"
+
+  cat >"${interp_dir}/node" <<'EOF'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  if [[ "${arg}" == "--aihub-r9-smoke" ]]; then
+    exit 0
+  fi
+done
+exit 1
+EOF
+  chmod +x "${interp_dir}/node"
+
+  cat >"${harness_dir}/claude" <<'EOF'
+#!/usr/bin/env node
+exit 1
+EOF
+  chmod +x "${harness_dir}/claude"
+
+  HOME="${ISOLATED_HOME}" PATH="${STUB_BIN}:${interp_dir}:${harness_dir}:${PATH}" \
+    "${ROOT}/scripts/install.sh" --no-start --bin-dir "${FAKE_BIN_DIR}"
+
+  local launchd_path
+  launchd_path="$(plutil -extract EnvironmentVariables.PATH raw -o - \
+    "${ISOLATED_HOME}/Library/LaunchAgents/io.mathborgess.aihubd.plist")"
+  case ":${launchd_path}:" in
+    *":${interp_dir}:"*) ;;
+    *) fail "r9: expected interpreter dir in LaunchAgent PATH, got ${launchd_path}" ;;
+  esac
+
+  if ! env -i PATH="${launchd_path}" claude --aihub-r9-smoke >/dev/null 2>&1; then
+    fail "r9: claude did not execute under plist PATH (interpreter missing?)"
+  fi
+}
+
 # n9: sidecar bind env and --no-start skips launchctl.
 test_n9_bind_and_no_start() {
   assert_eq "$(plutil -extract EnvironmentVariables.AI_MEMORY_BIND raw -o - \
@@ -215,11 +255,18 @@ EOF
   run_uninstall
   assert_eq "$( "${ISOLATED_HOME}/.local/bin/ai-memory" )" "preexisting-binary" \
     "uninstall must leave pre-existing ai-memory"
+  assert_path_exists \
+    "${ISOLATED_HOME}/Library/LaunchAgents/com.github.akitaonrails.ai-memory.plist" \
+    "uninstall must not remove ai-memory LaunchAgent when install did not own ai-memory"
+  if grep -q 'bootout.*com.github.akitaonrails.ai-memory' "${LAUNCHCTL_LOG}"; then
+    fail "uninstall must not bootout ai-memory when install marker is absent"
+  fi
 }
 
 main() {
   test_fresh_install
   test_n7_harness_path_in_plist
+  test_r9_harness_executes_under_plist_path
   test_repeat_install_idempotent
   test_uninstall_keeps_ai_memory_data
   test_purge_surfaces

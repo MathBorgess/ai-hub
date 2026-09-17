@@ -17,3 +17,6 @@ thiserror = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 vt100 = { workspace = true }
+
+[dev-dependencies]
+aihub-router = { workspace = true }

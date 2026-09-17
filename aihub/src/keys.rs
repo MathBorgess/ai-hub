@@ -176,9 +176,8 @@ fn handle_normal_key_at(app: &mut App, key: KeyEvent, now_s: u64) -> AppAction {
                 // Accept assisted-mode recommendation
                 match &app.recommendation {
                     Some(RecommendationState::Recommended {
-                        harness,
-                        model,
                         holds_until_s,
+                        recommendation_id,
                         ..
                     }) => {
                         if let Some(hold_s) = *holds_until_s {
@@ -189,11 +188,9 @@ fn handle_normal_key_at(app: &mut App, key: KeyEvent, now_s: u64) -> AppAction {
                             }
                         }
                         if let Some(session_id) = &app.session_id {
-                            return AppAction::SendMessage(ClientMessage::SwitchHarness {
+                            return AppAction::SendMessage(ClientMessage::AcceptRecommendation {
                                 session_id: session_id.clone(),
-                                target: *harness,
-                                with_handoff: true,
-                                model: model.clone(),
+                                recommendation_id: Some(*recommendation_id),
                             });
                         }
                     }

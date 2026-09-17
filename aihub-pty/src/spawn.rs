@@ -272,15 +272,6 @@ fn to_native_size(size: PtySize) -> NativePtySize {
     }
 }
 
-fn exit_status_to_i32(status: portable_pty::ExitStatus) -> Option<i32> {
-    let code = status.exit_code();
-    if code > i32::MAX as u32 {
-        None
-    } else {
-        Some(code as i32)
-    }
-}
-
 pub fn spawn_command(
     cmd: &str,
     args: &[&str],
@@ -308,7 +299,7 @@ pub fn spawn_command(
     let killer = child.clone_killer();
     let child_pid = child.process_id().map(|pid| pid as i32);
     let pgid = child_pid;
-    let mut child = child;
+    let child = child;
 
     let reader = pair
         .master
@@ -374,18 +365,28 @@ pub fn spawn_command(
             }
         }
 
-        let exit = {
-            let _guard = reader_inner.reap_lock.lock().expect("reap lock");
-            if let Some(code) = *reader_inner.exit_code.lock().expect("exit lock") {
-                code
-            } else {
-                match child.wait() {
-                    Ok(status) => exit_status_to_i32(status),
-                    Err(_) => None,
+        if reader_inner.exit_code.lock().expect("exit lock").is_none() {
+            if let Some(pid) = reader_inner.child_pid {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while Instant::now() < deadline {
+                    let reaped = {
+                        let _guard = reader_inner.reap_lock.lock().expect("reap lock");
+                        match try_reap_child_pid(pid) {
+                            Ok(ReapOutcome::Reaped(code)) => Some(code),
+                            Ok(ReapOutcome::StillRunning) => None,
+                            Err(_) => None,
+                        }
+                    };
+                    if let Some(code) = reaped {
+                        reader_inner.set_exit(code);
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
                 }
             }
-        };
-        reader_inner.set_exit(exit);
+        }
+        // Reaping uses `child_pid` + `waitpid`; dropping `Child` would block in `wait` again.
+        std::mem::forget(child);
         *reader_inner.killer.lock().expect("killer lock") = None;
         // Drop the sender so the dedicated writer thread's recv() unblocks and it exits.
         *reader_inner.input_tx.lock().expect("input tx lock") = None;

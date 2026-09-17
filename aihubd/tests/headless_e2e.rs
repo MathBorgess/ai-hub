@@ -592,6 +592,27 @@ async fn wait_for_writes(path: &std::path::Path, count: usize) {
     .await
     .unwrap();
 }
+async fn wait_for_stable_files(files: &[PathBuf], stable_for: Duration, deadline: Duration) {
+    tokio::time::timeout(deadline, async {
+        let mut last: Vec<Vec<u8>> = files.iter().map(|p| std::fs::read(p).unwrap()).collect();
+        let mut stable_since = std::time::Instant::now();
+        loop {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let current: Vec<Vec<u8>> = files.iter().map(|p| std::fs::read(p).unwrap()).collect();
+            if current == last {
+                if stable_since.elapsed() >= stable_for {
+                    return;
+                }
+            } else {
+                last = current;
+                stable_since = std::time::Instant::now();
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("files never stabilized for {:?}", stable_for));
+}
+
 async fn assert_quiescent(files: &[PathBuf]) {
     let before: Vec<_> = files.iter().map(|p| std::fs::read(p).unwrap()).collect();
     assert!(
@@ -600,12 +621,31 @@ async fn assert_quiescent(files: &[PathBuf]) {
             .all(|b| String::from_utf8_lossy(b).contains("stopping")),
         "SIGTERM handler must actually execute"
     );
-    tokio::time::sleep(Duration::from_millis(350)).await;
+    wait_for_stable_files(files, Duration::from_millis(350), Duration::from_secs(5)).await;
     let after: Vec<_> = files.iter().map(|p| std::fs::read(p).unwrap()).collect();
     assert_eq!(
         before, after,
         "outgoing harness wrote after the stop barrier returned"
     );
+}
+
+async fn wait_for_file_growth(path: &std::path::Path, min_exclusive: u64) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if std::fs::metadata(path).is_ok_and(|m| m.len() > min_exclusive) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "file {} never grew past {} bytes",
+            path.display(),
+            min_exclusive
+        )
+    });
 }
 
 #[tokio::test]
@@ -720,9 +760,8 @@ async fn f10_real_router_exhausted_autonomous_dispatches_nothing() {
             break;
         }
     }
-    tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(system.launches.load(std::sync::atomic::Ordering::SeqCst), 1);
-    assert!(std::fs::metadata(&write_files(&path)[0]).unwrap().len() > before);
+    wait_for_file_growth(&write_files(&path)[0], before).await;
     system.stop().await;
 }
 

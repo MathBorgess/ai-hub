@@ -16,7 +16,7 @@ pub async fn record_handoff(
     let data_dir = default_data_dir();
     let spool_path = handoffs_log_path(&data_dir);
     let record = SpooledRecord::from_brief(session_id, from, to, brief, project)?;
-    ai_memory::append_to_spool_file(&spool_path, &record)?;
+    ai_memory::append_to_spool_file_async(&spool_path, &record).await?;
     Ok(())
 }
 

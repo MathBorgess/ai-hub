@@ -54,6 +54,12 @@ pub enum MemoryError {
     #[error("Spool storage limit reached: {0}")]
     SpoolFull(String),
 
+    #[error("Spool lock error: {0}")]
+    LockError(String),
+
+    #[error("Unsafe spool file or directory permissions: {0}")]
+    UnsafePermissions(String),
+
     #[error("Handoff delivery failed: {0}")]
     DeliveryFailed(String),
 }

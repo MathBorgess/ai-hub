@@ -122,7 +122,8 @@ mod tests {
 
     #[test]
     fn extracts_antigravity_assistant_turn() {
-        let dir = std::env::temp_dir().join("aihub-memory-agy-fixture");
+        let dir =
+            std::env::temp_dir().join(format!("aihub-memory-agy-fixture-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let logs_dir = dir
             .join("sess-agy-123")

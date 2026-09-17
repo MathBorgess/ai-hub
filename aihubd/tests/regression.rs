@@ -3,7 +3,7 @@ use aihubd::{log_lifecycle, Daemon, Pty};
 use std::{
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -61,6 +61,21 @@ async fn recv(s: &mut UnixStream) -> DaemonMessage {
             return msg;
         }
     }
+}
+
+/// Operation replies can arrive after `SessionExited` or `SessionList` broadcasts
+/// (for example when `wait_session_stopped` polled the registry just before merge).
+async fn recv_operation_reply(s: &mut UnixStream) -> DaemonMessage {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match recv(s).await {
+                DaemonMessage::SessionExited { .. } | DaemonMessage::SessionList { .. } => {}
+                msg => return msg,
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for daemon operation reply"))
 }
 
 async fn connect_and_handshake(path: &std::path::Path) -> UnixStream {
@@ -125,6 +140,26 @@ fn dummy_pty() -> Pty {
         stop: Arc::new(|_| Box::pin(async { Ok(Some(0)) })),
         try_write: Arc::new(|_| Ok(())),
     }
+}
+
+/// Stop fails for the first `failures` calls, then succeeds (shutdown retries uncertain groups).
+fn failing_stop_for_n_attempts(failures: usize) -> (Pty, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut pty = dummy_pty();
+    pty.stop = Arc::new({
+        let calls = calls.clone();
+        move |_| {
+            let calls = calls.clone();
+            Box::pin(async move {
+                if calls.fetch_add(1, Ordering::SeqCst) < failures {
+                    anyhow::bail!("stop barrier signal failed")
+                } else {
+                    Ok(Some(0))
+                }
+            })
+        }
+    });
+    (pty, calls)
 }
 
 // ---------------------------------------------------------------------------
@@ -695,6 +730,7 @@ async fn f9_submit_task_context_and_classify_fallback() {
         DaemonMessage::RouteRecommendation {
             session_id,
             outcome,
+            ..
         } => {
             assert_eq!(session_id, id);
             assert!(matches!(outcome, RouteOutcome::Recommendation { .. }));
@@ -787,6 +823,7 @@ async fn f10_no_capacity_never_dispatched() {
         DaemonMessage::RouteRecommendation {
             session_id,
             outcome,
+            ..
         } => {
             assert_eq!(session_id, id);
             match outcome {
@@ -1105,12 +1142,7 @@ async fn f4_merge_refuses_when_stop_unconfirmed() {
 
     let daemon = Daemon::new(
         || async { vec![] },
-        |_, _, _| {
-            let mut pty = dummy_pty();
-            pty.stop =
-                Arc::new(|_| Box::pin(async { anyhow::bail!("stop barrier signal failed") }));
-            Ok(pty)
-        },
+        |_, _, _| Ok(failing_stop_for_n_attempts(1).0),
     )
     .with_git_seams(
         |_, _, _| async { Ok("diff content".to_string()) },
@@ -1218,10 +1250,7 @@ async fn f5_switch_refuses_replacement_when_stop_unconfirmed() {
         || async { vec![] },
         move |_, _, _| {
             calls.fetch_add(1, Ordering::SeqCst);
-            let mut pty = dummy_pty();
-            pty.stop =
-                Arc::new(|_| Box::pin(async { anyhow::bail!("stop barrier signal failed") }));
-            Ok(pty)
+            Ok(failing_stop_for_n_attempts(1).0)
         },
     );
 
@@ -1297,6 +1326,29 @@ async fn f5_switch_refuses_replacement_when_stop_unconfirmed() {
 // return, and stays quiet afterward.
 // ---------------------------------------------------------------------------
 
+fn write_leader_exits_descendant_script(dir: &std::path::Path) -> PathBuf {
+    std::fs::create_dir_all(dir).unwrap();
+    let script = dir.join("leader-exits.sh");
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+mkdir -p .scratch
+marker=.scratch/marker
+: > "$marker"
+(trap '' TERM HUP; exec >/dev/null 2>&1 </dev/null; while :; do printf x >> "$marker"; sleep 0.02; done) &
+while [ ! -s "$marker" ]; do sleep 0.01; done
+exit 0
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        &script,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+    )
+    .unwrap();
+    script
+}
+
 fn write_descendant_script(dir: &std::path::Path) -> PathBuf {
     std::fs::create_dir_all(dir).unwrap();
     let script = dir.join("descendant.sh");
@@ -1321,14 +1373,26 @@ wait
 
 async fn assert_marker_quiet(dir: &std::path::Path) {
     let marker = dir.join(".scratch/marker");
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let before = std::fs::read(&marker).unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let after = std::fs::read(&marker).unwrap();
-    assert_eq!(
-        before, after,
-        "redirected descendant kept writing after the stop barrier returned"
-    );
+    let deadline = Duration::from_secs(5);
+    let stable_for = Duration::from_millis(300);
+    tokio::time::timeout(deadline, async {
+        let mut last = std::fs::read(&marker).unwrap();
+        let mut stable_since = std::time::Instant::now();
+        loop {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let current = std::fs::read(&marker).unwrap();
+            if current == last {
+                if stable_since.elapsed() >= stable_for {
+                    return;
+                }
+            } else {
+                last = current;
+                stable_since = std::time::Instant::now();
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("marker file never stabilized for {:?}", stable_for));
 }
 
 /// Only `HarnessId::Codex` runs the ignoring-descendant script; any other harness (e.g. a
@@ -1377,16 +1441,37 @@ fn descendant_daemon(script: PathBuf) -> Daemon {
 }
 
 async fn wait_for_marker(dir: &std::path::Path) {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    let marker = dir.join(".scratch/marker");
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if std::fs::metadata(dir.join(".scratch/marker")).is_ok_and(|m| m.len() > 0) {
+            if std::fs::metadata(&marker).is_ok_and(|m| m.len() > 0) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .unwrap();
+    .unwrap_or_else(|_| panic!("marker {} never grew", marker.display()));
+}
+
+async fn wait_session_stopped(client: &mut UnixStream, id: &SessionId) {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            send(client, ClientMessage::ListSessions).await;
+            match recv(client).await {
+                DaemonMessage::SessionList { sessions } => {
+                    if sessions.iter().any(|s| s.session_id == *id && !s.active) {
+                        return;
+                    }
+                }
+                DaemonMessage::SessionExited { session_id, .. } if session_id == *id => return,
+                _ => {}
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("session {id} never became inactive within 15s"));
 }
 
 #[tokio::test]
@@ -1539,6 +1624,421 @@ async fn f4_redirected_descendant_quiet_after_switch() {
     stop_tx.send(()).unwrap();
     daemon_task.await.unwrap().unwrap();
     let _ = std::fs::remove_dir_all(&root);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::remove_dir_all(parent);
+    }
+}
+
+#[tokio::test]
+async fn r1_leader_exited_descendant_quiet_after_merge() {
+    let root = std::env::temp_dir().join(format!(
+        "ah09-r1-merge-{}-{}",
+        std::process::id(),
+        SOCKET_COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    let script = write_leader_exits_descendant_script(&root);
+    let wt = root.join("wt");
+    std::fs::create_dir_all(&wt).unwrap();
+
+    let finish_calls = Arc::new(AtomicUsize::new(0));
+    let finish_count = finish_calls.clone();
+    let daemon = descendant_daemon(script).with_git_seams(
+        |_, _, _| async { Ok(String::new()) },
+        move |_, strategy, _| {
+            let finish_count = finish_count.clone();
+            async move {
+                finish_count.fetch_add(1, Ordering::SeqCst);
+                Ok(aihub_git::MergeOutcome {
+                    strategy,
+                    success: true,
+                    diff: String::new(),
+                    message: "ok".into(),
+                })
+            }
+        },
+    );
+
+    let path = test_socket();
+    let id = SessionId::new("r1-leader-exit-merge");
+    daemon
+        .add_session(
+            PathBuf::from("/fake/repo"),
+            aihub_git::SessionWorktree {
+                session_id: id.clone(),
+                path: wt.clone(),
+                branch: id.branch_name(),
+                base_branch: "main".into(),
+                originating_checkout: PathBuf::from("/fake/repo"),
+            },
+            HarnessId::Codex,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let p = path.clone();
+    let daemon_task = tokio::spawn(async move {
+        daemon
+            .run(p, async {
+                stop_rx.await.ok();
+            })
+            .await
+    });
+
+    let mut client = connect_and_handshake(&path).await;
+    attach_session(&mut client, &id).await;
+    wait_for_marker(&wt).await;
+    wait_session_stopped(&mut client, &id).await;
+
+    send(
+        &mut client,
+        ClientMessage::MergeRequest {
+            session_id: id.clone(),
+            strategy: MergeStrategy::Keep,
+        },
+    )
+    .await;
+    match recv_operation_reply(&mut client).await {
+        DaemonMessage::MergeResult { .. } => {}
+        other => panic!("expected MergeResult preview, got {other:?}"),
+    }
+    send(
+        &mut client,
+        ClientMessage::MergeRequest {
+            session_id: id.clone(),
+            strategy: MergeStrategy::Keep,
+        },
+    )
+    .await;
+    match recv_operation_reply(&mut client).await {
+        DaemonMessage::MergeResult {
+            success, message, ..
+        } => assert!(success, "{message}"),
+        other => panic!("expected MergeResult, got {other:?}"),
+    }
+    assert_eq!(
+        finish_calls.load(Ordering::SeqCst),
+        1,
+        "git finalize must run only after the group barrier confirms quiescence"
+    );
+    assert_marker_quiet(&wt).await;
+
+    stop_tx.send(()).unwrap();
+    daemon_task.await.unwrap().unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::remove_dir_all(parent);
+    }
+}
+
+#[tokio::test]
+async fn r1_leader_exited_descendant_quiet_after_switch() {
+    let root = std::env::temp_dir().join(format!(
+        "ah09-r1-switch-{}-{}",
+        std::process::id(),
+        SOCKET_COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    let script = write_leader_exits_descendant_script(&root);
+    let wt = root.join("wt");
+    std::fs::create_dir_all(&wt).unwrap();
+
+    let spawn_calls = Arc::new(AtomicUsize::new(0));
+    let calls = spawn_calls.clone();
+    let script_for_spawn = script.clone();
+    let daemon = Daemon::new(
+        || async { vec![] },
+        move |harness, opts, _model| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            if harness != HarnessId::Codex {
+                return Ok(dummy_pty());
+            }
+            let h = Arc::new(aihub_pty::spawn_command(
+                "/bin/sh",
+                &[script_for_spawn.to_str().unwrap()],
+                opts,
+            )?);
+            let writer = h.clone();
+            let resize = h.clone();
+            let wait = h.clone();
+            let kill = h.clone();
+            let stop = h.clone();
+            Ok(Pty {
+                output: h.subscribe_output(),
+                scrollback: h.scrollback_snapshot(),
+                write: Box::new(move |data| {
+                    let h = writer.clone();
+                    Box::pin(async move { h.try_write(&data).map_err(Into::into) })
+                }),
+                resize: Box::new(move |size| resize.resize(size).map_err(Into::into)),
+                wait: Box::new(move || {
+                    let h = wait.clone();
+                    Box::pin(async move { h.wait().await.map_err(Into::into) })
+                }),
+                kill: Box::new(move || {
+                    let h = kill.clone();
+                    Box::pin(async move { h.kill().await.map_err(Into::into) })
+                }),
+                stop: Arc::new(move |timeout| {
+                    let h = stop.clone();
+                    Box::pin(async move { h.stop_barrier(timeout).await.map_err(Into::into) })
+                }),
+                try_write: Arc::new(move |data| h.try_write(&data).map_err(Into::into)),
+            })
+        },
+    );
+
+    let path = test_socket();
+    let id = SessionId::new("r1-leader-exit-switch");
+    daemon
+        .add_session(
+            PathBuf::from("/fake/repo"),
+            aihub_git::SessionWorktree {
+                session_id: id.clone(),
+                path: wt.clone(),
+                branch: id.branch_name(),
+                base_branch: "main".into(),
+                originating_checkout: PathBuf::from("/fake/repo"),
+            },
+            HarnessId::Codex,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let p = path.clone();
+    let daemon_task = tokio::spawn(async move {
+        daemon
+            .run(p, async {
+                stop_rx.await.ok();
+            })
+            .await
+    });
+
+    let mut client = connect_and_handshake(&path).await;
+    attach_session(&mut client, &id).await;
+    wait_for_marker(&wt).await;
+    wait_session_stopped(&mut client, &id).await;
+
+    send(
+        &mut client,
+        ClientMessage::SwitchHarness {
+            session_id: id.clone(),
+            target: HarnessId::ClaudeCode,
+            with_handoff: false,
+            model: None,
+        },
+    )
+    .await;
+    match recv_operation_reply(&mut client).await {
+        DaemonMessage::HarnessSwitched { .. } => {}
+        other => panic!("expected HarnessSwitched, got {other:?}"),
+    }
+    assert_eq!(
+        spawn_calls.load(Ordering::SeqCst),
+        2,
+        "incoming harness must spawn only after the group barrier confirms quiescence"
+    );
+    assert_marker_quiet(&wt).await;
+
+    stop_tx.send(()).unwrap();
+    daemon_task.await.unwrap().unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::remove_dir_all(parent);
+    }
+}
+
+#[tokio::test]
+async fn r1_repeated_merge_after_stop_unconfirmed_never_finishes_git() {
+    let path = test_socket();
+    let finish_calls = Arc::new(AtomicUsize::new(0));
+    let finish_count = finish_calls.clone();
+    let stop_attempts = Arc::new(AtomicUsize::new(0));
+    let attempts = stop_attempts.clone();
+    let daemon = Daemon::new(
+        || async { vec![] },
+        move |_, _, _| {
+            let attempts = attempts.clone();
+            let mut pty = dummy_pty();
+            pty.stop = Arc::new(move |_| {
+                let attempts = attempts.clone();
+                Box::pin(async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+                        anyhow::bail!("stop barrier signal failed")
+                    } else {
+                        Ok(Some(0))
+                    }
+                })
+            });
+            Ok(pty)
+        },
+    )
+    .with_git_seams(
+        |_, _, _| async { Ok("diff".to_string()) },
+        move |_, strategy, _| {
+            let finish_count = finish_count.clone();
+            async move {
+                finish_count.fetch_add(1, Ordering::SeqCst);
+                Ok(aihub_git::MergeOutcome {
+                    strategy,
+                    success: true,
+                    diff: "diff".into(),
+                    message: "ok".into(),
+                })
+            }
+        },
+    );
+
+    let id = SessionId::new("r1-repeat-merge");
+    daemon
+        .add_session(
+            PathBuf::from("/fake/repo"),
+            aihub_git::SessionWorktree {
+                session_id: id.clone(),
+                path: PathBuf::from("/fake/wt"),
+                branch: id.branch_name(),
+                base_branch: "main".into(),
+                originating_checkout: PathBuf::from("/fake/repo"),
+            },
+            HarnessId::Codex,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let p = path.clone();
+    let daemon_task = tokio::spawn(async move {
+        daemon
+            .run(p, async {
+                stop_rx.await.ok();
+            })
+            .await
+    });
+
+    let mut client = connect_and_handshake(&path).await;
+    attach_session(&mut client, &id).await;
+
+    for _ in 0..2 {
+        send(
+            &mut client,
+            ClientMessage::MergeRequest {
+                session_id: id.clone(),
+                strategy: MergeStrategy::Squash,
+            },
+        )
+        .await;
+        let _ = recv(&mut client).await;
+        send(
+            &mut client,
+            ClientMessage::MergeRequest {
+                session_id: id.clone(),
+                strategy: MergeStrategy::Squash,
+            },
+        )
+        .await;
+        match recv(&mut client).await {
+            DaemonMessage::Error { code, .. } => assert_eq!(code, "stop_unconfirmed"),
+            other => panic!("expected stop_unconfirmed, got {other:?}"),
+        }
+    }
+    assert_eq!(finish_calls.load(Ordering::SeqCst), 0);
+    assert!(
+        stop_attempts.load(Ordering::SeqCst) >= 2,
+        "each confirm must retry the stop barrier, not trust inactive alone"
+    );
+
+    stop_tx.send(()).unwrap();
+    daemon_task.await.unwrap().unwrap();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::remove_dir_all(parent);
+    }
+}
+
+#[tokio::test]
+async fn r1_second_client_switch_after_stop_unconfirmed_still_refuses_spawn() {
+    let path = test_socket();
+    let spawn_calls = Arc::new(AtomicUsize::new(0));
+    let calls = spawn_calls.clone();
+
+    let daemon = Daemon::new(
+        || async { vec![] },
+        move |_, _, _| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(failing_stop_for_n_attempts(2).0)
+        },
+    );
+
+    let id = SessionId::new("r1-second-client");
+    daemon
+        .add_session(
+            PathBuf::from("/fake/repo"),
+            aihub_git::SessionWorktree {
+                session_id: id.clone(),
+                path: PathBuf::from("/fake/wt"),
+                branch: id.branch_name(),
+                base_branch: "main".into(),
+                originating_checkout: PathBuf::from("/fake/repo"),
+            },
+            HarnessId::Codex,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let p = path.clone();
+    let daemon_task = tokio::spawn(async move {
+        daemon
+            .run(p, async {
+                stop_rx.await.ok();
+            })
+            .await
+    });
+
+    let mut client_a = connect_and_handshake(&path).await;
+    attach_session(&mut client_a, &id).await;
+    send(
+        &mut client_a,
+        ClientMessage::SwitchHarness {
+            session_id: id.clone(),
+            target: HarnessId::ClaudeCode,
+            with_handoff: false,
+            model: None,
+        },
+    )
+    .await;
+    match recv(&mut client_a).await {
+        DaemonMessage::Error { code, .. } => assert_eq!(code, "stop_unconfirmed"),
+        other => panic!("expected stop_unconfirmed, got {other:?}"),
+    }
+
+    let mut client_b = connect_and_handshake(&path).await;
+    attach_session(&mut client_b, &id).await;
+    send(
+        &mut client_b,
+        ClientMessage::SwitchHarness {
+            session_id: id.clone(),
+            target: HarnessId::ClaudeCode,
+            with_handoff: false,
+            model: None,
+        },
+    )
+    .await;
+    match recv(&mut client_b).await {
+        DaemonMessage::Error { code, .. } => assert_eq!(code, "stop_unconfirmed"),
+        other => panic!("expected stop_unconfirmed, got {other:?}"),
+    }
+    assert_eq!(
+        spawn_calls.load(Ordering::SeqCst),
+        1,
+        "replacement harness must not spawn until quiescence is confirmed"
+    );
+
+    stop_tx.send(()).unwrap();
+    daemon_task.await.unwrap().unwrap();
     if let Some(parent) = path.parent() {
         let _ = std::fs::remove_dir_all(parent);
     }
@@ -1980,13 +2480,18 @@ async fn hold_autonomous_dispatch_waits_for_hold() {
     ));
     std::fs::create_dir_all(&temp_wt).unwrap();
 
+    let now_epoch = Arc::new(AtomicU64::new(1_000_000));
+    let now_epoch_clock = now_epoch.clone();
+    let now_epoch_router = now_epoch.clone();
+
     let daemon = Daemon::new(
-        || async { vec![] },
+        || async { std::future::pending::<Vec<QuotaSnapshot>>().await },
         move |_, _, _| {
             calls.fetch_add(1, Ordering::SeqCst);
             Ok(dummy_pty())
         },
     )
+    .with_clock(move || now_epoch_clock.load(Ordering::SeqCst))
     .with_classifier(|_| async {
         aihub_router::Classification {
             tier: TaskTier::Mechanical,
@@ -1994,12 +2499,12 @@ async fn hold_autonomous_dispatch_waits_for_hold() {
             ambiguous: false,
         }
     })
-    .with_router(|_, _, _, _, _| {
+    .with_router(move |_, _, _, _, _| {
         Ok(RouteOutcome::Recommendation {
             harness: HarnessId::ClaudeCode,
             lane: None,
-            model: None,
-            holds_until_s: Some(30),
+            model: Some("claude-held".into()),
+            holds_until_s: Some(now_epoch_router.load(Ordering::SeqCst) + 30),
         })
     })
     .with_memory_extractor(|_, _, _| async {
@@ -2066,7 +2571,7 @@ async fn hold_autonomous_dispatch_waits_for_hold() {
         DaemonMessage::RouteRecommendation { outcome, .. } => assert!(matches!(
             outcome,
             RouteOutcome::Recommendation {
-                holds_until_s: Some(30),
+                holds_until_s: Some(1_000_030),
                 ..
             }
         )),
@@ -2082,7 +2587,183 @@ async fn hold_autonomous_dispatch_waits_for_hold() {
     );
 
     // Advance the injected clock past the hold; autonomous dispatch must then switch.
+    now_epoch.fetch_add(31, Ordering::SeqCst);
     tokio::time::advance(Duration::from_secs(31)).await;
+    for _ in 0..500 {
+        if spawn_calls.load(Ordering::SeqCst) == 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        spawn_calls.load(Ordering::SeqCst),
+        2,
+        "autonomous dispatch must switch once the hold has passed"
+    );
+
+    stop_tx.send(()).unwrap();
+    daemon_task.await.unwrap().unwrap();
+    let _ = std::fs::remove_dir_all(&temp_wt);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::remove_dir_all(parent);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// R3: router hold deadline, AcceptRecommendation, and spawn (not SwitchHarness)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn r3_daemon_accept_recommendation_honors_router_hold_deadline() {
+    let path = test_socket();
+    let spawn_calls = Arc::new(AtomicUsize::new(0));
+    let calls = spawn_calls.clone();
+    let temp_wt = std::env::temp_dir().join(format!(
+        "ah12-r3-wt-{}-{}",
+        std::process::id(),
+        SOCKET_COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&temp_wt).unwrap();
+
+    let now_epoch = Arc::new(AtomicU64::new(2_000_000));
+    let now_clock = now_epoch.clone();
+    let now_router = now_epoch.clone();
+
+    let held_snapshot = vec![QuotaSnapshot {
+        slot: SlotId::default_for(HarnessId::Antigravity),
+        status: QuotaStatus::Ok,
+        source: QuotaSource::Vendor,
+        estimated: false,
+        note: None,
+        windows: vec![],
+        lanes: vec![QuotaLane {
+            name: "gemini".into(),
+            kind: LaneKind::Own,
+            windows: vec![QuotaWindow::new(
+                WindowKind::FiveHour,
+                85.,
+                Some(30),
+                Some(18_000),
+            )],
+        }],
+    }];
+    let catalog = aihub_router::ModelCatalog::from_models(vec![], vec!["gemini-test".into()]);
+
+    let daemon = Daemon::new(
+        || async { vec![] },
+        move |_, _, _| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(dummy_pty())
+        },
+    )
+    .with_clock(move || now_clock.load(Ordering::SeqCst))
+    .with_catalog(catalog)
+    .with_classifier(|_| async {
+        aihub_router::Classification {
+            tier: TaskTier::Mechanical,
+            confidence: 0.9,
+            ambiguous: false,
+        }
+    })
+    .with_router(move |tier, size, _snapshots, horizon, catalog| {
+        aihub_router::route_outcome_at(
+            tier,
+            size,
+            &held_snapshot,
+            horizon,
+            catalog,
+            now_router.load(Ordering::SeqCst),
+        )
+        .map_err(Into::into)
+    })
+    .with_memory_extractor(|_, _, _| async {
+        Ok(aihub_memory::HandoffTurn {
+            summary: "s".into(),
+            last_output: "o".into(),
+            decisions: vec![],
+        })
+    })
+    .with_memory_recorder(|_, _, _, _, _| async { Ok(aihub_memory::HandoffDestination::Spooled) });
+
+    let id = SessionId::new("r3-hold-session");
+    daemon
+        .add_session(
+            PathBuf::from("/fake/repo"),
+            aihub_git::SessionWorktree {
+                session_id: id.clone(),
+                path: temp_wt.clone(),
+                branch: id.branch_name(),
+                base_branch: "main".into(),
+                originating_checkout: PathBuf::from("/fake/repo"),
+            },
+            HarnessId::Codex,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let p = path.clone();
+    let daemon_task = tokio::spawn(async move {
+        daemon
+            .run(p, async {
+                stop_rx.await.ok();
+            })
+            .await
+    });
+
+    let mut client = connect_and_handshake(&path).await;
+    attach_session(&mut client, &id).await;
+
+    send(
+        &mut client,
+        ClientMessage::SubmitTask {
+            session_id: id.clone(),
+            task: "mechanical rename".into(),
+        },
+    )
+    .await;
+    let (rec_id, hold_deadline) = match recv(&mut client).await {
+        DaemonMessage::RouteRecommendation {
+            outcome,
+            recommendation_id,
+            ..
+        } => {
+            let deadline = outcome
+                .holds_until_s()
+                .expect("router hold must be epoch deadline");
+            (recommendation_id, deadline)
+        }
+        other => panic!("expected RouteRecommendation, got {other:?}"),
+    };
+
+    send(
+        &mut client,
+        ClientMessage::AcceptRecommendation {
+            session_id: id.clone(),
+            recommendation_id: Some(rec_id),
+        },
+    )
+    .await;
+    match recv(&mut client).await {
+        DaemonMessage::Error { code, .. } => assert_eq!(code, "recommendation_held"),
+        other => panic!("expected held error while deadline in future, got {other:?}"),
+    }
+    assert_eq!(
+        spawn_calls.load(Ordering::SeqCst),
+        1,
+        "accept must not spawn before hold deadline"
+    );
+
+    now_epoch.store(hold_deadline, Ordering::SeqCst);
+    send(
+        &mut client,
+        ClientMessage::AcceptRecommendation {
+            session_id: id.clone(),
+            recommendation_id: Some(rec_id),
+        },
+    )
+    .await;
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if spawn_calls.load(Ordering::SeqCst) == 2 {
@@ -2092,7 +2773,374 @@ async fn hold_autonomous_dispatch_waits_for_hold() {
         }
     })
     .await
-    .expect("autonomous dispatch must switch once the hold has passed");
+    .expect("accept after deadline must switch harness");
+
+    stop_tx.send(()).unwrap();
+    daemon_task.await.unwrap().unwrap();
+    let _ = std::fs::remove_dir_all(&temp_wt);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::remove_dir_all(parent);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// R8: same-harness model change reaches spawner argv
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn r8_same_harness_model_change_passes_model_to_spawner() {
+    let path = test_socket();
+    let seen_models = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+    let captured = seen_models.clone();
+    let temp_wt = std::env::temp_dir().join(format!(
+        "ah12-r8-wt-{}-{}",
+        std::process::id(),
+        SOCKET_COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&temp_wt).unwrap();
+
+    let daemon = Daemon::new(
+        || async { vec![] },
+        move |_, _, model| {
+            captured.lock().unwrap().push(model);
+            Ok(dummy_pty())
+        },
+    )
+    .with_memory_extractor(|_, _, _| async {
+        Ok(aihub_memory::HandoffTurn {
+            summary: "s".into(),
+            last_output: "o".into(),
+            decisions: vec![],
+        })
+    })
+    .with_memory_recorder(|_, _, _, _, _| async { Ok(aihub_memory::HandoffDestination::Spooled) });
+
+    let id = SessionId::new("r8-model-session");
+    daemon
+        .add_session(
+            PathBuf::from("/fake/repo"),
+            aihub_git::SessionWorktree {
+                session_id: id.clone(),
+                path: temp_wt.clone(),
+                branch: id.branch_name(),
+                base_branch: "main".into(),
+                originating_checkout: PathBuf::from("/fake/repo"),
+            },
+            HarnessId::CursorAgent,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let p = path.clone();
+    let daemon_task = tokio::spawn(async move {
+        daemon
+            .run(p, async {
+                stop_rx.await.ok();
+            })
+            .await
+    });
+
+    let mut client = connect_and_handshake(&path).await;
+    attach_session(&mut client, &id).await;
+
+    send(
+        &mut client,
+        ClientMessage::SwitchHarness {
+            session_id: id.clone(),
+            target: HarnessId::CursorAgent,
+            with_handoff: true,
+            model: Some("old-model".into()),
+        },
+    )
+    .await;
+    let _ = recv(&mut client).await;
+
+    send(
+        &mut client,
+        ClientMessage::SwitchHarness {
+            session_id: id.clone(),
+            target: HarnessId::CursorAgent,
+            with_handoff: true,
+            model: Some("frontier-model".into()),
+        },
+    )
+    .await;
+    match recv(&mut client).await {
+        DaemonMessage::HarnessSwitched { .. } => {}
+        other => panic!("expected HarnessSwitched, got {other:?}"),
+    }
+
+    assert_eq!(
+        seen_models.lock().unwrap().last().and_then(|m| m.clone()),
+        Some("frontier-model".into()),
+        "same-harness switch with a new model must reach the spawner"
+    );
+
+    stop_tx.send(()).unwrap();
+    daemon_task.await.unwrap().unwrap();
+    let _ = std::fs::remove_dir_all(&temp_wt);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::remove_dir_all(parent);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// R10: hold dispatch lifecycle vs quiescence and stale recommendations
+// ---------------------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn r10_yielding_extractor_does_not_cancel_hold_dispatch() {
+    let path = test_socket();
+    let spawn_calls = Arc::new(AtomicUsize::new(0));
+    let calls = spawn_calls.clone();
+    let extract_gate = Arc::new(tokio::sync::Notify::new());
+    let extract_release = extract_gate.clone();
+    let temp_wt = std::env::temp_dir().join(format!(
+        "ah12-r10-yield-{}-{}",
+        std::process::id(),
+        SOCKET_COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&temp_wt).unwrap();
+
+    let now_epoch = Arc::new(AtomicU64::new(3_000_000));
+    let now_clock = now_epoch.clone();
+
+    let daemon = Daemon::new(
+        || async { vec![] },
+        move |_, _, _| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(dummy_pty())
+        },
+    )
+    .with_clock(move || now_clock.load(Ordering::SeqCst))
+    .with_classifier(|_| async {
+        aihub_router::Classification {
+            tier: TaskTier::Mechanical,
+            confidence: 0.9,
+            ambiguous: false,
+        }
+    })
+    .with_router(move |_, _, _, _, _| {
+        Ok(RouteOutcome::Recommendation {
+            harness: HarnessId::ClaudeCode,
+            lane: None,
+            model: Some("claude-target".into()),
+            holds_until_s: Some(now_epoch.load(Ordering::SeqCst) + 5),
+        })
+    })
+    .with_memory_extractor(move |_, _, _| {
+        let gate = extract_gate.clone();
+        async move {
+            gate.notified().await;
+            Ok(aihub_memory::HandoffTurn {
+                summary: "s".into(),
+                last_output: "o".into(),
+                decisions: vec![],
+            })
+        }
+    })
+    .with_memory_recorder(|_, _, _, _, _| async { Ok(aihub_memory::HandoffDestination::Spooled) });
+
+    let id = SessionId::new("r10-yield-session");
+    daemon
+        .add_session(
+            PathBuf::from("/fake/repo"),
+            aihub_git::SessionWorktree {
+                session_id: id.clone(),
+                path: temp_wt.clone(),
+                branch: id.branch_name(),
+                base_branch: "main".into(),
+                originating_checkout: PathBuf::from("/fake/repo"),
+            },
+            HarnessId::Codex,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let p = path.clone();
+    let daemon_task = tokio::spawn(async move {
+        daemon
+            .run(p, async {
+                stop_rx.await.ok();
+            })
+            .await
+    });
+
+    let mut client = connect_and_handshake(&path).await;
+    attach_session(&mut client, &id).await;
+    send(
+        &mut client,
+        ClientMessage::SetMode {
+            session_id: id.clone(),
+            mode: Mode::Autonomous,
+        },
+    )
+    .await;
+    let _ = recv(&mut client).await;
+    send(
+        &mut client,
+        ClientMessage::SubmitTask {
+            session_id: id.clone(),
+            task: "mechanical task".into(),
+        },
+    )
+    .await;
+    let _ = recv(&mut client).await;
+
+    tokio::time::advance(Duration::from_secs(6)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        spawn_calls.load(Ordering::SeqCst),
+        1,
+        "hold timer must start switch without being cancelled by quiesce"
+    );
+
+    extract_release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if spawn_calls.load(Ordering::SeqCst) == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("yielding extractor must not abort the scheduled switch");
+
+    stop_tx.send(()).unwrap();
+    daemon_task.await.unwrap().unwrap();
+    let _ = std::fs::remove_dir_all(&temp_wt);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::remove_dir_all(parent);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn r10_stale_hold_timer_ignored_after_no_capacity() {
+    let path = test_socket();
+    let spawn_calls = Arc::new(AtomicUsize::new(0));
+    let calls = spawn_calls.clone();
+    let router_pass = Arc::new(AtomicUsize::new(0));
+    let pass = router_pass.clone();
+    let temp_wt = std::env::temp_dir().join(format!(
+        "ah12-r10-stale-{}-{}",
+        std::process::id(),
+        SOCKET_COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&temp_wt).unwrap();
+
+    let now_epoch = Arc::new(AtomicU64::new(4_000_000));
+    let now_clock = now_epoch.clone();
+
+    let daemon = Daemon::new(
+        || async { vec![] },
+        move |_, _, _| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(dummy_pty())
+        },
+    )
+    .with_clock(move || now_clock.load(Ordering::SeqCst))
+    .with_classifier(|_| async {
+        aihub_router::Classification {
+            tier: TaskTier::Mechanical,
+            confidence: 0.9,
+            ambiguous: false,
+        }
+    })
+    .with_router(move |_, _, _, _, _| {
+        let n = pass.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            Ok(RouteOutcome::Recommendation {
+                harness: HarnessId::ClaudeCode,
+                lane: None,
+                model: Some("claude-target".into()),
+                holds_until_s: Some(now_epoch.load(Ordering::SeqCst) + 60),
+            })
+        } else {
+            Ok(RouteOutcome::NoCapacity {
+                reason: "exhausted".into(),
+            })
+        }
+    })
+    .with_memory_extractor(|_, _, _| async {
+        Ok(aihub_memory::HandoffTurn {
+            summary: "s".into(),
+            last_output: "o".into(),
+            decisions: vec![],
+        })
+    })
+    .with_memory_recorder(|_, _, _, _, _| async { Ok(aihub_memory::HandoffDestination::Spooled) });
+
+    let id = SessionId::new("r10-stale-session");
+    daemon
+        .add_session(
+            PathBuf::from("/fake/repo"),
+            aihub_git::SessionWorktree {
+                session_id: id.clone(),
+                path: temp_wt.clone(),
+                branch: id.branch_name(),
+                base_branch: "main".into(),
+                originating_checkout: PathBuf::from("/fake/repo"),
+            },
+            HarnessId::Codex,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let p = path.clone();
+    let daemon_task = tokio::spawn(async move {
+        daemon
+            .run(p, async {
+                stop_rx.await.ok();
+            })
+            .await
+    });
+
+    let mut client = connect_and_handshake(&path).await;
+    attach_session(&mut client, &id).await;
+    send(
+        &mut client,
+        ClientMessage::SetMode {
+            session_id: id.clone(),
+            mode: Mode::Autonomous,
+        },
+    )
+    .await;
+    let _ = recv(&mut client).await;
+
+    send(
+        &mut client,
+        ClientMessage::SubmitTask {
+            session_id: id.clone(),
+            task: "first task".into(),
+        },
+    )
+    .await;
+    let _ = recv(&mut client).await;
+
+    send(
+        &mut client,
+        ClientMessage::SubmitTask {
+            session_id: id.clone(),
+            task: "second task".into(),
+        },
+    )
+    .await;
+    let _ = recv(&mut client).await;
+
+    tokio::time::advance(Duration::from_secs(61)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        spawn_calls.load(Ordering::SeqCst),
+        1,
+        "stale hold timer must not dispatch after a newer NoCapacity recommendation"
+    );
 
     stop_tx.send(()).unwrap();
     daemon_task.await.unwrap().unwrap();

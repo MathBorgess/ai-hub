@@ -103,8 +103,13 @@ fn test_all_client_messages_roundtrip() {
         },
         // 13. SubmitTask (F9)
         ClientMessage::SubmitTask {
-            session_id: sess_id,
+            session_id: sess_id.clone(),
             task: "Implement RFC 42 with robust error handling".to_string(),
+        },
+        // 14. AcceptRecommendation (R3)
+        ClientMessage::AcceptRecommendation {
+            session_id: sess_id,
+            recommendation_id: Some(42),
         },
     ];
 
@@ -168,6 +173,8 @@ fn test_all_daemon_messages_roundtrip() {
                 worktree_path: wt_path.clone(),
                 branch: "session/session-test-01".to_string(),
                 active: true,
+                model: None,
+                lane: None,
             }],
         },
         // 3. SessionCreated
@@ -189,6 +196,8 @@ fn test_all_daemon_messages_roundtrip() {
                 worktree_path: wt_path,
                 branch: "session/session-test-01".to_string(),
                 active: true,
+                model: None,
+                lane: None,
             },
         },
         // 5. Detached
@@ -218,6 +227,7 @@ fn test_all_daemon_messages_roundtrip() {
                 model: Some("claude-3-7-sonnet".to_string()),
                 holds_until_s: Some(900),
             },
+            recommendation_id: 1,
         },
         // 9b. RouteRecommendation - no capacity (F10, F13)
         DaemonMessage::RouteRecommendation {
@@ -225,6 +235,7 @@ fn test_all_daemon_messages_roundtrip() {
             outcome: RouteOutcome::NoCapacity {
                 reason: "No available slots: every slot is empty or has no supply inside the horizon; do not launch.".to_string(),
             },
+            recommendation_id: 2,
         },
         // 10. HarnessSwitched
         DaemonMessage::HarnessSwitched {
@@ -232,6 +243,7 @@ fn test_all_daemon_messages_roundtrip() {
             old_harness: HarnessId::ClaudeCode,
             new_harness: HarnessId::Antigravity,
             handoff_path: Some(PathBuf::from("/tmp/aihub/briefs/02.md")),
+            model: Some("gemini-2.5-pro".to_string()),
         },
         // 11. ModeSet
         DaemonMessage::ModeSet {

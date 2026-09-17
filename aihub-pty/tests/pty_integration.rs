@@ -124,8 +124,14 @@ async fn late_subscriber_gets_scrollback_then_live() {
 async fn write_to_pty_stdin() {
     let handle =
         spawn_command("/bin/sh", &["-c", "read x; echo got:$x"], test_opts()).expect("spawn");
-    sleep(Duration::from_millis(50)).await;
-    handle.try_write(b"hello-input\n").expect("write");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while handle.try_write(b"hello-input\n").is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "PTY never accepted stdin write within 2s"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
     wait_for_scrollback_contains(&handle, b"got:hello-input").await;
     let code = handle.wait().await.expect("wait");
     assert_eq!(code, Some(0));
@@ -153,9 +159,13 @@ async fn exit_status_propagates() {
 
 #[tokio::test]
 async fn drop_does_not_leave_running_child() {
-    let handle = spawn_command("/bin/sh", &["-c", "sleep 5"], test_opts()).expect("spawn");
+    let handle =
+        spawn_command("/bin/sh", &["-c", "echo PID:$$; sleep 5"], test_opts()).expect("spawn");
+    wait_for_scrollback_contains(&handle, b"PID:").await;
+    let text = String::from_utf8_lossy(&handle.scrollback_snapshot()).into_owned();
+    let pid = extract_pid(&text, "PID:");
     drop(handle);
-    sleep(Duration::from_millis(100)).await;
+    poll_pid_dead(pid, Duration::from_secs(2)).await;
 }
 
 #[tokio::test]
@@ -255,13 +265,125 @@ exit 0\n",
         "descendant must be dead the moment stop returns"
     );
 
-    let size_after_stop = fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
-    sleep(Duration::from_millis(300)).await;
-    let size_later = fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
-    assert_eq!(
-        size_after_stop, size_later,
-        "marker file should not grow after stop returned"
+    assert_marker_stable(&marker, Duration::from_millis(300), Duration::from_secs(5)).await;
+}
+
+#[tokio::test]
+async fn f4_redirected_descendant_leader_exits_before_stop_returns() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let marker = dir.path().join("marker");
+    let pid_file = dir.path().join("desc.pid");
+    let script = dir.path().join("run.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n\
+MARKER={}\n\
+PIDFILE={}\n\
+: >\"$MARKER\"\n\
+{{\n\
+  trap '' TERM HUP\n\
+  while :; do echo x >>\"$MARKER\"; done\n\
+}} </dev/null >/dev/null 2>/dev/null &\n\
+echo $! >\"$PIDFILE\"\n\
+while [ ! -s \"$MARKER\" ]; do sleep 0.01; done\n\
+exit 0\n",
+            marker.display(),
+            pid_file.display(),
+        ),
+    )
+    .expect("write script");
+    let mut perms = fs::metadata(&script).expect("meta").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&script, perms).expect("chmod");
+
+    let opts = PtySpawnOptions {
+        cwd: dir.path().to_path_buf(),
+        env: HashMap::new(),
+        size: PtySize::default(),
+        initial_prompt: None,
+    };
+    let handle = spawn_command("/bin/sh", &[script.to_str().expect("utf8")], opts).expect("spawn");
+
+    let descendant_pid = {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if pid_file.exists() {
+                let raw = fs::read_to_string(&pid_file).expect("read pid");
+                if let Ok(pid) = raw.trim().parse::<i32>() {
+                    break pid;
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!("descendant pid file never appeared");
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    };
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if fs::metadata(&marker).is_ok_and(|m| m.len() > 0) {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("marker {} never grew before stop", marker.display()));
+
+    handle
+        .stop(Duration::from_secs(5))
+        .await
+        .expect("stop should succeed");
+
+    assert!(
+        pid_extinct(descendant_pid),
+        "descendant must be dead the moment stop returns"
     );
+
+    assert_marker_stable(&marker, Duration::from_millis(300), Duration::from_secs(5)).await;
+}
+
+async fn assert_marker_stable(marker: &std::path::Path, stable_for: Duration, deadline: Duration) {
+    timeout(deadline, async {
+        let mut last = fs::metadata(marker).map(|m| m.len()).unwrap_or(0);
+        let mut stable_since = Instant::now();
+        loop {
+            sleep(Duration::from_millis(10)).await;
+            let current = fs::metadata(marker).map(|m| m.len()).unwrap_or(0);
+            if current == last {
+                if stable_since.elapsed() >= stable_for {
+                    return;
+                }
+            } else {
+                last = current;
+                stable_since = Instant::now();
+            }
+        }
+    })
+    .await
+    .expect("marker file never stabilized");
+}
+
+#[tokio::test]
+async fn r2_eof_live_signal_ignoring_leader_stop_within_deadline() {
+    let handle = spawn_command(
+        "/bin/sh",
+        &[
+            "-c",
+            "trap '' TERM HUP; echo ready; exec >/dev/null 2>&1 </dev/null; while :; do sleep 1; done",
+        ],
+        test_opts(),
+    )
+    .expect("spawn");
+
+    wait_for_scrollback_contains(&handle, b"ready").await;
+
+    timeout(Duration::from_secs(6), handle.stop(Duration::from_secs(5)))
+        .await
+        .expect("stop must not hang behind a blocking reap lock")
+        .expect("stop should complete within its deadline");
 }
 
 #[tokio::test]
@@ -281,8 +403,6 @@ async fn f6_drop_without_stop_leaves_no_live_child_pid() {
 #[tokio::test]
 async fn f7_stalled_writer_does_not_block_caller_or_shutdown() {
     let handle = spawn_command("/bin/sh", &["-c", "exec cat"], test_opts()).expect("spawn");
-    sleep(Duration::from_millis(50)).await;
-
     let chunk = vec![b'x'; 256 * 1024];
     let started = Instant::now();
     let mut got_queue_full = false;

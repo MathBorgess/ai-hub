@@ -36,6 +36,7 @@ pub enum RecommendationState {
         holds_until_s: Option<u64>,
         confidence: f32,
         reason: String,
+        recommendation_id: u64,
     },
     NoCapacity {
         reason: String,

@@ -272,6 +272,10 @@ pub struct SessionSummary {
     pub worktree_path: PathBuf,
     pub branch: String,
     pub active: bool,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub lane: Option<String>,
 }
 
 impl Default for SessionSummary {
@@ -284,6 +288,8 @@ impl Default for SessionSummary {
             worktree_path: PathBuf::new(),
             branch: String::new(),
             active: false,
+            model: None,
+            lane: None,
         }
     }
 }

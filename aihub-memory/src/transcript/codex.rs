@@ -142,7 +142,8 @@ mod tests {
 
     #[test]
     fn extracts_codex_assistant_turn() {
-        let dir = std::env::temp_dir().join("aihub-memory-codex-fixture");
+        let dir =
+            std::env::temp_dir().join(format!("aihub-memory-codex-fixture-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("rollout.jsonl");
@@ -171,7 +172,8 @@ mod tests {
 
     #[test]
     fn f11_tool_call_skipped_for_final_assistant_message() {
-        let dir = std::env::temp_dir().join("aihub-memory-codex-f11");
+        let dir =
+            std::env::temp_dir().join(format!("aihub-memory-codex-f11-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("rollout_with_tool_call.jsonl");

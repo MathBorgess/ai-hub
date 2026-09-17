@@ -16,6 +16,7 @@ name = "aihub"
 version = "0.1.0"
 dependencies = [
  "aihub-core",
+ "aihub-router",
  "anyhow",
  "clap",
  "crossterm",
@@ -56,6 +57,7 @@ name = "aihub-memory"
 version = "0.1.0"
 dependencies = [
  "aihub-core",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

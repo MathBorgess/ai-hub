@@ -449,6 +449,7 @@ pub fn handle_daemon_msg(app: &mut App, msg: DaemonMessage) {
         DaemonMessage::RouteRecommendation {
             session_id,
             outcome,
+            recommendation_id,
         } => {
             if let Some(curr) = &app.session_id {
                 if curr != &session_id {
@@ -471,6 +472,7 @@ pub fn handle_daemon_msg(app: &mut App, msg: DaemonMessage) {
                         holds_until_s,
                         confidence: 1.0,
                         reason: String::new(),
+                        recommendation_id,
                     });
                 }
                 aihub_core::RouteOutcome::NoCapacity { reason } => {

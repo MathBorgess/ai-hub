@@ -473,6 +473,7 @@ fn f13_other_session_events_do_not_leak() {
             old_harness: HarnessId::ClaudeCode,
             new_harness: HarnessId::Codex,
             handoff_path: None,
+            model: None,
         },
     );
     assert_eq!(
@@ -544,6 +545,7 @@ fn f13_other_session_events_do_not_leak() {
                 model: None,
                 holds_until_s: None,
             },
+            recommendation_id: 0,
         },
     );
     assert!(
@@ -560,6 +562,8 @@ fn f13_other_session_events_do_not_leak() {
         worktree_path: PathBuf::from("/test/repo/wt"),
         branch: "session/feature-x".to_string(),
         active: true,
+        model: None,
+        lane: None,
     };
     handle_daemon_msg(
         &mut app,

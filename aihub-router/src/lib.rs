@@ -194,10 +194,37 @@ fn window_supply(w: &aihub_core::QuotaWindow, horizon_s: u64) -> f64 {
     supply
 }
 
-/// Assigns optimal harness, lane, and hold duration, returning the typed RouteOutcome from core (F10).
+/// Assigns optimal harness, lane, and hold duration, returning the typed RouteOutcome from core (F10, R3, R8).
 ///
 /// `Unknown` and `Empty` quota slots are never candidates. When nothing can take the task,
 /// returns `RouteOutcome::NoCapacity` instead of a dispatchable recommendation.
+pub fn route_outcome_at(
+    tier: TaskTier,
+    size: TaskSize,
+    snapshots: &[QuotaSnapshot],
+    horizon_s: u64,
+    catalog: &ModelCatalog,
+    now_s: u64,
+) -> Result<RouteOutcome, RouterError> {
+    let Some((snapshot, lane, hold)) =
+        select_route_candidate(tier, size, snapshots, horizon_s, true, catalog)?
+    else {
+        let reason = if snapshots.is_empty() {
+            "No available slots: no quota snapshots supplied; do not launch.".into()
+        } else {
+            "No available slots: every slot is empty, unknown, has no supply inside the horizon, or lacks an enforceable model; do not launch.".into()
+        };
+        return Ok(RouteOutcome::NoCapacity { reason });
+    };
+    let holds_until_s = hold.map(|h| now_s + h);
+    Ok(RouteOutcome::Recommendation {
+        harness: snapshot.slot.harness,
+        lane: lane.map(|l| l.name.clone()),
+        model: catalog.model_for_lane(snapshot.slot.harness, lane.map(|l| l.name.as_str())),
+        holds_until_s,
+    })
+}
+
 pub fn route_outcome(
     tier: TaskTier,
     size: TaskSize,
@@ -205,22 +232,11 @@ pub fn route_outcome(
     horizon_s: u64,
     catalog: &ModelCatalog,
 ) -> Result<RouteOutcome, RouterError> {
-    let Some((snapshot, lane, hold)) =
-        select_route_candidate(tier, size, snapshots, horizon_s, true)?
-    else {
-        let reason = if snapshots.is_empty() {
-            "No available slots: no quota snapshots supplied; do not launch.".into()
-        } else {
-            "No available slots: every slot is empty, unknown, or has no supply inside the horizon; do not launch.".into()
-        };
-        return Ok(RouteOutcome::NoCapacity { reason });
-    };
-    Ok(RouteOutcome::Recommendation {
-        harness: snapshot.slot.harness,
-        lane: lane.map(|l| l.name.clone()),
-        model: catalog.model_for_lane(snapshot.slot.harness, lane.map(|l| l.name.as_str())),
-        holds_until_s: hold,
-    })
+    let now_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    route_outcome_at(tier, size, snapshots, horizon_s, catalog, now_s)
 }
 
 /// Alias for `route_outcome`.
@@ -325,6 +341,26 @@ pub enum CatalogError {
 }
 
 impl ModelCatalog {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn from_models(cursor: Vec<String>, antigravity: Vec<String>) -> Self {
+        Self {
+            cursor,
+            antigravity,
+        }
+    }
+
+    pub fn with_models(mut self, harness: HarnessId, models: Vec<String>) -> Self {
+        match harness {
+            HarnessId::CursorAgent => self.cursor = models,
+            HarnessId::Antigravity => self.antigravity = models,
+            _ => {}
+        }
+        self
+    }
+
     /// Run one harness discovery asynchronously with a 10-second deadline.
     /// Stdout is strictly capped at 256 KiB (a full buffer is rejected).
     /// Errors leave self untouched. The child is killed and reaped on failure;
@@ -459,13 +495,14 @@ type RoutePick<'a> = (
     Option<u64>,
 );
 
-fn select_route_candidate(
+fn select_route_candidate<'a>(
     tier: TaskTier,
     size: TaskSize,
-    snapshots: &[QuotaSnapshot],
+    snapshots: &'a [QuotaSnapshot],
     horizon_s: u64,
     exclude_unknown_empty: bool,
-) -> Result<Option<RoutePick<'_>>, RouterError> {
+    catalog: &ModelCatalog,
+) -> Result<Option<RoutePick<'a>>, RouterError> {
     use aihub_core::QuotaStatus;
     let wanted = if tier == TaskTier::Mechanical {
         LaneKind::Own
@@ -492,6 +529,15 @@ fn select_route_candidate(
         let mut slot_candidates = Vec::new();
         let mut refills = false;
         for lane in options {
+            // R8: if candidate specifies a lane, verify that the catalog can enforce it by resolving a model
+            if let Some(l) = lane {
+                if catalog
+                    .model_for_lane(snapshot.slot.harness, Some(l.name.as_str()))
+                    .is_none()
+                {
+                    continue;
+                }
+            }
             let windows = lane
                 .filter(|l| !l.windows.is_empty())
                 .map_or(snapshot.windows.as_slice(), |l| l.windows.as_slice());

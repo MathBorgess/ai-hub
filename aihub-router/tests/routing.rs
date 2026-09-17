@@ -1,5 +1,14 @@
 use aihub_core::*;
-use aihub_router::route_outcome as route;
+
+fn route(
+    tier: TaskTier,
+    size: TaskSize,
+    snapshots: &[QuotaSnapshot],
+    horizon_s: u64,
+    catalog: &aihub_router::ModelCatalog,
+) -> Result<RouteOutcome, aihub_router::RouterError> {
+    aihub_router::route_outcome_at(tier, size, snapshots, horizon_s, catalog, 0)
+}
 
 fn window(used: f64, reset: Option<u64>, duration: Option<u64>) -> QuotaWindow {
     QuotaWindow::new(WindowKind::FiveHour, used, reset, duration)
@@ -113,17 +122,15 @@ fn preferred_lane_and_threefold_penalty_match_script() {
         lane("gemini", LaneKind::Own, 0.),
         lane("third-party", LaneKind::Frontier, 50.),
     ];
+    let catalog = aihub_router::ModelCatalog::from_models(
+        vec![],
+        vec!["gemini-2.0-flash".into(), "claude-3-5-sonnet".into()],
+    );
     for tier in [TaskTier::Design, TaskTier::Review] {
         assert_eq!(
-            route(
-                tier,
-                TaskSize::M,
-                &[agy.clone()],
-                7200,
-                &aihub_router::ModelCatalog::default()
-            )
-            .unwrap()
-            .lane(),
+            route(tier, TaskSize::M, &[agy.clone()], 7200, &catalog)
+                .unwrap()
+                .lane(),
             Some("third-party")
         );
     }
@@ -133,21 +140,14 @@ fn preferred_lane_and_threefold_penalty_match_script() {
             TaskSize::S,
             &[agy.clone()],
             7200,
-            &aihub_router::ModelCatalog::default()
+            &catalog
         )
         .unwrap()
         .lane(),
         Some("gemini")
     );
     agy.lanes[1].windows[0].used_pct = 80.;
-    let result = route(
-        TaskTier::Design,
-        TaskSize::L,
-        &[agy],
-        7200,
-        &aihub_router::ModelCatalog::default(),
-    )
-    .unwrap();
+    let result = route(TaskTier::Design, TaskSize::L, &[agy], 7200, &catalog).unwrap();
     assert_eq!(result.lane(), Some("gemini"));
 }
 
@@ -237,6 +237,25 @@ fn latest_blocked_reset_and_multiple_refills_match_script() {
 }
 
 #[test]
+fn r8_lane_without_catalog_model_is_not_dispatchable() {
+    let mut cursor = slot(HarnessId::CursorAgent, vec![window(20., None, None)]);
+    cursor.lanes = vec![lane("cursor-models", LaneKind::Own, 20.)];
+    let empty_catalog = aihub_router::ModelCatalog::default();
+    let outcome = route(
+        TaskTier::Mechanical,
+        TaskSize::S,
+        &[cursor],
+        7200,
+        &empty_catalog,
+    )
+    .unwrap();
+    assert!(
+        matches!(outcome, RouteOutcome::NoCapacity { .. }),
+        "a lane the catalog cannot enforce must not become a Recommendation with model: None"
+    );
+}
+
+#[test]
 fn independent_lane_windows_replace_aggregate_and_can_hold() {
     let mut agy = slot(HarnessId::Antigravity, vec![window(100., None, None)]);
     agy.lanes = vec![QuotaLane {
@@ -247,14 +266,8 @@ fn independent_lane_windows_replace_aggregate_and_can_hold() {
             window(40., None, None),
         ],
     }];
-    let result = route(
-        TaskTier::Design,
-        TaskSize::M,
-        &[agy],
-        7200,
-        &aihub_router::ModelCatalog::default(),
-    )
-    .unwrap();
+    let catalog = aihub_router::ModelCatalog::from_models(vec![], vec!["claude-3-5-sonnet".into()]);
+    let result = route(TaskTier::Design, TaskSize::M, &[agy], 7200, &catalog).unwrap();
     assert_eq!(result.lane(), Some("third-party"));
     assert_eq!(result.holds_until_s(), Some(1200));
 }
