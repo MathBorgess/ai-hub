@@ -81,7 +81,7 @@ Regra invariante (docs 02/04 + MAT-223): **bind só `127.0.0.1:<porta>`**.
 | Caminho | Viabilidade nesta box | Notas |
 |---|---|---|
 | SSH `-L` → loopback | **Bloqueado hoje** (sem sshd) | Requer OK dono para openssh-server **ou** Tailscale SSH |
-| CF Tunnel Public Hostname → `127.0.0.1:9920` | **Decidido; publicação no dashboard em curso** | Hostname **`aihub.mathai.com.br`** no named tunnel; **sem** Access; **nunca** reusar `a2a` / grants MCP |
+| CF Tunnel Public Hostname → `127.0.0.1:9920` | **LIVE** (2026-09-17) | `aihub.mathai.com.br` no tunnel `hermes-ailla-a2a` → `http://127.0.0.1:9920`; **sem** Access; smoke GET `/` → 200 (stub); **nunca** reusar `a2a` / grants MCP |
 | Tailscale + SSH | Ausente | Opcional MAT-224 1ª; install à parte |
 | Expor `0.0.0.0` | **Proibido** | Anti-padrão |
 
@@ -94,7 +94,7 @@ Até haver SSH ou hostname Access, Fatias 1–2 testam-se **na própria box** (T
 | Claude Code | sim | Probe/credenciais headless: research + login assistido |
 | Codex | sim | Preferir padrões oficiais (`app-server` / ficheiros) onde couber |
 | Antigravity (`agy`) | sim | Probe macOS-only → Fatia 0; CLI pode existir sem quota probe |
-| Cursor Agent | **em instalação (OK dono 2026-09-17)** | Após install+login, V1 pode ser **4 harnesses**; até login headless, router trata como ausente |
+| Cursor Agent | **instalado** `2026.09.15-d2fe57e` (`~/.local/bin/cursor-agent`) | **login pendente** (`cursor-agent login`); até login, router trata como ausente para quota/despacho |
 
 ## 8. Lacunas de desenvolvimento (código)
 
@@ -161,7 +161,8 @@ Este PR de docs considera o Remote Split **implementável na box Ailla** quando:
 - [x] Porta/colisão e regra “não usar a2a” documentadas
 - [x] Hostname CF `aihub.mathai.com.br` + IdP GitHub decididos (2026-09-17)
 - [x] OK dono para instalar rustup + cursor-agent
-- [ ] Harnesses: cursor-agent instalado + login headless (após install)
+- [x] cursor-agent instalado (2026.09.15)
+- [ ] cursor-agent login headless
 - [ ] Dono OK escrito em ToS (pesquisa) — gate de **spawn**, não de coding Fatia 0–2
 - [ ] Issue(s) Linear abertas para Fatia 0 e Fatia 1 com DoD testável
 

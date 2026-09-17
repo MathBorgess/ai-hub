@@ -227,9 +227,9 @@ flowchart TD
 Fechadas pelo inventário / desenho (ver [05](05-alvo-box-ailla.md)):
 - Box alvo = Ailla; build default = nativo com rustup **1.98.1** + `cc` já presente.
 - Canal duplo = **channel_ticket** (Opção B).
-- Porta TCP = `127.0.0.1:9920`; hostname público = **`aihub.mathai.com.br`**; **não** reusar `a2a` / `:9910` / `:9900` / `:8787`.
+- Porta TCP = `127.0.0.1:9920`; hostname público = **`aihub.mathai.com.br`** (**LIVE** no tunnel `hermes-ailla-a2a`, sem Access); **não** reusar `a2a` / `:9910` / `:9900` / `:8787`.
 - IdP pareamento = **GitHub** (`audience=aihubd`).
-- Harnesses: `claude` / `codex` / `agy` + **`cursor-agent` em instalação** (V1 pode passar a 4 após login).
+- Harnesses: `claude` / `codex` / `agy` + **`cursor-agent` 2026.09.15 instalado** (login headless pendente).
 - Day-1 tmux permanece até Fatia 3.
 
 Fechadas pelo dono em **2026-09-17** (além do inventário):
