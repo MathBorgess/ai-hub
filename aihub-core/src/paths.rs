@@ -20,10 +20,24 @@ pub fn socket_path_in(data_dir: &Path) -> PathBuf {
     data_dir.join("aihub.sock")
 }
 
-/// Returns the default root directory for git worktrees (`${TMPDIR}/aihub/worktrees`).
+/// Returns the default root directory for git worktrees.
+///
+/// On Linux this is `~/.local/share/aihub/worktrees`: the box Ailla target runs headless
+/// with no desktop session to keep `/tmp` alive, and worktrees on a tmpfs-backed temp dir
+/// would not survive a daemon restart (ADR §2.5, gap §4.4). On macOS the existing
+/// `${TMPDIR}/aihub/worktrees` behavior is unchanged.
 pub fn default_worktree_root() -> PathBuf {
-    let base = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
-    worktree_root_in(Path::new(&base))
+    if cfg!(target_os = "linux") {
+        linux_worktree_root()
+    } else {
+        let base = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
+        worktree_root_in(Path::new(&base))
+    }
+}
+
+/// Linux worktree root logic, split out so it is exercised by tests on every platform.
+fn linux_worktree_root() -> PathBuf {
+    default_data_dir().join("worktrees")
 }
 
 /// Returns the root directory for git worktrees within a custom base temporary directory.
@@ -62,5 +76,19 @@ mod tests {
             PathBuf::from("/custom/tmp/aihub/worktrees/test-sess-123")
         );
         assert_eq!(session_branch_name(&sid), "session/test-sess-123");
+    }
+
+    #[test]
+    fn test_linux_worktree_root_uses_persistent_data_dir() {
+        // ADR §2.5/§4.4: box Ailla worktrees must not live on tmpfs so they survive
+        // a daemon restart. Exercised directly since it must hold on every CI runner,
+        // not only when tests execute on Linux.
+        assert_eq!(linux_worktree_root(), default_data_dir().join("worktrees"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_default_worktree_root_on_linux() {
+        assert_eq!(default_worktree_root(), linux_worktree_root());
     }
 }

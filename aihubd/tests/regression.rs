@@ -94,6 +94,7 @@ async fn connect_and_handshake(path: &std::path::Path) -> UnixStream {
         &mut s,
         ClientMessage::Hello {
             version: PROTOCOL_VERSION,
+            credential: None,
         },
     )
     .await;
@@ -113,6 +114,7 @@ async fn attach_session(client: &mut UnixStream, session_id: &SessionId) {
         client,
         ClientMessage::Attach {
             target: SessionTarget::Id(session_id.clone()),
+            last_seen_offset: None,
         },
     )
     .await;
@@ -926,6 +928,7 @@ async fn f13_session_scoped_events_and_attach_summary() {
         &mut client,
         ClientMessage::Attach {
             target: SessionTarget::Id(id1.clone()),
+            last_seen_offset: None,
         },
     )
     .await;

@@ -9,7 +9,45 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::PathBuf;
 
 /// Current IPC protocol version.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
+
+/// Audience a `ClientCredential` must name to be accepted by the daemon (ADR §2.3).
+///
+/// Verification is positive: the daemon checks the credential names exactly this value,
+/// it never infers trust from "the signature is valid" alone.
+pub const CREDENTIAL_AUDIENCE: &str = "aihubd";
+
+/// Proof-of-possession credential presented in `ClientMessage::Hello` for v3 clients
+/// (ADR §2.2, §2.3). Carries no long-lived secret: `signature` proves possession of the
+/// paired private key over a daemon-issued challenge, never the key material itself.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClientCredential {
+    /// Public key of the paired client keypair.
+    pub public_key: Base64Bytes,
+    /// Signature over the challenge nonce, proving possession of the private key.
+    pub signature: Base64Bytes,
+    /// Audience this credential was issued for. Must equal `CREDENTIAL_AUDIENCE`
+    /// for the daemon to accept it (§2.3 positive audience verification).
+    pub audience: String,
+    /// Unix timestamp (seconds) the credential was signed at, bounding replay window.
+    pub timestamp: u64,
+}
+
+/// Single-use ticket minted by the authenticated control channel to admit the
+/// secondary PTY data channel without a second full handshake
+/// (ADR contradiction 1, Option B: `channel_ticket`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChannelTicket(pub Base64Bytes);
+
+/// Handshake sent on the secondary PTY channel connection, presenting the
+/// `ChannelTicket` minted by the control channel for this session. Precedes the
+/// binary frame stream (`PtyBinaryFrame` in `codec.rs`), not a `ClientMessage`/
+/// `DaemonMessage` itself since the PTY channel no longer speaks JSON.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PtyChannelHello {
+    pub session_id: SessionId,
+    pub ticket: ChannelTicket,
+}
 
 /// Byte container that serializes to/from standard Base64 string in JSON.
 ///
@@ -85,7 +123,15 @@ impl From<&[u8]> for Base64Bytes {
 #[serde(tag = "action", content = "payload")]
 pub enum ClientMessage {
     /// Handshake initiating connection with protocol version.
-    Hello { version: u32 },
+    ///
+    /// `credential` is additive: absent on v2 clients (`#[serde(default)]`), so a v2
+    /// `Hello { version: 2 }` still deserializes. Local Unix socket listeners accept
+    /// v2/uncredentialed clients unconditionally; network listeners require it.
+    Hello {
+        version: u32,
+        #[serde(default)]
+        credential: Option<ClientCredential>,
+    },
     /// Request the list of active/recent sessions.
     ListSessions,
     /// Create a new session worktree and launch specified harness.
@@ -95,7 +141,16 @@ pub enum ClientMessage {
         initial_prompt: Option<String>,
     },
     /// Attach to an existing session or the latest session for a repository.
-    Attach { target: SessionTarget },
+    ///
+    /// `last_seen_offset` drives ring-buffer resumption (ADR §2.2, §3): if present and
+    /// still within the daemon's retained window, only the delta since it is replayed;
+    /// otherwise the daemon reports `gap_detected: true` in `Attached` and sends a full
+    /// snapshot.
+    Attach {
+        target: SessionTarget,
+        #[serde(default)]
+        last_seen_offset: Option<u64>,
+    },
     /// Detach client from active session without terminating it.
     Detach { session_id: SessionId },
     /// Send raw keystroke / input bytes to the session PTY.
@@ -153,7 +208,15 @@ pub enum ClientMessage {
 #[serde(tag = "event", content = "payload")]
 pub enum DaemonMessage {
     /// Handshake response confirming protocol version.
+    ///
+    /// A `version == 2` reply operates exactly as before. `version >= 3` responses may be
+    /// preceded by a `Challenge` on network listeners requiring proof of possession.
     Hello { version: u32 },
+    /// Proof-of-possession challenge issued to a client before accepting its `Hello`
+    /// credential (ADR §2.3). The client signs `nonce` and resends `Hello` with the
+    /// resulting `ClientCredential`. Never sent on local Unix socket listeners, which
+    /// accept v2/uncredentialed clients unconditionally.
+    Challenge { nonce: Base64Bytes },
     /// Response to `ListSessions`.
     SessionList { sessions: Vec<SessionSummary> },
     /// Confirmation that a new session worktree was created and launched.
@@ -162,6 +225,9 @@ pub enum DaemonMessage {
         harness: HarnessId,
         worktree_path: PathBuf,
         branch: String,
+        /// Ticket admitting the secondary PTY channel for this session (§2.2 contradiction 1).
+        #[serde(default)]
+        channel_ticket: Option<ChannelTicket>,
     },
     /// Confirmation of attach, replaying terminal scrollback and session summary (F13).
     Attached {
@@ -169,6 +235,16 @@ pub enum DaemonMessage {
         scrollback: Base64Bytes,
         #[serde(default)]
         summary: SessionSummary,
+        /// Current tail offset of the PTY ring buffer, for the client's next `Attach`.
+        #[serde(default)]
+        stream_offset: u64,
+        /// True when `last_seen_offset` fell outside the retained window: `scrollback`
+        /// is a full snapshot and the client must reset its VT parser (ADR §2.2, §3).
+        #[serde(default)]
+        gap_detected: bool,
+        /// Ticket admitting the secondary PTY channel for this session (§2.2 contradiction 1).
+        #[serde(default)]
+        channel_ticket: Option<ChannelTicket>,
     },
     /// Confirmation that client was detached.
     Detached { session_id: SessionId },
@@ -176,6 +252,10 @@ pub enum DaemonMessage {
     PtyOutput {
         session_id: SessionId,
         data: Base64Bytes,
+        /// Monotonic offset of the first byte of `data` in the session's ring buffer
+        /// (ADR §2.2). Defaults to 0 for legacy senders that do not track offsets.
+        #[serde(default)]
+        stream_offset: u64,
     },
     /// Notification that the harness process terminated in the PTY.
     SessionExited {
@@ -211,6 +291,12 @@ pub enum DaemonMessage {
     },
     /// General or fatal IPC error.
     Error { code: String, message: String },
+    /// Opaque authentication/authorization failure (ADR §2.3, §6: fail closed, no oracle).
+    ///
+    /// Deliberately carries no fields: missing handshake, bad signature, wrong audience,
+    /// expired credential and insufficient scope are all indistinguishable to the caller.
+    /// Distinguishing detail lives only in the daemon's internal audit log.
+    Unauthorized,
 }
 
 /// Top-level bidirectional IPC message envelope.

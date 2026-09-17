@@ -143,3 +143,65 @@ pub fn decode_frame(buf: &[u8]) -> Result<Option<(IpcMessage, usize)>, IpcCodecE
     let msg: IpcMessage = serde_json::from_slice(payload)?;
     Ok(Some((msg, 4 + frame_len)))
 }
+
+/// Header size (bytes) of a `PtyBinaryFrame`: 8-byte offset + 4-byte length.
+const PTY_BINARY_FRAME_HEADER_LEN: usize = 12;
+
+/// Binary frame for the dedicated PTY data channel (ADR §5, §2.2): `[8-byte
+/// big-endian stream_offset][4-byte big-endian length][raw bytes]`.
+///
+/// Distinct from the JSON/`Base64Bytes` control-channel encoding: this is the "no more
+/// Base64 on the PTY wire" format, used only once a `PtyChannelHello` has authenticated
+/// the secondary connection. The legacy JSON path (`Base64Bytes` in `ClientMessage`/
+/// `DaemonMessage`) is unchanged for the local Unix socket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PtyBinaryFrame {
+    pub stream_offset: u64,
+    pub data: Vec<u8>,
+}
+
+impl PtyBinaryFrame {
+    pub fn new(stream_offset: u64, data: impl Into<Vec<u8>>) -> Self {
+        Self {
+            stream_offset,
+            data: data.into(),
+        }
+    }
+
+    /// Encodes this frame into its wire representation.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(PTY_BINARY_FRAME_HEADER_LEN + self.data.len());
+        out.extend_from_slice(&self.stream_offset.to_be_bytes());
+        out.extend_from_slice(&(self.data.len() as u32).to_be_bytes());
+        out.extend_from_slice(&self.data);
+        out
+    }
+
+    /// Decodes a frame from the start of `buf`. Returns the frame and the number of
+    /// bytes consumed, or `None` if `buf` does not yet contain a complete frame.
+    pub fn decode(buf: &[u8]) -> Option<(Self, usize)> {
+        if buf.len() < PTY_BINARY_FRAME_HEADER_LEN {
+            return None;
+        }
+        let mut offset_bytes = [0u8; 8];
+        offset_bytes.copy_from_slice(&buf[0..8]);
+        let stream_offset = u64::from_be_bytes(offset_bytes);
+
+        let mut len_bytes = [0u8; 4];
+        len_bytes.copy_from_slice(&buf[8..12]);
+        let data_len = u32::from_be_bytes(len_bytes) as usize;
+
+        let total_len = PTY_BINARY_FRAME_HEADER_LEN + data_len;
+        if buf.len() < total_len {
+            return None;
+        }
+        let data = buf[PTY_BINARY_FRAME_HEADER_LEN..total_len].to_vec();
+        Some((
+            Self {
+                stream_offset,
+                data,
+            },
+            total_len,
+        ))
+    }
+}

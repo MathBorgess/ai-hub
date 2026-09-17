@@ -53,7 +53,14 @@ pub async fn run(cli: Cli) -> Result<()> {
                 Some(id) => SessionTarget::Id(SessionId::new(id)),
                 None => SessionTarget::LatestForRepo(repo_path),
             };
-            send_msg(&mut writer, &ClientMessage::Attach { target }).await?;
+            send_msg(
+                &mut writer,
+                &ClientMessage::Attach {
+                    target,
+                    last_seen_offset: None,
+                },
+            )
+            .await?;
 
             // Read daemon response for attach
             if let Ok(Ok(msg)) =
@@ -68,6 +75,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 &mut writer,
                 &ClientMessage::Attach {
                     target: SessionTarget::LatestForRepo(repo_path.clone()),
+                    last_seen_offset: None,
                 },
             )
             .await?;
@@ -79,6 +87,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     session_id,
                     scrollback,
                     summary,
+                    ..
                 })) => {
                     app.session_id = Some(session_id);
                     app.harness = summary.harness;
@@ -100,6 +109,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                                 session_id,
                                 scrollback,
                                 summary,
+                                ..
                             } => {
                                 app.session_id = Some(session_id);
                                 app.harness = summary.harness;
@@ -315,6 +325,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                                             &mut new_writer,
                                             &ClientMessage::Attach {
                                                 target: SessionTarget::Id(session_id.clone()),
+                                                last_seen_offset: None,
                                             },
                                         )
                                         .await;
@@ -368,6 +379,7 @@ async fn create_new_session(
                 harness,
                 worktree_path,
                 branch,
+                ..
             })) => {
                 app.session_id = Some(session_id.clone());
                 app.harness = harness;
@@ -379,6 +391,7 @@ async fn create_new_session(
                     writer,
                     &ClientMessage::Attach {
                         target: SessionTarget::Id(session_id),
+                        last_seen_offset: None,
                     },
                 )
                 .await?;
@@ -388,6 +401,7 @@ async fn create_new_session(
                 session_id,
                 scrollback,
                 summary,
+                ..
             })) => {
                 app.session_id = Some(session_id);
                 app.harness = summary.harness;
@@ -417,6 +431,7 @@ pub fn handle_daemon_msg(app: &mut App, msg: DaemonMessage) {
             session_id,
             scrollback,
             summary,
+            ..
         } => {
             app.session_id = Some(session_id);
             app.harness = summary.harness;
@@ -435,7 +450,9 @@ pub fn handle_daemon_msg(app: &mut App, msg: DaemonMessage) {
             }
             app.should_exit = true;
         }
-        DaemonMessage::PtyOutput { session_id, data } => {
+        DaemonMessage::PtyOutput {
+            session_id, data, ..
+        } => {
             if let Some(curr) = &app.session_id {
                 if curr != &session_id {
                     return;
@@ -552,8 +569,12 @@ pub fn handle_daemon_msg(app: &mut App, msg: DaemonMessage) {
         DaemonMessage::Error { code, message } => {
             app.set_status(format!("Erro [{}]: {}", code, message));
         }
+        DaemonMessage::Unauthorized => {
+            app.set_status("Não autorizado");
+        }
         DaemonMessage::SessionList { .. }
         | DaemonMessage::SessionCreated { .. }
-        | DaemonMessage::Hello { .. } => {}
+        | DaemonMessage::Hello { .. }
+        | DaemonMessage::Challenge { .. } => {}
     }
 }

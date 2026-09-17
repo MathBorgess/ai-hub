@@ -151,6 +151,7 @@ async fn cached_quota_broadcast_attach_and_disconnect() {
         &mut a,
         ClientMessage::Hello {
             version: PROTOCOL_VERSION,
+            credential: None,
         },
     )
     .await;
@@ -170,6 +171,7 @@ async fn cached_quota_broadcast_attach_and_disconnect() {
         &mut b,
         ClientMessage::Hello {
             version: PROTOCOL_VERSION,
+            credential: None,
         },
     )
     .await;
@@ -191,6 +193,7 @@ async fn cached_quota_broadcast_attach_and_disconnect() {
         &mut b,
         ClientMessage::Attach {
             target: SessionTarget::Id(id.clone()),
+            last_seen_offset: None,
         },
     )
     .await;
@@ -210,7 +213,8 @@ async fn cached_quota_broadcast_attach_and_disconnect() {
         recv(&mut b).await,
         DaemonMessage::PtyOutput {
             session_id: id.clone(),
-            data: b"live".to_vec().into()
+            data: b"live".to_vec().into(),
+            stream_offset: 0,
         }
     );
     drop(b);
@@ -220,6 +224,7 @@ async fn cached_quota_broadcast_attach_and_disconnect() {
         &mut c,
         ClientMessage::Hello {
             version: PROTOCOL_VERSION,
+            credential: None,
         },
     )
     .await;
@@ -229,6 +234,7 @@ async fn cached_quota_broadcast_attach_and_disconnect() {
         &mut c,
         ClientMessage::Attach {
             target: SessionTarget::LatestForRepo(PathBuf::from("/fake/repo")),
+            last_seen_offset: None,
         },
     )
     .await;

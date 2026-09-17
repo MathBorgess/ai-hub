@@ -173,6 +173,7 @@ pub async fn perform_handshake(
         writer,
         &ClientMessage::Hello {
             version: PROTOCOL_VERSION,
+            credential: None,
         },
     )
     .await?;

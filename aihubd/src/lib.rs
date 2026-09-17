@@ -859,6 +859,7 @@ impl Daemon {
             harness,
             worktree_path: session.summary.worktree_path.clone(),
             branch: session.summary.branch.clone(),
+            channel_ticket: None,
         });
         state.sessions.push(session);
         Ok(id)
@@ -902,6 +903,7 @@ impl Daemon {
                 let message = DaemonMessage::PtyOutput {
                     session_id: output_session_id.clone(),
                     data: data.into(),
+                    stream_offset: 0,
                 };
                 state.clients.retain(|_, c| {
                     !c.attached.contains(&output_session_id)
@@ -1084,7 +1086,8 @@ impl Daemon {
         if !matches!(
             hello,
             ClientMessage::Hello {
-                version: PROTOCOL_VERSION
+                version: PROTOCOL_VERSION,
+                ..
             }
         ) {
             writer
@@ -1169,7 +1172,7 @@ impl Daemon {
                 let wt = aihub_git::create_session_worktree(&repo_path, &id, None).await?;
                 self.add_locked(&mut state, repo_path, wt, harness, initial_prompt)?;
             }
-            ClientMessage::Attach { target } => {
+            ClientMessage::Attach { target, .. } => {
                 let s = state
                     .sessions
                     .iter()
@@ -1193,6 +1196,9 @@ impl Daemon {
                         session_id: id,
                         scrollback: scrollback.into(),
                         summary,
+                        stream_offset: 0,
+                        gap_detected: false,
+                        channel_ticket: None,
                     },
                 );
             }
@@ -1791,6 +1797,7 @@ mod tests {
                     &encode_frame(
                         &ClientMessage::Hello {
                             version: PROTOCOL_VERSION,
+                            credential: None,
                         }
                         .into(),
                     )
