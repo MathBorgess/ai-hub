@@ -49,21 +49,43 @@ get_running_pid() {
   if [[ -f "${PID_FILE}" ]]; then
     local pid
     pid="$(tr -d '[:space:]' < "${PID_FILE}")"
-    if is_pid_running "${pid}"; then
+    if is_pid_running "${pid}" && is_aihubd_process "${pid}"; then
       echo "${pid}"
       return 0
     fi
   fi
-  # Secondary check: search via pgrep for aihubd binary matching user and path
-  local detected
-  detected="$(pgrep -u "$(id -u)" -f "${AIHUBD_BIN}" 2>/dev/null || true)"
+  # Secondary check: only real aihubd processes (never match shells that merely
+  # mention the binary path — `pgrep -f "${AIHUBD_BIN}"` false-positives on
+  # install/status command lines and blocks restart).
+  local detected pid
+  detected="$(pgrep -u "$(id -u)" -x aihubd 2>/dev/null || true)"
   for pid in ${detected}; do
-    if is_pid_running "${pid}"; then
+    if is_pid_running "${pid}" && is_aihubd_process "${pid}"; then
       echo "${pid}"
       return 0
     fi
   done
   return 1
+}
+
+# True when /proc/<pid>/exe (or argv0) is the installed aihubd binary.
+is_aihubd_process() {
+  local pid="$1"
+  if [[ -z "${pid}" ]]; then
+    return 1
+  fi
+  local exe=""
+  if [[ -r "/proc/${pid}/exe" ]]; then
+    exe="$(readlink -f "/proc/${pid}/exe" 2>/dev/null || true)"
+  fi
+  if [[ -n "${exe}" ]]; then
+    [[ "${exe}" == "$(readlink -f "${AIHUBD_BIN}" 2>/dev/null || echo "${AIHUBD_BIN}")" ]]
+    return $?
+  fi
+  # Fallback when /proc is unavailable: exact comm match only.
+  local comm
+  comm="$(ps -p "${pid}" -o comm= 2>/dev/null | tr -d '[:space:]' || true)"
+  [[ "${comm}" == "aihubd" ]]
 }
 
 rotate_logs_builtin() {

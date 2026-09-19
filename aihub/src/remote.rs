@@ -16,7 +16,7 @@ use aihub_core::{ChannelTicket, ClientMessage, DaemonMessage, IpcMessage, Sessio
 use std::io::ErrorKind;
 use std::net::TcpStream;
 use std::sync::mpsc as sync_mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio_tungstenite::tungstenite;
 use tungstenite::stream::MaybeTlsStream;
@@ -225,19 +225,42 @@ pub struct SocketIo {
 /// timeout on the plain-TCP path so a queued keystroke never waits behind a
 /// blocking read for server data.
 ///
-/// ponytail: the TLS (`wss://`) path does not get the same read-timeout treatment
-/// (reaching the inner `TcpStream` through `rustls::StreamOwned` needs matching on
-/// a transitive type this crate cannot name). Outbound sends over `wss://` may
-/// wait up to one inbound message behind a read. Upgrade path: add `rustls` as a
-/// direct dependency and set `sock.set_read_timeout` on the `Rustls` variant too.
+/// All `MaybeTlsStream` variants get a short read timeout so outbound frames
+/// (Hello, keystrokes) are not stuck behind a blocking read — required for
+/// `wss://` through Cloudflare (NativeTls on Mac).
+
+fn set_ws_read_timeout(socket: &mut WsSocket, timeout: Duration) {
+    match socket.get_mut() {
+        MaybeTlsStream::Plain(tcp) => {
+            let _ = tcp.set_read_timeout(Some(timeout));
+        }
+        MaybeTlsStream::NativeTls(tls) => {
+            let _ = tls.get_mut().set_read_timeout(Some(timeout));
+        }
+        // `MaybeTlsStream` is `#[non_exhaustive]`; ignore unknown TLS backends.
+        _ => {}
+    }
+}
+
 pub fn spawn_io(mut socket: WsSocket) -> SocketIo {
     let (outbound_tx, outbound_rx) = sync_mpsc::channel::<Message>();
     let (inbound_tx, inbound_rx) = tokio_mpsc::unbounded_channel();
 
     std::thread::spawn(move || {
-        if let MaybeTlsStream::Plain(tcp) = socket.get_ref() {
-            let _ = tcp.set_read_timeout(Some(Duration::from_millis(100)));
-        }
+        // Without a short read timeout, the TLS variants block forever in
+        // `socket.read()` and never drain `outbound_rx` — so Hello never leaves
+        // the Mac and the daemon never answers (deadlock over wss://). Plain TCP
+        // already had the 100ms timeout; extend it to NativeTls/Rustls.
+        set_ws_read_timeout(&mut socket, Duration::from_millis(100));
+
+        // aihubd drops the *transport* after 15s with no inbound frames
+        // (LIVENESS_TIMEOUT). Answering daemon Ping with Pong is necessary but
+        // not always sufficient through Cloudflare: the edge can ACK origin
+        // Pings without a client→origin Pong ever reaching aihubd's reader.
+        // Emit our own Ping on a cadence under that budget so the daemon's
+        // read timeout always resets.
+        const CLIENT_KEEPALIVE: Duration = Duration::from_secs(4);
+        let mut last_keepalive = Instant::now();
 
         loop {
             loop {
@@ -250,6 +273,7 @@ pub fn spawn_io(mut socket: WsSocket) -> SocketIo {
                             )));
                             return;
                         }
+                        last_keepalive = Instant::now();
                     }
                     Err(sync_mpsc::TryRecvError::Empty) => break,
                     Err(sync_mpsc::TryRecvError::Disconnected) => return,
@@ -257,7 +281,36 @@ pub fn spawn_io(mut socket: WsSocket) -> SocketIo {
             }
 
             match socket.read() {
+                // Daemon (and Cloudflare) send WebSocket Ping as a liveness probe.
+                // tungstenite surfaces these as Message::Ping — they are NOT JSON
+                // DaemonMessages. Forwarding them made spawn_daemon_reader treat the
+                // first heartbeat (tokio interval fires immediately) as a fatal
+                // decode error, so the TUI dropped/reconnected in a ~1s loop while
+                // doctor (short-lived) still looked fine. Answer with Pong and keep
+                // the control channel open; never push Ping/Pong to inbound.
+                Ok(Message::Ping(payload)) => {
+                    if let Err(e) = socket.send(Message::Pong(payload)) {
+                        let _ = inbound_tx.send(Err(RemoteError::new(
+                            classify_connect_error(&e),
+                            e.to_string(),
+                        )));
+                        return;
+                    }
+                    let _ = socket.flush();
+                    last_keepalive = Instant::now();
+                }
+                Ok(Message::Pong(_)) => {
+                    last_keepalive = Instant::now();
+                }
+                Ok(Message::Close(frame)) => {
+                    let _ = inbound_tx.send(Err(RemoteError::new(
+                        FailureClass::HandshakeRejected,
+                        format!("conexão encerrada pelo daemon: {frame:?}"),
+                    )));
+                    return;
+                }
                 Ok(msg) => {
+                    last_keepalive = Instant::now();
                     if inbound_tx.send(Ok(msg)).is_err() {
                         return;
                     }
@@ -265,6 +318,17 @@ pub fn spawn_io(mut socket: WsSocket) -> SocketIo {
                 Err(tungstenite::Error::Io(ref io_err))
                     if matches!(io_err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
                 {
+                    if last_keepalive.elapsed() >= CLIENT_KEEPALIVE {
+                        if let Err(e) = socket.send(Message::Ping(Vec::new())) {
+                            let _ = inbound_tx.send(Err(RemoteError::new(
+                                classify_connect_error(&e),
+                                e.to_string(),
+                            )));
+                            return;
+                        }
+                        let _ = socket.flush();
+                        last_keepalive = Instant::now();
+                    }
                     continue;
                 }
                 Err(e) => {
@@ -389,17 +453,33 @@ async fn recv_daemon_message(
     io: &mut SocketIo,
     timeout: Duration,
 ) -> Result<DaemonMessage, RemoteError> {
-    match tokio::time::timeout(timeout, io.inbound.recv()).await {
-        Err(_) => Err(RemoteError::new(
-            FailureClass::Timeout,
-            "sem resposta do daemon",
-        )),
-        Ok(None) => Err(RemoteError::new(
-            FailureClass::HandshakeRejected,
-            "conexão encerrada",
-        )),
-        Ok(Some(Err(e))) => Err(e),
-        Ok(Some(Ok(frame))) => decode_daemon_message(&frame),
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(RemoteError::new(
+                FailureClass::Timeout,
+                "sem resposta do daemon",
+            ));
+        }
+        match tokio::time::timeout(remaining, io.inbound.recv()).await {
+            Err(_) => {
+                return Err(RemoteError::new(
+                    FailureClass::Timeout,
+                    "sem resposta do daemon",
+                ))
+            }
+            Ok(None) => {
+                return Err(RemoteError::new(
+                    FailureClass::HandshakeRejected,
+                    "conexão encerrada",
+                ))
+            }
+            Ok(Some(Err(e))) => return Err(e),
+            // spawn_io should already swallow these; keep handshake robust if any slip through.
+            Ok(Some(Ok(Message::Ping(_)))) | Ok(Some(Ok(Message::Pong(_)))) => continue,
+            Ok(Some(Ok(frame))) => return decode_daemon_message(&frame),
+        }
     }
 }
 
@@ -415,6 +495,8 @@ pub fn spawn_daemon_reader(
     tokio::spawn(async move {
         while let Some(item) = inbound.recv().await {
             let mapped = match item {
+                // Defense in depth: Ping/Pong should already be consumed in spawn_io.
+                Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
                 Ok(frame) => {
                     decode_daemon_message(&frame).map_err(|e| anyhow::anyhow!(e.to_string()))
                 }

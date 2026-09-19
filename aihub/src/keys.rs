@@ -136,12 +136,25 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> AppAction {
 
 /// Main key routing function with an explicit clock parameter in seconds.
 pub fn handle_key_at(app: &mut App, key: KeyEvent, now_s: u64) -> AppAction {
+    // Disconnect banner promises Ctrl+C exits without ending server work.
+    // In crossterm raw mode, SIGINT is usually not delivered — Ctrl+C arrives
+    // as a KeyEvent. While Connected we still forward 0x03 to the PTY; while
+    // Connecting/Reconnecting/Pairing the writer is often gone, so the old
+    // pass-through was a silent no-op and left the user stuck.
+    if is_ctrl_c(key) && !matches!(app.connection, crate::state::ConnectionState::Connected) {
+        return AppAction::Exit;
+    }
     match &mut app.ui_mode {
         UiMode::Normal => handle_normal_key_at(app, key, now_s),
         UiMode::Palette { .. } => handle_palette_key(app, key),
         UiMode::QuotaTable { .. } => handle_quota_table_key(app, key),
         UiMode::MergeReview { .. } => handle_merge_review_key(app, key),
     }
+}
+
+fn is_ctrl_c(key: KeyEvent) -> bool {
+    (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+        || key.code == KeyCode::Char('\x03')
 }
 
 fn handle_normal_key_at(app: &mut App, key: KeyEvent, now_s: u64) -> AppAction {

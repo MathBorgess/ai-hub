@@ -5,7 +5,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::path::PathBuf;
 
 use aihub::keys::{cycle_harness, handle_key, key_event_to_bytes, AppAction};
-use aihub::state::{App, RecommendationState, UiMode};
+use aihub::state::{App, ConnectionState, RecommendationState, UiMode};
 
 fn make_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
     KeyEvent::new(code, modifiers)
@@ -64,6 +64,56 @@ fn test_plain_keystrokes_go_to_pty() {
     );
     assert_eq!(action, AppAction::SendPtyInput(vec![4]));
 }
+
+
+#[test]
+fn ctrl_c_exits_while_reconnecting() {
+    let mut app = App::new(PathBuf::from("/test/repo"));
+    app.session_id = Some(SessionId::new("test-session"));
+    app.connection = ConnectionState::Reconnecting {
+        class_text: "Conexão perdida".to_string(),
+        attempt: 8,
+    };
+    let action = handle_key(
+        &mut app,
+        make_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    );
+    assert_eq!(
+        action,
+        AppAction::Exit,
+        "banner promises Ctrl+C exits while disconnected; must not be a silent PTY no-op"
+    );
+}
+
+#[test]
+fn ctrl_c_exits_while_connecting_or_pairing() {
+    let mut app = App::new(PathBuf::from("/test/repo"));
+    app.connection = ConnectionState::Connecting;
+    assert_eq!(
+        handle_key(&mut app, make_key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        AppAction::Exit
+    );
+    app.connection = ConnectionState::PairingRequired {
+        code: "AAAAA-BBBBB".to_string(),
+    };
+    assert_eq!(
+        handle_key(&mut app, make_key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        AppAction::Exit
+    );
+}
+
+#[test]
+fn ctrl_c_still_goes_to_pty_when_connected() {
+    let mut app = App::new(PathBuf::from("/test/repo"));
+    app.session_id = Some(SessionId::new("test-session"));
+    app.connection = ConnectionState::Connected;
+    let action = handle_key(
+        &mut app,
+        make_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    );
+    assert_eq!(action, AppAction::SendPtyInput(vec![3]));
+}
+
 
 #[test]
 fn test_prefix_chord_activation() {
