@@ -528,6 +528,20 @@ async fn bootstrap_session(
                         }
                     }
                 }
+                // Attach missed (no session yet) or was refused (e.g. LatestForRepo
+                // pointed at another principal's session). Same recovery as the
+                // QuotaPush+Error branch below: mint a fresh session so a remote
+                // client is not left connected with an empty TUI and no PTY.
+                Ok(Some(Ok(DaemonMessage::Error { .. }))) => {
+                    create_new_session(
+                        writer,
+                        daemon_rx,
+                        app,
+                        repo_path,
+                        cli.task.clone(),
+                    )
+                    .await?;
+                }
                 Ok(Some(Ok(other))) => {
                     handle_daemon_msg(app, other);
                 }

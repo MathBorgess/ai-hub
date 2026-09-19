@@ -271,6 +271,30 @@ pub fn spawn_io(mut socket: WsSocket) -> SocketIo {
             }
 
             match socket.read() {
+                // Daemon (and Cloudflare) send WebSocket Ping as a liveness probe.
+                // tungstenite surfaces these as Message::Ping — they are NOT JSON
+                // DaemonMessages. Forwarding them made spawn_daemon_reader treat the
+                // first heartbeat (tokio interval fires immediately) as a fatal
+                // decode error, so the TUI dropped/reconnected in a ~1s loop while
+                // doctor (short-lived) still looked fine. Answer with Pong and keep
+                // the control channel open; never push Ping/Pong to inbound.
+                Ok(Message::Ping(payload)) => {
+                    if let Err(e) = socket.send(Message::Pong(payload)) {
+                        let _ = inbound_tx.send(Err(RemoteError::new(
+                            classify_connect_error(&e),
+                            e.to_string(),
+                        )));
+                        return;
+                    }
+                }
+                Ok(Message::Pong(_)) => {}
+                Ok(Message::Close(frame)) => {
+                    let _ = inbound_tx.send(Err(RemoteError::new(
+                        FailureClass::HandshakeRejected,
+                        format!("conexão encerrada pelo daemon: {frame:?}"),
+                    )));
+                    return;
+                }
                 Ok(msg) => {
                     if inbound_tx.send(Ok(msg)).is_err() {
                         return;
@@ -403,17 +427,33 @@ async fn recv_daemon_message(
     io: &mut SocketIo,
     timeout: Duration,
 ) -> Result<DaemonMessage, RemoteError> {
-    match tokio::time::timeout(timeout, io.inbound.recv()).await {
-        Err(_) => Err(RemoteError::new(
-            FailureClass::Timeout,
-            "sem resposta do daemon",
-        )),
-        Ok(None) => Err(RemoteError::new(
-            FailureClass::HandshakeRejected,
-            "conexão encerrada",
-        )),
-        Ok(Some(Err(e))) => Err(e),
-        Ok(Some(Ok(frame))) => decode_daemon_message(&frame),
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(RemoteError::new(
+                FailureClass::Timeout,
+                "sem resposta do daemon",
+            ));
+        }
+        match tokio::time::timeout(remaining, io.inbound.recv()).await {
+            Err(_) => {
+                return Err(RemoteError::new(
+                    FailureClass::Timeout,
+                    "sem resposta do daemon",
+                ))
+            }
+            Ok(None) => {
+                return Err(RemoteError::new(
+                    FailureClass::HandshakeRejected,
+                    "conexão encerrada",
+                ))
+            }
+            Ok(Some(Err(e))) => return Err(e),
+            // spawn_io should already swallow these; keep handshake robust if any slip through.
+            Ok(Some(Ok(Message::Ping(_)))) | Ok(Some(Ok(Message::Pong(_)))) => continue,
+            Ok(Some(Ok(frame))) => return decode_daemon_message(&frame),
+        }
     }
 }
 
@@ -429,6 +469,8 @@ pub fn spawn_daemon_reader(
     tokio::spawn(async move {
         while let Some(item) = inbound.recv().await {
             let mapped = match item {
+                // Defense in depth: Ping/Pong should already be consumed in spawn_io.
+                Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
                 Ok(frame) => {
                     decode_daemon_message(&frame).map_err(|e| anyhow::anyhow!(e.to_string()))
                 }
