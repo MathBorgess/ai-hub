@@ -207,7 +207,7 @@ pub fn route_outcome_at(
     now_s: u64,
 ) -> Result<RouteOutcome, RouterError> {
     let Some((snapshot, lane, hold)) =
-        select_route_candidate(tier, size, snapshots, horizon_s, true, catalog)?
+        select_route_candidate(tier, size, snapshots, horizon_s, catalog)?
     else {
         let reason = if snapshots.is_empty() {
             "No available slots: no quota snapshots supplied; do not launch.".into()
@@ -500,7 +500,6 @@ fn select_route_candidate<'a>(
     size: TaskSize,
     snapshots: &'a [QuotaSnapshot],
     horizon_s: u64,
-    exclude_unknown_empty: bool,
     catalog: &ModelCatalog,
 ) -> Result<Option<RoutePick<'a>>, RouterError> {
     use aihub_core::QuotaStatus;
@@ -516,9 +515,10 @@ fn select_route_candidate<'a>(
     };
     let mut candidates = Vec::new();
     for snapshot in snapshots {
-        if exclude_unknown_empty
-            && matches!(snapshot.status, QuotaStatus::Unknown | QuotaStatus::Empty)
-        {
+        // A failed or absent vendor probe (Unknown) must never be read as "harness
+        // available" — the box has no other signal to fall back on, so this stays
+        // pessimistic (ADR sec.2.4 / 03-credenciais-e-quota.md sec.4).
+        if matches!(snapshot.status, QuotaStatus::Unknown | QuotaStatus::Empty) {
             continue;
         }
         let options: Vec<_> = if snapshot.lanes.is_empty() {
@@ -548,14 +548,6 @@ fn select_route_candidate<'a>(
                 .unwrap_or(50.0);
             let reopens = windows.iter().any(|w| can_refill(w, horizon_s));
             refills |= reopens;
-            if !exclude_unknown_empty
-                && snapshot.status == QuotaStatus::Empty
-                && !windows
-                    .iter()
-                    .any(|w| w.used_pct >= 100.0 && can_refill(w, horizon_s))
-            {
-                continue;
-            }
             if supply <= 0.0 {
                 continue;
             }
@@ -571,11 +563,7 @@ fn select_route_candidate<'a>(
             };
             slot_candidates.push((snapshot, lane, supply, cost / supply * penalty, hold));
         }
-        let healthy = if exclude_unknown_empty {
-            matches!(snapshot.status, QuotaStatus::Ok | QuotaStatus::Low) || refills
-        } else {
-            matches!(snapshot.status, QuotaStatus::Ok | QuotaStatus::Unknown) || refills
-        };
+        let healthy = matches!(snapshot.status, QuotaStatus::Ok | QuotaStatus::Low) || refills;
         candidates.extend(slot_candidates.into_iter().map(|c| (healthy, c)));
     }
     let healthy_exists = candidates.iter().any(|(healthy, _)| *healthy);

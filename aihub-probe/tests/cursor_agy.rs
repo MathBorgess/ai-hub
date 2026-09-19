@@ -1,9 +1,11 @@
 use aihub_core::{LaneKind, WindowKind};
 use aihub_probe::antigravity::{
-    discover_ls_bases_from, parse_csrf_token, parse_lsof_ports, parse_quota_summary,
+    discover_ls_bases_from, parse_antigravity_session_token, parse_csrf_token, parse_lsof_ports,
+    parse_quota_summary, read_antigravity_session_file,
 };
 use aihub_probe::cursor::{
-    extract_cursor_jwt, parse_dashboard_usage, parse_summary_usage, read_cursor_ide_token_from_path,
+    extract_cursor_jwt, parse_dashboard_usage, parse_summary_usage,
+    read_cursor_config_token_from_path, read_cursor_ide_token_from_path,
 };
 use rusqlite::Connection;
 
@@ -140,6 +142,30 @@ fn antigravity_csrf_from_html() {
         parse_csrf_token(&html).as_deref(),
         Some("test-csrf-value-abc")
     );
+}
+
+#[test]
+fn antigravity_session_token_from_config_file_non_macos_fallback() {
+    // Runs on any host (Linux CI included): a saved session file under
+    // ~/.config/antigravity/ must yield a bearer token without touching the
+    // macOS Keychain, since that path does not exist off macOS.
+    let path = std::path::Path::new("tests/fixtures/antigravity/session.json");
+    let token = read_antigravity_session_file(path).expect("token");
+    assert_eq!(token, "synthetic-fixture-access-token");
+}
+
+#[test]
+fn antigravity_session_token_parser_rejects_empty_json() {
+    assert!(parse_antigravity_session_token("{}").is_none());
+}
+
+#[test]
+fn cursor_reads_token_from_json_config_without_sqlite() {
+    // Headless Linux boxes without the Cursor desktop app never populate
+    // state.vscdb; the JSON config path must work standalone.
+    let path = std::path::Path::new("tests/fixtures/cursor/config_auth.json");
+    let token = read_cursor_config_token_from_path(path).expect("token");
+    assert!(token.starts_with("eyJ"));
 }
 
 #[test]

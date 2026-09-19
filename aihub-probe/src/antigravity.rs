@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aihub_core::{
@@ -32,6 +33,20 @@ pub async fn probe() -> Result<QuotaSnapshot, ProbeError> {
     if let Some(session) = tokio::task::spawn_blocking(read_antigravity_session)
         .await
         .map_err(|e| ProbeError::Failure(format!("antigravity session read failed: {e}")))?
+    {
+        if let Ok(lanes) = fetch_cloud_quota(&session.token).await {
+            return Ok(build_snapshot(lanes, QuotaSource::OAuth, None));
+        }
+    }
+
+    // Additive fallback for hosts without a macOS Keychain (Linux boxes) or where the
+    // Keychain lookup above found nothing: a config file under ~/.config/antigravity/
+    // (or the legacy ~/.gemini/ Gemini CLI location), then GEMINI_AUTH_TOKEN.
+    if let Some(session) = tokio::task::spawn_blocking(read_antigravity_session_fallback)
+        .await
+        .map_err(|e| {
+            ProbeError::Failure(format!("antigravity fallback session read failed: {e}"))
+        })?
     {
         if let Ok(lanes) = fetch_cloud_quota(&session.token).await {
             return Ok(build_snapshot(lanes, QuotaSource::OAuth, None));
@@ -356,6 +371,52 @@ fn read_antigravity_session() -> Option<AntigravitySession> {
 #[cfg(not(target_os = "macos"))]
 fn read_antigravity_session() -> Option<AntigravitySession> {
     None
+}
+
+/// Pure parser: extracts the bearer token from a saved Antigravity/Gemini CLI session
+/// file (`~/.config/antigravity/*.json` or `~/.gemini/oauth_creds.json`), independent
+/// of the macOS Keychain and of any subprocess/network access.
+pub fn parse_antigravity_session_token(raw: &str) -> Option<String> {
+    parse_antigravity_session(raw).map(|s| s.token)
+}
+
+/// Reads and parses a saved Antigravity/Gemini CLI session file from an explicit path.
+/// Used by the non-macOS config-file fallback and directly by tests.
+pub fn read_antigravity_session_file(path: &std::path::Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    parse_antigravity_session_token(&raw)
+}
+
+fn antigravity_config_paths() -> Vec<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    vec![
+        home.join(".config/antigravity/session.json"),
+        home.join(".config/antigravity/auth.json"),
+        home.join(".gemini/oauth_creds.json"),
+    ]
+}
+
+/// Non-Keychain session lookup: config files under `~/.config/antigravity/` (or the
+/// legacy `~/.gemini/`), then `GEMINI_AUTH_TOKEN`. Additive alternative to the macOS
+/// Keychain read above, tried on every platform when it comes up empty.
+fn read_antigravity_session_fallback() -> Option<AntigravitySession> {
+    for path in antigravity_config_paths() {
+        if let Some(token) = read_antigravity_session_file(&path) {
+            return Some(AntigravitySession {
+                token,
+                expires_at: None,
+            });
+        }
+    }
+    std::env::var("GEMINI_AUTH_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty())
+        .map(|token| AntigravitySession {
+            token,
+            expires_at: None,
+        })
 }
 
 struct AntigravitySession {

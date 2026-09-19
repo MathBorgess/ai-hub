@@ -1,6 +1,8 @@
 //! Application state models for the `aihub` TUI client.
 
-use aihub_core::{HarnessId, MergeStrategy, Mode, QuotaSnapshot, SessionId, TaskTier};
+use aihub_core::{
+    ChannelTicket, HarnessId, MergeStrategy, Mode, QuotaSnapshot, SessionId, TaskTier,
+};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -23,6 +25,22 @@ pub enum UiMode {
         strategy: MergeStrategy,
         scroll: usize,
     },
+}
+
+/// Connection lifecycle state driven by the async reconnect machine (design doc
+/// §2.5), rendered as a persistent banner distinct from the transient
+/// `status_message` footer line.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConnectionState {
+    /// Establishing the first connection.
+    Connecting,
+    /// Connected and past the v3 handshake (or connected on the local socket,
+    /// which never challenges).
+    Connected,
+    /// Remote daemon rejected the credential (ADR gap §4.5): not yet paired.
+    PairingRequired { code: String },
+    /// Lost connection; the background task is retrying with backoff.
+    Reconnecting { class_text: String, attempt: u32 },
 }
 
 /// Route recommendation or no-capacity status from the daemon.
@@ -63,6 +81,11 @@ pub struct App {
     pub task: Option<String>,
     pub pending_autonomous: bool,
     pub now_override: Option<u64>,
+    pub connection: ConnectionState,
+    /// Ticket admitting the secondary PTY channel for the current session
+    /// (ADR contradiction 1, Option B), captured off `SessionCreated`/`Attached`
+    /// so the run loop can open the dedicated PTY WebSocket once available.
+    pub channel_ticket: Option<ChannelTicket>,
 }
 
 impl App {
@@ -87,6 +110,8 @@ impl App {
             task: None,
             pending_autonomous: false,
             now_override: None,
+            connection: ConnectionState::Connecting,
+            channel_ticket: None,
         }
     }
 

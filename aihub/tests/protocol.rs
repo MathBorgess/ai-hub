@@ -45,7 +45,8 @@ async fn test_handshake_success() {
         assert_eq!(
             client_msg,
             IpcMessage::Client(ClientMessage::Hello {
-                version: PROTOCOL_VERSION
+                version: PROTOCOL_VERSION,
+                credential: None,
             })
         );
 
@@ -89,6 +90,7 @@ async fn test_protocol_send_recv_messages() {
             client_msg,
             IpcMessage::Client(ClientMessage::Attach {
                 target: SessionTarget::Id(SessionId::new("test-session-42")),
+                last_seen_offset: None,
             })
         );
     });
@@ -102,6 +104,7 @@ async fn test_protocol_send_recv_messages() {
         &mut writer,
         &ClientMessage::Attach {
             target: SessionTarget::Id(session.clone()),
+            last_seen_offset: None,
         },
     )
     .await
@@ -118,6 +121,9 @@ async fn test_protocol_send_recv_messages() {
             session_id: SessionId::new("test-session-42"),
             scrollback: b"hello scrollback".to_vec().into(),
             summary: SessionSummary::default(),
+            stream_offset: 0,
+            gap_detected: false,
+            channel_ticket: None,
         };
         send_msg_daemon(&mut s_writer, &attached).await.unwrap();
     });
@@ -132,6 +138,9 @@ async fn test_protocol_send_recv_messages() {
             session_id: SessionId::new("test-session-42"),
             scrollback: b"hello scrollback".to_vec().into(),
             summary: SessionSummary::default(),
+            stream_offset: 0,
+            gap_detected: false,
+            channel_ticket: None,
         }
     );
 
@@ -527,6 +536,7 @@ fn f13_other_session_events_do_not_leak() {
         DaemonMessage::PtyOutput {
             session_id: other_session.clone(),
             data: b"leak content\r\n".to_vec().into(),
+            stream_offset: 0,
         },
     );
     assert!(
@@ -571,6 +581,9 @@ fn f13_other_session_events_do_not_leak() {
             session_id: my_session,
             scrollback: b"clean scrollback".to_vec().into(),
             summary,
+            stream_offset: 0,
+            gap_detected: false,
+            channel_ticket: None,
         },
     );
     assert_eq!(

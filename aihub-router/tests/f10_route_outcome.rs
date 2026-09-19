@@ -55,3 +55,33 @@ fn f10_unknown_slots_are_never_candidates() {
     .unwrap();
     assert!(matches!(outcome, RouteOutcome::NoCapacity { .. }));
 }
+
+#[test]
+fn f10_antigravity_unknown_with_lanes_and_catalog_is_not_assumed_available() {
+    // A Linux box without a running language server or a valid saved session gets
+    // QuotaStatus::Unknown from the Antigravity probe, but may still carry a
+    // populated model catalog (e.g. from a previous successful `agy models`
+    // discovery). Neither signal should make the router treat the harness as
+    // available — the vendor probe failure must win.
+    let mut unknown = slot(
+        HarnessId::Antigravity,
+        QuotaStatus::Unknown,
+        vec![window(10., None, None)],
+    );
+    unknown.lanes = vec![QuotaLane {
+        name: "gemini".into(),
+        kind: LaneKind::Own,
+        windows: vec![window(10., None, None)],
+    }];
+    let catalog = aihub_router::ModelCatalog::default()
+        .with_models(HarnessId::Antigravity, vec!["gemini-3-pro".into()]);
+    let outcome = route_outcome(
+        TaskTier::Mechanical,
+        TaskSize::M,
+        &[unknown],
+        7200,
+        &catalog,
+    )
+    .unwrap();
+    assert!(matches!(outcome, RouteOutcome::NoCapacity { .. }));
+}

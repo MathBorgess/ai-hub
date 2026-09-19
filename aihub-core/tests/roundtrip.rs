@@ -36,6 +36,16 @@ fn test_all_client_messages_roundtrip() {
         // 1. Hello
         ClientMessage::Hello {
             version: PROTOCOL_VERSION,
+            credential: None,
+        },
+        ClientMessage::Hello {
+            version: PROTOCOL_VERSION,
+            credential: Some(ClientCredential {
+                public_key: Base64Bytes::new(b"pubkey-bytes".to_vec()),
+                signature: Base64Bytes::new(b"signature-bytes".to_vec()),
+                audience: CREDENTIAL_AUDIENCE.to_string(),
+                timestamp: 1_700_000_000,
+            }),
         },
         // 2. ListSessions
         ClientMessage::ListSessions,
@@ -53,9 +63,11 @@ fn test_all_client_messages_roundtrip() {
         // 4. Attach
         ClientMessage::Attach {
             target: SessionTarget::Id(sess_id.clone()),
+            last_seen_offset: None,
         },
         ClientMessage::Attach {
             target: SessionTarget::LatestForRepo(repo_path.clone()),
+            last_seen_offset: Some(60_000),
         },
         // 5. Detach
         ClientMessage::Detach {
@@ -163,6 +175,10 @@ fn test_all_daemon_messages_roundtrip() {
         DaemonMessage::Hello {
             version: PROTOCOL_VERSION,
         },
+        // 1b. Challenge (proof-of-possession, ADR §2.3)
+        DaemonMessage::Challenge {
+            nonce: Base64Bytes::new(b"nonce-bytes".to_vec()),
+        },
         // 2. SessionList
         DaemonMessage::SessionList {
             sessions: vec![SessionSummary {
@@ -183,11 +199,31 @@ fn test_all_daemon_messages_roundtrip() {
             harness: HarnessId::CursorAgent,
             worktree_path: wt_path.clone(),
             branch: "session/session-test-01".to_string(),
+            channel_ticket: Some(ChannelTicket(Base64Bytes::new(b"ticket-bytes".to_vec()))),
         },
-        // 4. Attached
+        // 4. Attached (delta resumption: gap_detected = false)
         DaemonMessage::Attached {
             session_id: sess_id.clone(),
             scrollback: Base64Bytes::new(b"welcome to shell\n$ ".to_vec()),
+            summary: SessionSummary {
+                session_id: sess_id.clone(),
+                harness: HarnessId::ClaudeCode,
+                mode: Mode::Assisted,
+                repo_path: repo_path.clone(),
+                worktree_path: wt_path.clone(),
+                branch: "session/session-test-01".to_string(),
+                active: true,
+                model: None,
+                lane: None,
+            },
+            stream_offset: 100_000,
+            gap_detected: false,
+            channel_ticket: Some(ChannelTicket(Base64Bytes::new(b"ticket-bytes".to_vec()))),
+        },
+        // 4b. Attached (buffer overrun: gap_detected = true)
+        DaemonMessage::Attached {
+            session_id: sess_id.clone(),
+            scrollback: Base64Bytes::new(b"full snapshot".to_vec()),
             summary: SessionSummary {
                 session_id: sess_id.clone(),
                 harness: HarnessId::ClaudeCode,
@@ -199,6 +235,9 @@ fn test_all_daemon_messages_roundtrip() {
                 model: None,
                 lane: None,
             },
+            stream_offset: 10_485_760,
+            gap_detected: true,
+            channel_ticket: None,
         },
         // 5. Detached
         DaemonMessage::Detached {
@@ -208,6 +247,7 @@ fn test_all_daemon_messages_roundtrip() {
         DaemonMessage::PtyOutput {
             session_id: sess_id.clone(),
             data: Base64Bytes::new(b"\x1b[32mBuild succeeded\x1b[0m\r\n".to_vec()),
+            stream_offset: 42,
         },
         // 7. SessionExited
         DaemonMessage::SessionExited {
@@ -262,6 +302,8 @@ fn test_all_daemon_messages_roundtrip() {
             code: "ERR_NO_QUOTA".to_string(),
             message: "All quota slots exhausted".to_string(),
         },
+        // 14. Unauthorized (ADR §2.3, §6: opaque, no detail)
+        DaemonMessage::Unauthorized,
     ];
 
     for daemon_msg in messages {
@@ -285,6 +327,7 @@ fn test_large_pty_chunks_roundtrip() {
     let pty_output_msg = IpcMessage::Daemon(DaemonMessage::PtyOutput {
         session_id: sess_id.clone(),
         data: Base64Bytes::new(large_data.clone()),
+        stream_offset: 0,
     });
     test_roundtrip(pty_output_msg);
 
@@ -300,8 +343,36 @@ fn test_large_pty_chunks_roundtrip() {
         session_id: sess_id,
         scrollback: Base64Bytes::new(large_data),
         summary: SessionSummary::default(),
+        stream_offset: chunk_size as u64,
+        gap_detected: true,
+        channel_ticket: None,
     });
     test_roundtrip(attached_msg);
+}
+
+#[test]
+fn test_pty_binary_frame_roundtrip() {
+    // ADR §5: the dedicated PTY channel drops Base64/JSON in favor of a raw binary
+    // frame `[8-byte offset][4-byte length][bytes]`. Exercised at both small and
+    // 1+ MiB sizes to mirror `test_large_pty_chunks_roundtrip` above.
+    for (offset, data) in [
+        (0u64, b"hello pty".to_vec()),
+        (60_001u64, vec![b'x'; 1_572_864]),
+        (u64::MAX - 1, Vec::new()),
+    ] {
+        let frame = PtyBinaryFrame::new(offset, data);
+        let encoded = frame.encode();
+        let (decoded, consumed) =
+            PtyBinaryFrame::decode(&encoded).expect("expected complete frame");
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(frame, decoded);
+    }
+
+    // Partial buffers must report "not enough data yet", never an error or a false frame.
+    let frame = PtyBinaryFrame::new(7, b"partial".to_vec());
+    let encoded = frame.encode();
+    assert!(PtyBinaryFrame::decode(&encoded[..encoded.len() - 1]).is_none());
+    assert!(PtyBinaryFrame::decode(&encoded[..4]).is_none());
 }
 
 #[test]
@@ -310,6 +381,7 @@ fn test_base64_json_encoding_is_not_array_of_numbers() {
     let msg = IpcMessage::Daemon(DaemonMessage::PtyOutput {
         session_id: SessionId::new("sess-1"),
         data: Base64Bytes::new(pty_data),
+        stream_offset: 0,
     });
 
     let json_str = serde_json::to_string(&msg).expect("serialize json");
@@ -396,12 +468,115 @@ fn test_f13_attached_summary_deserializes_with_default() {
             session_id,
             scrollback,
             summary,
+            stream_offset,
+            gap_detected,
+            channel_ticket,
         } => {
             assert_eq!(session_id, SessionId::new("s1"));
             assert_eq!(scrollback.as_slice(), b"test");
             assert_eq!(summary.harness, HarnessId::ClaudeCode);
             assert!(!summary.active);
+            assert_eq!(stream_offset, 0);
+            assert!(!gap_detected);
+            assert_eq!(channel_ticket, None);
         }
         _ => panic!("Expected Attached"),
     }
+}
+
+#[test]
+fn test_hello_v2_without_credential_still_deserializes() {
+    // A v2 client's `Hello { version: 2 }` (no `credential` field at all) must still
+    // deserialize under protocol v3 (ADR §2.2 "aceitação incondicional de clientes v2").
+    let json_v2_hello = r#"{"action":"Hello","payload":{"version":2}}"#;
+    let decoded: ClientMessage =
+        serde_json::from_str(json_v2_hello).expect("v2 Hello must still deserialize");
+    match decoded {
+        ClientMessage::Hello {
+            version,
+            credential,
+        } => {
+            assert_eq!(version, 2);
+            assert_eq!(credential, None);
+        }
+        _ => panic!("Expected Hello"),
+    }
+}
+
+#[test]
+fn test_hello_v3_with_credential_roundtrip() {
+    let credential = ClientCredential {
+        public_key: Base64Bytes::new(b"pubkey".to_vec()),
+        signature: Base64Bytes::new(b"sig-over-challenge".to_vec()),
+        audience: CREDENTIAL_AUDIENCE.to_string(),
+        timestamp: 1_700_000_042,
+    };
+    let msg = ClientMessage::Hello {
+        version: PROTOCOL_VERSION,
+        credential: Some(credential.clone()),
+    };
+    test_roundtrip(IpcMessage::Client(msg));
+
+    let json = serde_json::to_string(&ClientMessage::Hello {
+        version: PROTOCOL_VERSION,
+        credential: Some(credential),
+    })
+    .unwrap();
+    assert!(json.contains(&format!("\"audience\":\"{CREDENTIAL_AUDIENCE}\"")));
+}
+
+#[test]
+fn test_attach_resumption_and_gap_detected_roundtrip() {
+    let sess_id = SessionId::new("session-resume");
+
+    // Delta catch-up: last_seen_offset within the retained window.
+    let attach = ClientMessage::Attach {
+        target: SessionTarget::Id(sess_id.clone()),
+        last_seen_offset: Some(60_000),
+    };
+    test_roundtrip(IpcMessage::Client(attach));
+
+    let attached_delta = DaemonMessage::Attached {
+        session_id: sess_id.clone(),
+        scrollback: Base64Bytes::new(b"[60001..=100000]".to_vec()),
+        summary: SessionSummary::default(),
+        stream_offset: 100_000,
+        gap_detected: false,
+        channel_ticket: None,
+    };
+    test_roundtrip(IpcMessage::Daemon(attached_delta));
+
+    // Buffer overrun: last_seen_offset fell out of the retained window.
+    let attached_gap = DaemonMessage::Attached {
+        session_id: sess_id,
+        scrollback: Base64Bytes::new(b"full 2MiB snapshot".to_vec()),
+        summary: SessionSummary::default(),
+        stream_offset: 8_388_608,
+        gap_detected: true,
+        channel_ticket: None,
+    };
+    test_roundtrip(IpcMessage::Daemon(attached_gap));
+}
+
+#[test]
+fn test_credential_challenge_channel_ticket_and_pty_channel_hello_roundtrip() {
+    let challenge = DaemonMessage::Challenge {
+        nonce: Base64Bytes::new(b"one-time-nonce".to_vec()),
+    };
+    test_roundtrip(IpcMessage::Daemon(challenge));
+
+    let unauthorized = DaemonMessage::Unauthorized;
+    test_roundtrip(IpcMessage::Daemon(unauthorized));
+
+    // PtyChannelHello is not itself a ClientMessage/DaemonMessage (the PTY channel
+    // stops speaking JSON after this handshake), so it is round-tripped through plain
+    // serde_json rather than the IPC frame helpers.
+    let hello = PtyChannelHello {
+        session_id: SessionId::new("session-pty"),
+        ticket: ChannelTicket(Base64Bytes::new(b"one-time-ticket".to_vec())),
+    };
+    let json = serde_json::to_string(&hello).expect("serialize PtyChannelHello");
+    let decoded: PtyChannelHello =
+        serde_json::from_str(&json).expect("deserialize PtyChannelHello");
+    assert_eq!(hello, decoded);
 }

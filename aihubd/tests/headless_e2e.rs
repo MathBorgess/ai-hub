@@ -144,6 +144,7 @@ async fn test_headless_end_to_end() {
         &mut client,
         ClientMessage::Hello {
             version: PROTOCOL_VERSION,
+            credential: None,
         },
     )
     .await;
@@ -174,6 +175,7 @@ async fn test_headless_end_to_end() {
             harness: _,
             worktree_path,
             branch,
+            ..
         } => {
             assert!(worktree_path.exists(), "worktree must exist on disk");
             assert!(branch.starts_with("session/"));
@@ -187,6 +189,7 @@ async fn test_headless_end_to_end() {
         &mut client,
         ClientMessage::Attach {
             target: SessionTarget::Id(session_id.clone()),
+            last_seen_offset: None,
         },
     )
     .await;
@@ -251,6 +254,7 @@ async fn test_headless_end_to_end() {
         &mut client,
         ClientMessage::Attach {
             target: SessionTarget::Id(session_id.clone()),
+            last_seen_offset: None,
         },
     )
     .await;
@@ -516,6 +520,7 @@ while :; do echo running >> "$file"; sleep 0.02; done
             &mut client,
             ClientMessage::Hello {
                 version: PROTOCOL_VERSION,
+                credential: None,
             },
         )
         .await;
@@ -531,6 +536,7 @@ while :; do echo running >> "$file"; sleep 0.02; done
             &mut client,
             ClientMessage::Attach {
                 target: SessionTarget::Id(id.clone()),
+                last_seen_offset: None,
             },
         )
         .await;

@@ -1,3 +1,4 @@
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -16,6 +17,17 @@ pub struct SessionId(pub String);
 impl SessionId {
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
+    }
+
+    /// Generates a session id from a 128-bit CSPRNG value (ADR §2.2, §4).
+    ///
+    /// Replaces the previous `pid-nanos-counter` scheme, which was predictable and
+    /// enumerable and therefore unsafe to use as a bearer-equivalent session handle.
+    pub fn generate() -> Self {
+        let mut bytes = [0u8; 16];
+        rand::rng().fill_bytes(&mut bytes);
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        Self(format!("sess_{hex}"))
     }
 
     pub fn as_str(&self) -> &str {
@@ -371,6 +383,30 @@ impl RouteOutcome {
         match self {
             RouteOutcome::Recommendation { .. } => None,
             RouteOutcome::NoCapacity { reason } => Some(reason),
+        }
+    }
+}
+
+#[cfg(test)]
+mod session_id_tests {
+    use super::*;
+
+    #[test]
+    fn test_generate_produces_unique_ids_with_expected_format() {
+        let a = SessionId::generate();
+        let b = SessionId::generate();
+        assert_ne!(a, b, "two CSPRNG-generated session ids must not collide");
+
+        for id in [&a, &b] {
+            let s = id.as_str();
+            assert!(s.starts_with("sess_"), "unexpected prefix: {s}");
+            let hex = &s["sess_".len()..];
+            // 128 bits = 16 bytes = 32 hex chars.
+            assert_eq!(hex.len(), 32, "expected 32 hex chars for 128-bit id: {s}");
+            assert!(
+                hex.chars().all(|c| c.is_ascii_hexdigit()),
+                "expected lowercase hex digits: {s}"
+            );
         }
     }
 }
