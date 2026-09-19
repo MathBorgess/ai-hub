@@ -16,7 +16,7 @@ use aihub_core::{ChannelTicket, ClientMessage, DaemonMessage, IpcMessage, Sessio
 use std::io::ErrorKind;
 use std::net::TcpStream;
 use std::sync::mpsc as sync_mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio_tungstenite::tungstenite;
 use tungstenite::stream::MaybeTlsStream;
@@ -253,6 +253,15 @@ pub fn spawn_io(mut socket: WsSocket) -> SocketIo {
         // already had the 100ms timeout; extend it to NativeTls/Rustls.
         set_ws_read_timeout(&mut socket, Duration::from_millis(100));
 
+        // aihubd drops the *transport* after 15s with no inbound frames
+        // (LIVENESS_TIMEOUT). Answering daemon Ping with Pong is necessary but
+        // not always sufficient through Cloudflare: the edge can ACK origin
+        // Pings without a client→origin Pong ever reaching aihubd's reader.
+        // Emit our own Ping on a cadence under that budget so the daemon's
+        // read timeout always resets.
+        const CLIENT_KEEPALIVE: Duration = Duration::from_secs(4);
+        let mut last_keepalive = Instant::now();
+
         loop {
             loop {
                 match outbound_rx.try_recv() {
@@ -264,6 +273,7 @@ pub fn spawn_io(mut socket: WsSocket) -> SocketIo {
                             )));
                             return;
                         }
+                        last_keepalive = Instant::now();
                     }
                     Err(sync_mpsc::TryRecvError::Empty) => break,
                     Err(sync_mpsc::TryRecvError::Disconnected) => return,
@@ -286,8 +296,12 @@ pub fn spawn_io(mut socket: WsSocket) -> SocketIo {
                         )));
                         return;
                     }
+                    let _ = socket.flush();
+                    last_keepalive = Instant::now();
                 }
-                Ok(Message::Pong(_)) => {}
+                Ok(Message::Pong(_)) => {
+                    last_keepalive = Instant::now();
+                }
                 Ok(Message::Close(frame)) => {
                     let _ = inbound_tx.send(Err(RemoteError::new(
                         FailureClass::HandshakeRejected,
@@ -296,6 +310,7 @@ pub fn spawn_io(mut socket: WsSocket) -> SocketIo {
                     return;
                 }
                 Ok(msg) => {
+                    last_keepalive = Instant::now();
                     if inbound_tx.send(Ok(msg)).is_err() {
                         return;
                     }
@@ -303,6 +318,17 @@ pub fn spawn_io(mut socket: WsSocket) -> SocketIo {
                 Err(tungstenite::Error::Io(ref io_err))
                     if matches!(io_err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
                 {
+                    if last_keepalive.elapsed() >= CLIENT_KEEPALIVE {
+                        if let Err(e) = socket.send(Message::Ping(Vec::new())) {
+                            let _ = inbound_tx.send(Err(RemoteError::new(
+                                classify_connect_error(&e),
+                                e.to_string(),
+                            )));
+                            return;
+                        }
+                        let _ = socket.flush();
+                        last_keepalive = Instant::now();
+                    }
                     continue;
                 }
                 Err(e) => {

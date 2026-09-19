@@ -225,6 +225,12 @@ pub async fn run(cli: Cli) -> Result<()> {
                 match msg_opt {
                     Some(Ok(msg)) => {
                         handle_daemon_msg(&mut app, msg);
+                        // Attached/SessionCreated may mint a fresh channel_ticket after
+                        // reconnect — re-open the dedicated PTY socket whenever we have
+                        // credentials and no live PTY channel (first boot or post-drop).
+                        if pty_in.is_none() {
+                            maybe_spawn_pty(&target, &app, &pty_tx_events);
+                        }
                     }
                     Some(Err(_)) | None => {
                         // Connection lost: hand off to a fresh background reconnect task
@@ -256,14 +262,6 @@ pub async fn run(cli: Cli) -> Result<()> {
                         if !bootstrapped {
                             bootstrapped = true;
                             bootstrap_session(&mut new_writer, &mut new_rx, &mut app, &cli, &repo_path).await?;
-
-                            if let RemoteTarget::Remote(url) = &target {
-                                if let (Some(ticket), Some(session_id)) =
-                                    (app.channel_ticket.clone(), app.session_id.clone())
-                                {
-                                    spawn_pty_connect(url.clone(), session_id, ticket, pty_tx_events.clone());
-                                }
-                            }
                         } else if let Some(session_id) = app.session_id.clone() {
                             let _ = new_writer
                                 .send(&ClientMessage::Attach { target: SessionTarget::Id(session_id), last_seen_offset: None })
@@ -271,6 +269,11 @@ pub async fn run(cli: Cli) -> Result<()> {
                         }
                         writer = Some(new_writer);
                         daemon_rx = Some(new_rx);
+                        // Bootstrap (or a still-cached ticket after transport drop) may
+                        // already have session+ticket before the next Attached arrives.
+                        if pty_in.is_none() {
+                            maybe_spawn_pty(&target, &app, &pty_tx_events);
+                        }
                     }
                     ConnEvent::PairingRequired { code } => {
                         app.connection = ConnectionState::PairingRequired { code };
@@ -424,6 +427,22 @@ async fn reconnect_task(
         }
         tokio::time::sleep(backoff.next_delay()).await;
     }
+}
+
+/// Opens the PTY dual-channel when talking to a remote daemon and we already
+/// hold a session id + channel ticket. No-op for local UDS or missing ticket.
+fn maybe_spawn_pty(
+    target: &RemoteTarget,
+    app: &App,
+    events: &mpsc::UnboundedSender<PtyEvent>,
+) {
+    let RemoteTarget::Remote(url) = target else {
+        return;
+    };
+    let (Some(ticket), Some(session_id)) = (app.channel_ticket.clone(), app.session_id.clone()) else {
+        return;
+    };
+    spawn_pty_connect(url.clone(), session_id, ticket, events.clone());
 }
 
 /// Opens the dedicated PTY channel in the background so it never blocks the draw loop.

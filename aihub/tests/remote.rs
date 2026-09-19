@@ -235,6 +235,76 @@ async fn control_channel_survives_post_handshake_ping() {
 }
 
 
+
+/// Regression: aihubd tears down the transport after 15s with no inbound frames.
+/// Client must emit its own WebSocket Ping so Cloudflare edge ACK of origin Pings
+/// cannot starve the daemon reader.
+#[tokio::test]
+async fn control_channel_client_keepalive_pings() {
+    let (listener, url) = bind_loopback();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut ws = tungstenite::accept(stream).unwrap();
+        match recv_client(&mut ws) {
+            ClientMessage::Hello { credential: None, .. } => {}
+            other => panic!("expected bare Hello, got {other:?}"),
+        }
+        send_daemon(
+            &mut ws,
+            DaemonMessage::Challenge {
+                nonce: b"keepalive-nonce".to_vec().into(),
+            },
+        );
+        match recv_client(&mut ws) {
+            ClientMessage::Hello {
+                credential: Some(_),
+                ..
+            } => {}
+            other => panic!("expected credentialed Hello, got {other:?}"),
+        }
+        send_daemon(
+            &mut ws,
+            DaemonMessage::Hello {
+                version: PROTOCOL_VERSION,
+            },
+        );
+        // Do NOT send server Ping — only wait for client keepalive Ping.
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        let mut saw_client_ping = false;
+        while std::time::Instant::now() < deadline {
+            let _ = ws.get_mut().set_read_timeout(Some(Duration::from_millis(200)));
+            match ws.read() {
+                Ok(Message::Ping(_)) => {
+                    saw_client_ping = true;
+                    let _ = ws.send(Message::Pong(vec![]));
+                    break;
+                }
+                Ok(Message::Pong(_)) => continue,
+                Ok(_) => continue,
+                Err(_) => continue,
+            }
+        }
+        assert!(
+            saw_client_ping,
+            "idle client must emit WebSocket Ping keepalive within a few seconds"
+        );
+    });
+
+    let identity_path = scratch_identity_path("keepalive");
+    let identity = Identity::load_or_create(&identity_path).unwrap();
+    let socket = remote::connect(&url, Duration::from_secs(5)).await.unwrap();
+    let mut io = remote::spawn_io(socket);
+    remote::perform_remote_handshake(&mut io, &identity, Duration::from_secs(5))
+        .await
+        .expect("handshake");
+    // Hold the SocketIo open (outbound sender alive) while keepalive fires.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    drop(io);
+    server.join().unwrap();
+    let _ = std::fs::remove_file(&identity_path);
+}
+
+
 #[tokio::test]
 async fn remote_handshake_reports_unauthorized_when_not_yet_paired() {
     let (listener, url) = bind_loopback();
