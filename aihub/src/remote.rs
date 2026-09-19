@@ -225,19 +225,33 @@ pub struct SocketIo {
 /// timeout on the plain-TCP path so a queued keystroke never waits behind a
 /// blocking read for server data.
 ///
-/// ponytail: the TLS (`wss://`) path does not get the same read-timeout treatment
-/// (reaching the inner `TcpStream` through `rustls::StreamOwned` needs matching on
-/// a transitive type this crate cannot name). Outbound sends over `wss://` may
-/// wait up to one inbound message behind a read. Upgrade path: add `rustls` as a
-/// direct dependency and set `sock.set_read_timeout` on the `Rustls` variant too.
+/// All `MaybeTlsStream` variants get a short read timeout so outbound frames
+/// (Hello, keystrokes) are not stuck behind a blocking read — required for
+/// `wss://` through Cloudflare (NativeTls on Mac).
+
+fn set_ws_read_timeout(socket: &mut WsSocket, timeout: Duration) {
+    match socket.get_mut() {
+        MaybeTlsStream::Plain(tcp) => {
+            let _ = tcp.set_read_timeout(Some(timeout));
+        }
+        MaybeTlsStream::NativeTls(tls) => {
+            let _ = tls.get_mut().set_read_timeout(Some(timeout));
+        }
+        // `MaybeTlsStream` is `#[non_exhaustive]`; ignore unknown TLS backends.
+        _ => {}
+    }
+}
+
 pub fn spawn_io(mut socket: WsSocket) -> SocketIo {
     let (outbound_tx, outbound_rx) = sync_mpsc::channel::<Message>();
     let (inbound_tx, inbound_rx) = tokio_mpsc::unbounded_channel();
 
     std::thread::spawn(move || {
-        if let MaybeTlsStream::Plain(tcp) = socket.get_ref() {
-            let _ = tcp.set_read_timeout(Some(Duration::from_millis(100)));
-        }
+        // Without a short read timeout, the TLS variants block forever in
+        // `socket.read()` and never drain `outbound_rx` — so Hello never leaves
+        // the Mac and the daemon never answers (deadlock over wss://). Plain TCP
+        // already had the 100ms timeout; extend it to NativeTls/Rustls.
+        set_ws_read_timeout(&mut socket, Duration::from_millis(100));
 
         loop {
             loop {

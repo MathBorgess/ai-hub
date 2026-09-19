@@ -9,7 +9,10 @@ authors.workspace = true
 aihub-core = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
-tokio-tungstenite = { workspace = true }
+# native-tls: Mac remote wss:// through Cloudflare fails with rustls-webpki-roots
+# ("TLS handshake rejected") while Security.framework succeeds. aihubd stays on
+# the workspace rustls feature set for its own deps; only the TUI client overrides.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["native-tls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
